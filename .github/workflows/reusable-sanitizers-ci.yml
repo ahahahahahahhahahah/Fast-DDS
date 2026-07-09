@@ -441,6 +441,15 @@ jobs:
           echo "Per-process report files : $nfiles"
           echo "Reports captured in files: $in_files"
           echo "Reports left in stdout   : $in_stdout   (expected ~0; anything >0 = a process missed the option)"
+          echo ""
+          echo "## TSan report files dump"
+          for f in ${{ github.workspace }}/tsan_reports/*; do
+            [ -e "$f" ] || { echo "(no report files found)"; break; }
+            echo "===== BEGIN $f ====="
+            cat "$f"
+            echo "===== END $f ====="
+            echo ""
+          done
 
       - name: Check on failures
         if: ${{ steps.report_summary.outcome == 'failure' }}
