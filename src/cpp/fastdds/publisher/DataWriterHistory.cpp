@@ -26,6 +26,8 @@
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/writer/RTPSWriter.h>
 
+#include "../../rtps/RetransmissionTrace.hpp"
+
 namespace eprosima {
 namespace fastdds {
 namespace dds {
@@ -249,6 +251,13 @@ bool DataWriterHistory::add_pub_change(
                     topic_att_.getTopicDataType()
                     << " Change " << change->sequenceNumber << " added with key: " << change->instanceHandle
                     << " and " << change->serializedPayload.length << " bytes");
+            FASTDDS_TRACE_RETRANSMISSION(
+                "HISTORY_ADD",
+                change->writerGUID,
+                c_Guid_Unknown,
+                change->sequenceNumber,
+                change->serializedPayload.length,
+                topic_att_.getTopicName());
             returnedValue = true;
         }
     }
@@ -339,8 +348,18 @@ bool DataWriterHistory::remove_change_pub(
     std::lock_guard<RecursiveTimedMutex> guard(*this->mp_mutex);
     if (topic_att_.getTopicKind() == NO_KEY)
     {
+        const GUID_t writer_guid = change->writerGUID;
+        const SequenceNumber_t sequence_number = change->sequenceNumber;
+        const uint32_t payload_size = change->serializedPayload.length;
         if (remove_change(change))
         {
+            FASTDDS_TRACE_RETRANSMISSION(
+                "HISTORY_REMOVE",
+                writer_guid,
+                c_Guid_Unknown,
+                sequence_number,
+                payload_size,
+                topic_att_.getTopicName());
             m_isHistoryFull = false;
             return true;
         }
@@ -360,8 +379,18 @@ bool DataWriterHistory::remove_change_pub(
         {
             if (((*chit)->sequenceNumber == change->sequenceNumber) && ((*chit)->writerGUID == change->writerGUID))
             {
+                const GUID_t writer_guid = change->writerGUID;
+                const SequenceNumber_t sequence_number = change->sequenceNumber;
+                const uint32_t payload_size = change->serializedPayload.length;
                 if (remove_change(change))
                 {
+                    FASTDDS_TRACE_RETRANSMISSION(
+                        "HISTORY_REMOVE",
+                        writer_guid,
+                        c_Guid_Unknown,
+                        sequence_number,
+                        payload_size,
+                        topic_att_.getTopicName());
                     vit->second.cache_changes.erase(chit);
                     m_isHistoryFull = false;
                     return true;

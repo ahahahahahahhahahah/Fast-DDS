@@ -286,6 +286,9 @@ endif()
 ###############################################################################
 option(FASTDDS_STATISTICS "Enable Fast DDS Statistics Module" OFF)
 
+option(FASTDDS_RETRANSMISSION_TRACE
+    "Enable the experimental reliable-writer retransmission CSV trace" OFF)
+
 ###############################################################################
 # Compile library.
 ###############################################################################

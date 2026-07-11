@@ -31,6 +31,7 @@
 
 #include "rtps/messages/RTPSGapBuilder.hpp"
 #include <rtps/DataSharing/DataSharingNotifier.hpp>
+#include "../RetransmissionTrace.hpp"
 
 #include <mutex>
 #include <cassert>
@@ -430,6 +431,13 @@ bool ReaderProxy::requested_changes_set(
                         {
                             chit->setStatus(REQUESTED);
                             chit->markAllFragmentsAsUnsent();
+                            FASTDDS_TRACE_RETRANSMISSION(
+                                "REQUESTED",
+                                writer_->getGuid(),
+                                guid(),
+                                sit,
+                                chit->getChange()->serializedPayload.length,
+                                std::string());
                             isSomeoneWasSetRequested = true;
                         }
                     }

@@ -52,6 +52,7 @@
 #include "../builtin/discovery/database/DiscoveryDataBase.hpp"
 
 #include "../flowcontrol/FlowController.hpp"
+#include "../RetransmissionTrace.hpp"
 
 #include <mutex>
 #include <vector>
@@ -1853,6 +1854,13 @@ void StatefulWriter::perform_nack_response()
                         {
                             // This labmda is called if the ChangeForReader_t pass from REQUESTED to UNSENT.
                             assert(nullptr != change.getChange());
+                            FASTDDS_TRACE_RETRANSMISSION(
+                                "RETRANSMIT_ENQUEUE",
+                                getGuid(),
+                                reader->guid(),
+                                change.getChange()->sequenceNumber,
+                                change.getChange()->serializedPayload.length,
+                                std::string());
                             flow_controller_->add_old_sample(this, change.getChange());
                         }
                         );
@@ -1896,6 +1904,18 @@ bool StatefulWriter::process_acknack(
 
     if (result)
     {
+        std::ostringstream acknack_detail;
+        acknack_detail << "count=" << ack_count
+                       << ";base=" << sn_set.base()
+                       << ";final=" << final_flag;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ACKNACK",
+            writer_guid,
+            reader_guid,
+            sn_set.base(),
+            0,
+            acknack_detail.str());
+
         SequenceNumber_t received_sequence_number = sn_set.empty() ? sn_set.base() : sn_set.max();
         if (received_sequence_number <= next_sequence_number())
         {
