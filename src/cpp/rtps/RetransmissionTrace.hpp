@@ -113,13 +113,13 @@ inline void trace_retransmission_event(
 } // namespace fastrtps
 } // namespace eprosima
 
-#define FASTDDS_TRACE_RETRANSMISSION(event, writer, reader, sequence, size, detail) \
+#define FASTDDS_TRACE_RETRANSMISSION(event, writer, reader, sequence, size, event_detail) \
     ::eprosima::fastrtps::rtps::detail::trace_retransmission_event( \
-        event, writer, reader, sequence, size, detail)
+        event, writer, reader, sequence, size, event_detail)
 
 #else
 
-#define FASTDDS_TRACE_RETRANSMISSION(event, writer, reader, sequence, size, detail) \
+#define FASTDDS_TRACE_RETRANSMISSION(event, writer, reader, sequence, size, event_detail) \
     do \
     { \
     } while (false)
