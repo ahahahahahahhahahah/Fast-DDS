@@ -257,7 +257,7 @@ bool DataWriterHistory::add_pub_change(
                 c_Guid_Unknown,
                 change->sequenceNumber,
                 change->serializedPayload.length,
-                topic_att_.getTopicName());
+                topic_att_.getTopicName().to_string());
             returnedValue = true;
         }
     }
@@ -359,7 +359,7 @@ bool DataWriterHistory::remove_change_pub(
                 c_Guid_Unknown,
                 sequence_number,
                 payload_size,
-                topic_att_.getTopicName());
+                topic_att_.getTopicName().to_string());
             m_isHistoryFull = false;
             return true;
         }
@@ -390,7 +390,7 @@ bool DataWriterHistory::remove_change_pub(
                         c_Guid_Unknown,
                         sequence_number,
                         payload_size,
-                        topic_att_.getTopicName());
+                        topic_att_.getTopicName().to_string());
                     vit->second.cache_changes.erase(chit);
                     m_isHistoryFull = false;
                     return true;
