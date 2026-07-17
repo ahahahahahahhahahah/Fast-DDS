@@ -26,9 +26,7 @@
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/writer/RTPSWriter.h>
 
-#ifdef FASTDDS_RETRANSMISSION_TRACE
 #include "../../rtps/RetransmissionTrace.hpp"
-#endif // FASTDDS_RETRANSMISSION_TRACE
 
 namespace eprosima {
 namespace fastdds {
