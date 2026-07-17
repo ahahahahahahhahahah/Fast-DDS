@@ -8,6 +8,48 @@ The XML profile disables the built-in transports and Data Sharing, then register
 for every run. The two processes must run on the same Linux host for the monotonic timestamps to be directly
 comparable.
 
+The profile explicitly uses `PREALLOCATED_WITH_REALLOC` for discovery and endpoint histories. This is required when
+`RMW_FASTRTPS_USE_QOS_FROM_XML=1`: in that mode, `rmw_fastrtps` leaves these middleware settings to XML, and the
+Fast DDS `PREALLOCATED` endpoint default is too small for some variable-length ROS 2 internal messages.
+
+## Terminal B: single-node preflight
+
+Run this after every XML or custom-library change, before starting the two-terminal benchmark:
+
+```bash
+source /opt/ros/humble/setup.bash
+
+ROOT="$HOME/fastdds_trace_ws/src/Fast-DDS-2.6.11-trace"
+LIB="$HOME/fastdds_trace_ws/install/plain-secure/lib"
+XML="$ROOT/tools/research/ros2_udp_benchmark/udp_only.xml"
+
+env \
+  LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  RMW_FASTRTPS_USE_QOS_FROM_XML=1 \
+  FASTRTPS_DEFAULT_PROFILES_FILE="$XML" \
+  ROS_DOMAIN_ID=77 \
+  ROS_LOCALHOST_ONLY=1 \
+  timeout -k 5s 15s \
+  python3 - <<'PY'
+import rclpy
+
+rclpy.init()
+node = rclpy.create_node("udp_profile_preflight")
+print(f"node_name={node.get_name()}")
+node.destroy_node()
+rclpy.shutdown()
+PY
+
+echo "preflight_exit=$?"
+
+pgrep -af 'udp_profile_preflight|adaptive_benchmark|ros2|_ros2_daemon|timeout' ||
+  echo "no benchmark process remains"
+```
+
+The required result is `node_name=udp_profile_preflight`, `preflight_exit=0`, and
+`no benchmark process remains`. Do not apply `tc netem` or start Terminal A until this check passes.
+
 ## Terminal A: subscriber
 
 ```bash
@@ -23,6 +65,8 @@ env \
   RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
   RMW_FASTRTPS_USE_QOS_FROM_XML=1 \
   FASTRTPS_DEFAULT_PROFILES_FILE="$XML" \
+  ROS_DOMAIN_ID=77 \
+  ROS_LOCALHOST_ONLY=1 \
   python3 "$ROOT/tools/research/ros2_udp_benchmark/subscriber.py" \
     --expected 500 \
     --timeout 30 \
@@ -50,6 +94,8 @@ env \
   RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
   RMW_FASTRTPS_USE_QOS_FROM_XML=1 \
   FASTRTPS_DEFAULT_PROFILES_FILE="$XML" \
+  ROS_DOMAIN_ID=77 \
+  ROS_LOCALHOST_ONLY=1 \
   python3 "$ROOT/tools/research/ros2_udp_benchmark/publisher.py" \
     --messages 500 \
     --rate 50 \

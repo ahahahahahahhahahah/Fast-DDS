@@ -10,6 +10,10 @@
 
         <participant profile_name="benchmark_udp_participant" is_default_profile="true">
             <rtps>
+                <builtin>
+                    <readerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</readerHistoryMemoryPolicy>
+                    <writerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</writerHistoryMemoryPolicy>
+                </builtin>
                 <userTransports>
                     <transport_id>benchmark_udp_transport</transport_id>
                 </userTransports>
@@ -23,6 +27,7 @@
                     <kind>OFF</kind>
                 </data_sharing>
             </qos>
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
         </publisher>
 
         <subscriber profile_name="benchmark_udp_reader" is_default_profile="true">
@@ -31,6 +36,7 @@
                     <kind>OFF</kind>
                 </data_sharing>
             </qos>
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
         </subscriber>
     </profiles>
 </dds>
