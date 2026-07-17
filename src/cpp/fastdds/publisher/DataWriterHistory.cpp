@@ -26,7 +26,9 @@
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/writer/RTPSWriter.h>
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
 #include "../../rtps/RetransmissionTrace.hpp"
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 namespace eprosima {
 namespace fastdds {
@@ -251,19 +253,29 @@ bool DataWriterHistory::add_pub_change(
                     topic_att_.getTopicDataType()
                     << " Change " << change->sequenceNumber << " added with key: " << change->instanceHandle
                     << " and " << change->serializedPayload.length << " bytes");
-            FASTDDS_TRACE_RETRANSMISSION(
-                "HISTORY_ADD",
-                change->writerGUID,
-                c_Guid_Unknown,
-                change->sequenceNumber,
-                change->serializedPayload.length,
-                topic_att_.getTopicName().to_string());
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_history_add(change);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             returnedValue = true;
         }
     }
 
     return returnedValue;
 }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+void DataWriterHistory::trace_history_add(
+        const CacheChange_t* change) const
+{
+    FASTDDS_TRACE_RETRANSMISSION(
+        "HISTORY_ADD",
+        change->writerGUID,
+        c_Guid_Unknown,
+        change->sequenceNumber,
+        change->serializedPayload.length,
+        topic_att_.getTopicName().to_string());
+}
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 bool DataWriterHistory::find_or_add_key(
         const InstanceHandle_t& instance_handle,
@@ -348,9 +360,11 @@ bool DataWriterHistory::remove_change_pub(
     std::lock_guard<RecursiveTimedMutex> guard(*this->mp_mutex);
     if (topic_att_.getTopicKind() == NO_KEY)
     {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
         const GUID_t writer_guid = change->writerGUID;
         const SequenceNumber_t sequence_number = change->sequenceNumber;
         const uint32_t payload_size = change->serializedPayload.length;
+#endif // FASTDDS_RETRANSMISSION_TRACE
         if (remove_change(change))
         {
             FASTDDS_TRACE_RETRANSMISSION(
@@ -379,9 +393,11 @@ bool DataWriterHistory::remove_change_pub(
         {
             if (((*chit)->sequenceNumber == change->sequenceNumber) && ((*chit)->writerGUID == change->writerGUID))
             {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                 const GUID_t writer_guid = change->writerGUID;
                 const SequenceNumber_t sequence_number = change->sequenceNumber;
                 const uint32_t payload_size = change->serializedPayload.length;
+#endif // FASTDDS_RETRANSMISSION_TRACE
                 if (remove_change(change))
                 {
                     FASTDDS_TRACE_RETRANSMISSION(

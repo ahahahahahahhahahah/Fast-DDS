@@ -143,6 +143,9 @@ public:
                         topic_att_.getTopicDataType()
                         << " Change " << change->sequenceNumber << " added with key: " << change->instanceHandle
                         << " and " << change->serializedPayload.length << " bytes");
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                trace_history_add(change);
+#endif // FASTDDS_RETRANSMISSION_TRACE
                 returnedValue = true;
             }
         }
@@ -222,6 +225,11 @@ public:
 private:
 
     typedef std::map<fastrtps::rtps::InstanceHandle_t, detail::DataWriterInstance> t_m_Inst_Caches;
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    void trace_history_add(
+            const fastrtps::rtps::CacheChange_t* change) const;
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     //!Map where keys are instance handles and values are vectors of cache changes associated
     t_m_Inst_Caches keyed_changes_;
