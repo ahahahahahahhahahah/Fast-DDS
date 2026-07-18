@@ -4,9 +4,55 @@ This harness measures application-visible behavior independently of the experime
 reliable ROS 2 nodes, embeds a sequence number and `CLOCK_MONOTONIC` timestamp in each message, and reports delivery,
 latency, inter-arrival, ordering, and goodput statistics.
 
-The XML profile disables the built-in transports and Data Sharing, then registers only UDPv4. Use unique output files
-for every run. The two processes must run on the same Linux host for the monotonic timestamps to be directly
-comparable.
+## Adaptive shadow controller
+
+The first adaptive implementation is observation-only. Build Fast DDS with both the controller and trace enabled:
+
+```bash
+cmake -S "$ROOT" \
+  -B "$HOME/fastdds_trace_ws/build/adaptive-shadow" \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_INSTALL_PREFIX="$HOME/fastdds_trace_ws/install/adaptive-shadow" \
+  -DBUILD_TESTING=OFF \
+  -DCOMPILE_TOOLS=OFF \
+  -DSECURITY=ON \
+  -DFASTDDS_STATISTICS=OFF \
+  -DFASTDDS_RETRANSMISSION_TRACE=ON \
+  -DFASTDDS_ADAPTIVE_RETRANSMISSION=ON
+
+cmake --build "$HOME/fastdds_trace_ws/build/adaptive-shadow" -j2
+cmake --install "$HOME/fastdds_trace_ws/build/adaptive-shadow"
+```
+
+`adaptive_shadow.xml` only adds `fastdds.adaptive_retransmission.enabled=true` to the
+`/adaptive_benchmark` DataWriter. It does not change transports, publication mode, memory policy, or ROS QoS. Set
+`FASTRTPS_DEFAULT_PROFILES_FILE` on the publisher process only. Do not set `RMW_FASTRTPS_USE_QOS_FROM_XML`.
+
+When a real remote Reliable Reader requests missing data, the publisher trace should contain:
+
+```text
+REQUESTED
+ADAPT_REQUEST_OBSERVED
+ADAPT_SHADOW_DECISION
+RETRANSMIT_ENQUEUE
+```
+
+The shadow decision is diagnostic only. `perform_nack_response()` still converts every requested change and calls the
+original `add_old_sample()` path.
+
+The controller is Transport-independent: it applies to Reliable readers in `matched_remote_readers_`, whether their
+RTPS traffic uses UDP, SHM Transport, or another registered Transport. Intraprocess readers and Data Sharing readers
+do not enter this recovery path. A test still needs a real loss/recovery condition before the adaptive trace events can
+appear.
+
+## UDP-only laboratory profile
+
+`udp_only.xml` is an optional fault-injection profile for controlled single-host tests. It disables the built-in
+transports and Data Sharing, then registers only UDPv4 so `tc netem` can create repeatable packet loss. This profile is
+not part of the adaptive mechanism and is not required for normal Fast DDS operation or cross-host tests.
+
+Use unique output files for every run. The two processes must run on the same Linux host for the monotonic timestamps
+to be directly comparable.
 
 The profile explicitly uses `PREALLOCATED_WITH_REALLOC` for discovery and endpoint histories. This is required when
 `RMW_FASTRTPS_USE_QOS_FROM_XML=1`: in that mode, `rmw_fastrtps` leaves these middleware settings to XML, and the

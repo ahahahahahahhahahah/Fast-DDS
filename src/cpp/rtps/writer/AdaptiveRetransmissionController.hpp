@@ -1,0 +1,76 @@
+// Copyright 2026
+// Licensed under the Apache License, Version 2.0.
+
+#ifndef FASTDDS_RTPS_WRITER_ADAPTIVE_RETRANSMISSION_CONTROLLER_HPP
+#define FASTDDS_RTPS_WRITER_ADAPTIVE_RETRANSMISSION_CONTROLLER_HPP
+
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+
+#include <cstdint>
+
+#include <fastdds/rtps/common/Guid.h>
+#include <fastdds/rtps/common/SequenceNumber.h>
+
+namespace eprosima {
+namespace fastrtps {
+namespace rtps {
+
+struct CacheChange_t;
+class StatefulWriter;
+
+namespace detail {
+
+class AdaptiveRetransmissionController
+{
+public:
+
+    static AdaptiveRetransmissionController& instance();
+
+    void on_requested(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const CacheChange_t& change,
+            uint32_t requested_fragments,
+            uint32_t estimated_bytes);
+
+    void on_retransmit_interest(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const CacheChange_t& change);
+
+    void on_acknowledged_before(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence_number);
+
+    void on_change_removed(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence_number);
+
+    void on_reader_removed(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid);
+
+private:
+
+    AdaptiveRetransmissionController();
+    ~AdaptiveRetransmissionController();
+
+    AdaptiveRetransmissionController(
+            const AdaptiveRetransmissionController&) = delete;
+    AdaptiveRetransmissionController& operator =(
+            const AdaptiveRetransmissionController&) = delete;
+
+    struct Implementation;
+    Implementation* impl_;
+};
+
+} // namespace detail
+} // namespace rtps
+} // namespace fastrtps
+} // namespace eprosima
+
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+
+#endif // FASTDDS_RTPS_WRITER_ADAPTIVE_RETRANSMISSION_CONTROLLER_HPP

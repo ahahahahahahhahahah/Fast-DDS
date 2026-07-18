@@ -32,6 +32,7 @@
 #include "rtps/messages/RTPSGapBuilder.hpp"
 #include <rtps/DataSharing/DataSharingNotifier.hpp>
 #include "../RetransmissionTrace.hpp"
+#include "AdaptiveRetransmissionController.hpp"
 
 #include <mutex>
 #include <cassert>
@@ -166,6 +167,14 @@ bool ReaderProxy::update(
 
 void ReaderProxy::stop()
 {
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+    if (is_active_ && is_remote_and_reliable())
+    {
+        detail::AdaptiveRetransmissionController::instance().on_reader_removed(
+            writer_, guid());
+    }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+
     locator_info_.stop();
     is_active_ = false;
     disable_timers();
@@ -339,6 +348,14 @@ bool ReaderProxy::change_is_unsent(
 void ReaderProxy::acked_changes_set(
         const SequenceNumber_t& seq_num)
 {
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+    if (is_active_ && is_remote_and_reliable())
+    {
+        detail::AdaptiveRetransmissionController::instance().on_acknowledged_before(
+            writer_, guid(), seq_num);
+    }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+
     SequenceNumber_t future_low_mark = seq_num;
 
     if (seq_num > changes_low_mark_)
@@ -438,6 +455,17 @@ bool ReaderProxy::requested_changes_set(
                                 sit,
                                 chit->getChange()->serializedPayload.length,
                                 std::string());
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                            if (is_remote_and_reliable())
+                            {
+                                detail::AdaptiveRetransmissionController::instance().on_requested(
+                                    writer_,
+                                    guid(),
+                                    *chit->getChange(),
+                                    0,
+                                    chit->getChange()->serializedPayload.length);
+                            }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
                             isSomeoneWasSetRequested = true;
                         }
                     }
@@ -573,6 +601,14 @@ uint32_t ReaderProxy::convert_status_on_all_changes(
 void ReaderProxy::change_has_been_removed(
         const SequenceNumber_t& seq_num)
 {
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+    if (is_active_ && is_remote_and_reliable())
+    {
+        detail::AdaptiveRetransmissionController::instance().on_change_removed(
+            writer_, guid(), seq_num);
+    }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+
     // Check sequence number is in the container, because it was not clean up.
     if (changes_for_reader_.empty() || seq_num < changes_for_reader_.begin()->getSequenceNumber())
     {
@@ -640,6 +676,32 @@ bool ReaderProxy::requested_fragment_set(
     {
         changeIter->setStatus(REQUESTED);
     }
+
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+    if (is_remote_and_reliable())
+    {
+        uint32_t requested_fragments = 0;
+        uint64_t estimated_bytes = 0;
+        const CacheChange_t* change = changeIter->getChange();
+        frag_set.for_each([&](FragmentNumber_t fragment)
+                {
+                    ++requested_fragments;
+                    const uint32_t fragment_size = change->getFragmentSize();
+                    const uint64_t fragment_start = 0 == fragment ?
+                            change->serializedPayload.length :
+                            static_cast<uint64_t>(fragment_size) * (fragment - 1);
+                    if (fragment_start < change->serializedPayload.length)
+                    {
+                        estimated_bytes += std::min(
+                            static_cast<uint64_t>(fragment_size),
+                            static_cast<uint64_t>(change->serializedPayload.length) - fragment_start);
+                    }
+                });
+
+        detail::AdaptiveRetransmissionController::instance().on_requested(
+            writer_, guid(), *change, requested_fragments, static_cast<uint32_t>(estimated_bytes));
+    }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 
     return true;
 }

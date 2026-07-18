@@ -53,6 +53,7 @@
 
 #include "../flowcontrol/FlowController.hpp"
 #include "../RetransmissionTrace.hpp"
+#include "AdaptiveRetransmissionController.hpp"
 
 #include <mutex>
 #include <vector>
@@ -1854,6 +1855,12 @@ void StatefulWriter::perform_nack_response()
                         {
                             // This labmda is called if the ChangeForReader_t pass from REQUESTED to UNSENT.
                             assert(nullptr != change.getChange());
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                            detail::AdaptiveRetransmissionController::instance().on_retransmit_interest(
+                                this,
+                                reader->guid(),
+                                *change.getChange());
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
                             FASTDDS_TRACE_RETRANSMISSION(
                                 "RETRANSMIT_ENQUEUE",
                                 getGuid(),

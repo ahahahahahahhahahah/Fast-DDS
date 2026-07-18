@@ -48,6 +48,7 @@ set(${PROJECT_NAME}_source_files
     rtps/resources/TimedEventImpl.cpp
     rtps/writer/LivelinessManager.cpp
     rtps/writer/LocatorSelectorSender.cpp
+    rtps/writer/AdaptiveRetransmissionController.cpp
     rtps/writer/RTPSWriter.cpp
     rtps/writer/StatefulWriter.cpp
     rtps/writer/ReaderProxy.cpp
@@ -449,6 +450,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
     $<$<BOOL:${INTERNAL_DEBUG}>:__INTERNALDEBUG> # Internal debug activated.
     $<$<BOOL:${FASTDDS_RETRANSMISSION_TRACE}>:FASTDDS_RETRANSMISSION_TRACE>
+    $<$<BOOL:${FASTDDS_ADAPTIVE_RETRANSMISSION}>:FASTDDS_ADAPTIVE_RETRANSMISSION>
     $<$<AND:$<BOOL:${WIN32}>,$<STREQUAL:"${CMAKE_SYSTEM_NAME}","WindowsStore">>:_WIN32_WINNT=0x0603>
     $<$<AND:$<BOOL:${WIN32}>,$<NOT:$<STREQUAL:"${CMAKE_SYSTEM_NAME}","WindowsStore">>>:_WIN32_WINNT=0x0601>
     $<$<AND:$<BOOL:${WIN32}>,$<STREQUAL:"${CMAKE_SYSTEM_NAME}","WindowsStore">>:SQLITE_OS_WINRT>
