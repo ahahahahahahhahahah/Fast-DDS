@@ -56,6 +56,9 @@ appear.
 transports and Data Sharing, then registers only UDPv4 so `tc netem` can create repeatable packet loss. This profile is
 not part of the adaptive mechanism and is not required for normal Fast DDS operation or cross-host tests.
 
+`adaptive_udp_validation.xml` adds the `/adaptive_benchmark` enable property to the same controlled UDP setup. Use it
+only for active-controller fault injection. `adaptive_enabled.xml` remains the Transport-independent normal profile.
+
 Use unique output files for every run. On two hosts, do not pass `--same-host`: monotonic clock epochs are unrelated,
 even when wall clocks are synchronized. Cross-host one-way latency requires a separate PTP/clock-error method; receive
 rate, loss recovery, ordering, inter-arrival, and goodput remain valid without it.
