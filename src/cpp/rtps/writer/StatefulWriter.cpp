@@ -294,8 +294,7 @@ void StatefulWriter::init(
         pimpl->getEventResource(),
         [&]() -> bool
         {
-            perform_nack_response();
-            return false;
+            return perform_nack_response_event();
         },
         TimeConv::Time_t2MilliSecondsDouble(m_times.nackResponseDelay));
 
@@ -1846,37 +1845,72 @@ void StatefulWriter::send_heartbeat_piggyback_nts_(
 
 void StatefulWriter::perform_nack_response()
 {
+    if (perform_nack_response_event() && nullptr != nack_response_event_)
+    {
+        nack_response_event_->restart_timer();
+    }
+}
+
+bool StatefulWriter::perform_nack_response_event()
+{
     std::unique_lock<RecursiveTimedMutex> lock(mp_mutex);
 
     uint32_t changes_to_resend = 0;
+    uint32_t deferred_changes = 0;
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+    detail::AdaptiveRetransmissionController::instance().begin_admission_cycle(this);
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
     for (ReaderProxy* reader : matched_remote_readers_)
     {
-        changes_to_resend += reader->perform_acknack_response([&](ChangeForReader_t& change)
-                        {
-                            // This labmda is called if the ChangeForReader_t pass from REQUESTED to UNSENT.
-                            assert(nullptr != change.getChange());
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-                            detail::AdaptiveRetransmissionController::instance().on_retransmit_interest(
-                                this,
-                                reader->guid(),
-                                *change.getChange());
+        uint32_t reader_deferred = 0;
+        changes_to_resend += reader->perform_acknack_response(
+                    [&](const ChangeForReader_t& change)
+                    {
+                        assert(nullptr != change.getChange());
+                        return detail::AdaptiveRetransmissionDecision::DEFER !=
+                               detail::AdaptiveRetransmissionController::instance().decide_retransmission(
+                            this,
+                            reader->guid(),
+                            *change.getChange());
+                    },
+                    [&](ChangeForReader_t& change)
+                    {
+                        // This lambda is called if the ChangeForReader_t passes from REQUESTED to UNSENT.
+                        assert(nullptr != change.getChange());
+                        FASTDDS_TRACE_RETRANSMISSION(
+                            "RETRANSMIT_ENQUEUE",
+                            getGuid(),
+                            reader->guid(),
+                            change.getChange()->sequenceNumber,
+                            change.getChange()->serializedPayload.length,
+                            std::string());
+                        flow_controller_->add_old_sample(this, change.getChange());
+                    },
+                    reader_deferred);
+        deferred_changes += reader_deferred;
+#else
+        changes_to_resend += reader->perform_acknack_response(
+                    [&](ChangeForReader_t& change)
+                    {
+                        assert(nullptr != change.getChange());
+                        FASTDDS_TRACE_RETRANSMISSION(
+                            "RETRANSMIT_ENQUEUE",
+                            getGuid(),
+                            reader->guid(),
+                            change.getChange()->sequenceNumber,
+                            change.getChange()->serializedPayload.length,
+                            std::string());
+                        flow_controller_->add_old_sample(this, change.getChange());
+                    });
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
-                            FASTDDS_TRACE_RETRANSMISSION(
-                                "RETRANSMIT_ENQUEUE",
-                                getGuid(),
-                                reader->guid(),
-                                change.getChange()->sequenceNumber,
-                                change.getChange()->serializedPayload.length,
-                                std::string());
-                            flow_controller_->add_old_sample(this, change.getChange());
-                        }
-                        );
     }
 
     lock.unlock();
 
     // Notify the statistics module
     on_resent_data(changes_to_resend);
+    return deferred_changes > 0;
 }
 
 void StatefulWriter::perform_nack_supression(

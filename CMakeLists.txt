@@ -290,7 +290,7 @@ option(FASTDDS_RETRANSMISSION_TRACE
     "Enable the experimental reliable-writer retransmission CSV trace" OFF)
 
 option(FASTDDS_ADAPTIVE_RETRANSMISSION
-    "Enable the experimental adaptive retransmission shadow controller" OFF)
+    "Enable the experimental adaptive retransmission admission controller" OFF)
 
 ###############################################################################
 # Compile library.

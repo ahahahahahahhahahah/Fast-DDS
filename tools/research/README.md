@@ -15,7 +15,7 @@ v2.6.11: 87dd60c
 | 分支 | 职责 | 状态 |
 |---|---|---|
 | `research/scan-retransmission-trace` | 可选 CSV 重传事件插桩和有限 ROS 2 benchmark | 已验证的观测基线；只接受必要修复 |
-| `research/adaptive-retransmission-v1` | 显式启用的 Reliable StatefulWriter 远端 Reader 旧样本恢复控制 | 当前开发分支；现有检查点是 shadow controller，下一步实现无 GAP 动态准入 |
+| `research/adaptive-retransmission-v1` | 显式启用的 Reliable StatefulWriter 远端 Reader 旧样本恢复控制 | 当前开发分支；shadow 检查点为 `4de1055`，后续提交实现无 GAP 动态准入 |
 
 `adaptive-retransmission-v1` 包含 `scan-retransmission-trace` 的全部提交。日常开发和 Linux 编译应使用前者，
 不需要在两个分支之间来回切换。标准源码对照使用 `git show 87dd60c:path/to/file`，也不需要切换分支。
@@ -49,10 +49,13 @@ git pull --ff-only
 ## 当前 V1 边界
 
 ```text
-显式开启的用户数据 Reliable StatefulWriter
+显式开启的用户数据 Reliable synchronous StatefulWriter
 + matched_remote_readers_
 + ACKNACK/NACK_FRAG 旧样本恢复
 ```
 
 V1 不修改 Best Effort、进程内通信、Data Sharing、Writer 类型选择和 RTPS 协议，不使用 GAP。
 Transport 不是功能开关；只有可控丢包实验才会选择 UDP/netem 作为测试工具。
+
+异步 Writer 在主动 V1 中回退原始 `SEND_NOW`，因为只限制旧样本准入不能修复 Flow Controller 的新队列
+绝对优先问题。支持异步 Writer 时必须同时实现旧队列最低服务份额或 aging。

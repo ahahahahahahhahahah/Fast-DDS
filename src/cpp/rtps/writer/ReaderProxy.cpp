@@ -567,7 +567,37 @@ bool ReaderProxy::perform_nack_supression()
 uint32_t ReaderProxy::perform_acknack_response(
         const std::function<void(ChangeForReader_t& change)>& func)
 {
-    return convert_status_on_all_changes(REQUESTED, UNSENT, func);
+    uint32_t deferred = 0;
+    return perform_acknack_response(nullptr, func, deferred);
+}
+
+uint32_t ReaderProxy::perform_acknack_response(
+        const std::function<bool(const ChangeForReader_t& change)>& should_admit,
+        const std::function<void(ChangeForReader_t& change)>& func,
+        uint32_t& deferred)
+{
+    uint32_t changed = 0;
+    deferred = 0;
+    for (ChangeForReader_t& change : changes_for_reader_)
+    {
+        if (REQUESTED == change.getStatus())
+        {
+            if (should_admit && !should_admit(change))
+            {
+                ++deferred;
+                continue;
+            }
+
+            ++changed;
+            change.setStatus(UNSENT);
+            if (func)
+            {
+                func(change);
+            }
+        }
+    }
+
+    return changed;
 }
 
 uint32_t ReaderProxy::convert_status_on_all_changes(

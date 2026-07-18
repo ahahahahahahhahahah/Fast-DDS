@@ -20,6 +20,13 @@ class StatefulWriter;
 
 namespace detail {
 
+enum class AdaptiveRetransmissionDecision
+{
+    SEND_NOW,
+    DEFER,
+    FORCE_SEND
+};
+
 class AdaptiveRetransmissionController
 {
 public:
@@ -33,7 +40,10 @@ public:
             uint32_t requested_fragments,
             uint32_t estimated_bytes);
 
-    void on_retransmit_interest(
+    void begin_admission_cycle(
+            StatefulWriter* writer);
+
+    AdaptiveRetransmissionDecision decide_retransmission(
             StatefulWriter* writer,
             const GUID_t& reader_guid,
             const CacheChange_t& change);

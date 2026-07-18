@@ -30,8 +30,14 @@ namespace {
 using steady_clock = std::chrono::steady_clock;
 
 constexpr const char* enabled_property = "fastdds.adaptive_retransmission.enabled";
+
+// Provisional safety defaults. These are experiment inputs, not calibrated link classifications.
 constexpr uint32_t warmup_feedback_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
+constexpr uint32_t max_changes_per_cycle = 2;
+constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
+constexpr uint32_t max_defer_ms = 50;
+constexpr double slow_feedback_ms = 25.0;
 
 struct ReaderKey
 {
@@ -72,6 +78,8 @@ struct ReaderState
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     steady_clock::time_point last_request;
+    uint32_t admitted_changes_in_cycle = 0;
+    uint64_t admitted_bytes_in_cycle = 0;
 };
 
 struct ChangeState
@@ -179,7 +187,7 @@ void AdaptiveRetransmissionController::on_requested(
         uint32_t requested_fragments,
         uint32_t estimated_bytes)
 {
-    if (nullptr == writer || !property_is_enabled(*writer))
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
     {
         return;
     }
@@ -188,7 +196,9 @@ void AdaptiveRetransmissionController::on_requested(
     const ReaderKey reader_key {writer->getGuid(), reader_guid};
     const ChangeKey change_key {reader_key, change.sequenceNumber};
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     std::string trace_detail;
+#endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ReaderState& reader = impl_->readers[reader_key];
@@ -210,6 +220,7 @@ void AdaptiveRetransmissionController::on_requested(
         observed.estimated_bytes = estimated_bytes;
         observed.last_request = now;
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
         std::ostringstream detail;
         detail << "requests=" << observed.requests
                << ";requested_fragments=" << requested_fragments
@@ -218,6 +229,7 @@ void AdaptiveRetransmissionController::on_requested(
                << ";path_outstanding_bytes=" << impl_->outstanding_bytes(reader_key)
                << ";request_interval_ewma_ms=" << reader.request_interval_ewma_ms;
         trace_detail = detail.str();
+#endif // FASTDDS_RETRANSMISSION_TRACE
     }
 
     FASTDDS_TRACE_RETRANSMISSION(
@@ -229,68 +241,141 @@ void AdaptiveRetransmissionController::on_requested(
         trace_detail);
 }
 
-void AdaptiveRetransmissionController::on_retransmit_interest(
+void AdaptiveRetransmissionController::begin_admission_cycle(
+        StatefulWriter* writer)
+{
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (auto& item : impl_->readers)
+    {
+        if (item.first.writer == writer->getGuid())
+        {
+            item.second.admitted_changes_in_cycle = 0;
+            item.second.admitted_bytes_in_cycle = 0;
+        }
+    }
+}
+
+AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransmission(
         StatefulWriter* writer,
         const GUID_t& reader_guid,
         const CacheChange_t& change)
 {
     if (nullptr == writer || !property_is_enabled(*writer))
     {
-        return;
+        return AdaptiveRetransmissionDecision::SEND_NOW;
+    }
+
+    if (writer->isAsync())
+    {
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ADMISSION_DECISION",
+            writer->getGuid(),
+            reader_guid,
+            change.sequenceNumber,
+            change.serializedPayload.length,
+            std::string("state=BYPASS;decision=SEND_NOW;reason=ASYNC_QUEUE_FAIRNESS_NOT_IMPLEMENTED"));
+        return AdaptiveRetransmissionDecision::SEND_NOW;
     }
 
     const auto now = steady_clock::now();
     const ReaderKey reader_key {writer->getGuid(), reader_guid};
     const ChangeKey change_key {reader_key, change.sequenceNumber};
 
+    AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::SEND_NOW;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     std::string trace_detail;
+#endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ReaderState& reader = impl_->readers[reader_key];
         ChangeState& observed = impl_->changes[change_key];
-        observed.last_interest = now;
+        if (0 == observed.requests)
+        {
+            observed.first_request = now;
+        }
         if (0 == observed.estimated_bytes)
         {
             observed.estimated_bytes = change.serializedPayload.length;
         }
 
         const size_t pending = impl_->outstanding_changes(reader_key);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
         const uint64_t pending_bytes = impl_->outstanding_bytes(reader_key);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        const double age_ms = std::chrono::duration<double, std::milli>(now - observed.first_request).count();
+        const bool feedback_pressure = reader.feedback_samples >= warmup_feedback_samples &&
+                reader.recovery_feedback_ewma_ms > slow_feedback_ms;
+        const bool recovery_pressure = pending >= pressure_request_count ||
+                observed.requests >= pressure_request_count || feedback_pressure;
 
-        const char* state = "UNKNOWN";
-        const char* proposed_action = "ORIGINAL";
-        if (reader.feedback_samples >= warmup_feedback_samples)
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        const char* state = recovery_pressure ? "RECOVERY_PRESSURE" : "SPARSE_REQUESTS";
+        const char* action = "SEND_NOW";
+        const char* reason = recovery_pressure ? "WITHIN_BUDGET" : "NO_PRESSURE";
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        if (recovery_pressure)
         {
-            if (pending >= pressure_request_count || observed.requests >= pressure_request_count)
+            if (age_ms >= max_defer_ms)
             {
-                state = "RECOVERY_PRESSURE";
-                proposed_action = "LIMIT_BURST";
+                decision = AdaptiveRetransmissionDecision::FORCE_SEND;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                action = "FORCE_SEND";
+                reason = "MAX_DEFER_REACHED";
+#endif // FASTDDS_RETRANSMISSION_TRACE
             }
-            else
+            else if (reader.admitted_changes_in_cycle >= max_changes_per_cycle ||
+                    (reader.admitted_changes_in_cycle > 0 &&
+                    reader.admitted_bytes_in_cycle + observed.estimated_bytes > max_bytes_per_cycle))
             {
-                state = "SPARSE_REQUESTS";
-                proposed_action = "SEND_NOW";
+                decision = AdaptiveRetransmissionDecision::DEFER;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                action = "DEFER";
+                reason = "CYCLE_BUDGET_EXHAUSTED";
+#endif // FASTDDS_RETRANSMISSION_TRACE
             }
         }
 
+        if (AdaptiveRetransmissionDecision::DEFER != decision)
+        {
+            ++reader.admitted_changes_in_cycle;
+            reader.admitted_bytes_in_cycle += observed.estimated_bytes;
+            observed.last_interest = now;
+        }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
         std::ostringstream detail;
         detail << "state=" << state
-               << ";proposed_action=" << proposed_action
+               << ";decision=" << action
+               << ";reason=" << reason
                << ";requests=" << observed.requests
+               << ";age_ms=" << age_ms
                << ";path_outstanding_changes=" << pending
                << ";path_outstanding_bytes=" << pending_bytes
+               << ";cycle_admitted_changes=" << reader.admitted_changes_in_cycle
+               << ";cycle_admitted_bytes=" << reader.admitted_bytes_in_cycle
+               << ";cycle_change_budget=" << max_changes_per_cycle
+               << ";cycle_byte_budget=" << max_bytes_per_cycle
+               << ";max_defer_ms=" << max_defer_ms
                << ";feedback_samples=" << reader.feedback_samples
                << ";recovery_feedback_ewma_ms=" << reader.recovery_feedback_ewma_ms;
         trace_detail = detail.str();
+#endif // FASTDDS_RETRANSMISSION_TRACE
     }
 
     FASTDDS_TRACE_RETRANSMISSION(
-        "ADAPT_SHADOW_DECISION",
+        "ADAPT_ADMISSION_DECISION",
         writer->getGuid(),
         reader_guid,
         change.sequenceNumber,
         change.serializedPayload.length,
         trace_detail);
+
+    return decision;
 }
 
 void AdaptiveRetransmissionController::on_acknowledged_before(
@@ -298,7 +383,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         const GUID_t& reader_guid,
         const SequenceNumber_t& sequence_number)
 {
-    if (nullptr == writer || !property_is_enabled(*writer))
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
     {
         return;
     }
@@ -335,7 +420,7 @@ void AdaptiveRetransmissionController::on_change_removed(
         const GUID_t& reader_guid,
         const SequenceNumber_t& sequence_number)
 {
-    if (nullptr == writer || !property_is_enabled(*writer))
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
     {
         return;
     }
@@ -349,7 +434,7 @@ void AdaptiveRetransmissionController::on_reader_removed(
         StatefulWriter* writer,
         const GUID_t& reader_guid)
 {
-    if (nullptr == writer || !property_is_enabled(*writer))
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
     {
         return;
     }

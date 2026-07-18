@@ -431,6 +431,8 @@ public:
 
 private:
 
+    bool perform_nack_response_event();
+
     bool is_acked_by_all(
             const SequenceNumber_t seq) const;
 

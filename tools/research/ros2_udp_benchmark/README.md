@@ -5,15 +5,15 @@ reliable ROS 2 nodes, embeds a sequence number and `CLOCK_MONOTONIC` timestamp i
 inter-arrival, ordering, and goodput statistics. Add `--same-host` to the subscriber only when both processes run on
 one host; only then does it report one-way latency from the shared monotonic clock.
 
-## Adaptive shadow controller
+## Adaptive admission controller
 
-The first adaptive implementation is observation-only. Build Fast DDS with both the controller and trace enabled:
+Build Fast DDS with both the controller and trace enabled for functional validation:
 
 ```bash
 cmake -S "$ROOT" \
-  -B "$HOME/fastdds_trace_ws/build/adaptive-shadow" \
+  -B "$HOME/fastdds_trace_ws/build/adaptive-v1" \
   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_INSTALL_PREFIX="$HOME/fastdds_trace_ws/install/adaptive-shadow" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/fastdds_trace_ws/install/adaptive-v1" \
   -DBUILD_TESTING=OFF \
   -DCOMPILE_TOOLS=OFF \
   -DSECURITY=ON \
@@ -21,11 +21,11 @@ cmake -S "$ROOT" \
   -DFASTDDS_RETRANSMISSION_TRACE=ON \
   -DFASTDDS_ADAPTIVE_RETRANSMISSION=ON
 
-cmake --build "$HOME/fastdds_trace_ws/build/adaptive-shadow" -j2
-cmake --install "$HOME/fastdds_trace_ws/build/adaptive-shadow"
+cmake --build "$HOME/fastdds_trace_ws/build/adaptive-v1" -j2
+cmake --install "$HOME/fastdds_trace_ws/build/adaptive-v1"
 ```
 
-`adaptive_shadow.xml` only adds `fastdds.adaptive_retransmission.enabled=true` to the
+`adaptive_enabled.xml` only adds `fastdds.adaptive_retransmission.enabled=true` to the
 `/adaptive_benchmark` DataWriter. It does not change transports, publication mode, memory policy, or ROS QoS. Set
 `FASTRTPS_DEFAULT_PROFILES_FILE` on the publisher process only. Do not set `RMW_FASTRTPS_USE_QOS_FROM_XML`.
 
@@ -34,12 +34,16 @@ When a real remote Reliable Reader requests missing data, the publisher trace sh
 ```text
 REQUESTED
 ADAPT_REQUEST_OBSERVED
-ADAPT_SHADOW_DECISION
+ADAPT_ADMISSION_DECISION
 RETRANSMIT_ENQUEUE
 ```
 
-The shadow decision is diagnostic only. `perform_nack_response()` still converts every requested change and calls the
-original `add_old_sample()` path.
+The admission decision may be `SEND_NOW`, `DEFER`, or `FORCE_SEND`. Deferred changes remain `REQUESTED` and the
+existing nack-response timer schedules another admission cycle. No sample is removed and no GAP is sent.
+
+Active V1 admission applies to synchronous writers. Asynchronous writers emit a
+`reason=ASYNC_QUEUE_FAIRNESS_NOT_IMPLEMENTED` bypass decision and retain the original behavior until old-queue aging
+or a minimum service share is implemented in the Flow Controller.
 
 The controller is Transport-independent: it applies to Reliable readers in `matched_remote_readers_`, whether their
 RTPS traffic uses UDP, SHM Transport, or another registered Transport. Intraprocess readers and Data Sharing readers

@@ -148,6 +148,56 @@ TEST(ReaderProxyTests, requested_changes_set_test)
     rproxy.requested_changes_set(set, gap_builder, {0, 1});
 }
 
+TEST(ReaderProxyTests, deferred_acknack_response_keeps_requested_state)
+{
+    StatefulWriter writer_mock;
+    WriterTimes writer_times;
+    RemoteLocatorsAllocationAttributes allocation;
+    ReaderProxy reader_proxy(writer_times, allocation, &writer_mock);
+    CacheChange_t cache_change;
+    cache_change.sequenceNumber = {0, 1};
+    RTPSMessageGroup message_group(nullptr, false);
+    RTPSGapBuilder gap_builder(message_group);
+
+    ReaderProxyData reader_attributes(0, 0);
+    reader_attributes.m_qos.m_reliability.kind = RELIABLE_RELIABILITY_QOS;
+    reader_proxy.start(reader_attributes);
+    reader_proxy.add_change(ChangeForReader_t(&cache_change), true, false);
+    reader_proxy.from_unsent_to_status(cache_change.sequenceNumber, UNACKNOWLEDGED, false, false);
+
+    SequenceNumberSet_t requested({0, 1});
+    requested.add({0, 1});
+    ASSERT_TRUE(reader_proxy.requested_changes_set(requested, gap_builder, cache_change.sequenceNumber));
+
+    uint32_t callbacks = 0;
+    uint32_t deferred = 0;
+    EXPECT_EQ(0u, reader_proxy.perform_acknack_response(
+                [](const ChangeForReader_t&)
+                {
+                    return false;
+                },
+                [&](ChangeForReader_t&)
+                {
+                    ++callbacks;
+                },
+                deferred));
+    EXPECT_EQ(1u, deferred);
+    EXPECT_EQ(0u, callbacks);
+
+    EXPECT_EQ(1u, reader_proxy.perform_acknack_response(
+                [](const ChangeForReader_t&)
+                {
+                    return true;
+                },
+                [&](ChangeForReader_t&)
+                {
+                    ++callbacks;
+                },
+                deferred));
+    EXPECT_EQ(0u, deferred);
+    EXPECT_EQ(1u, callbacks);
+}
+
 FragmentNumber_t mark_next_fragment_sent(
         ReaderProxy& rproxy,
         SequenceNumber_t sequence_number,

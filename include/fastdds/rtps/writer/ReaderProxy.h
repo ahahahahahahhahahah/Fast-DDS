@@ -217,6 +217,19 @@ public:
             const std::function<void(ChangeForReader_t& change)>& func);
 
     /**
+     * Turns admitted REQUESTED changes into UNSENT and leaves deferred changes as REQUESTED.
+     *
+     * @param should_admit Predicate called for each REQUESTED change.
+     * @param func Function executed for each admitted change.
+     * @param deferred Number of changes left in REQUESTED state.
+     * @return the number of changes that changed to UNSENT.
+     */
+    uint32_t perform_acknack_response(
+            const std::function<bool(const ChangeForReader_t& change)>& should_admit,
+            const std::function<void(ChangeForReader_t& change)>& func,
+            uint32_t& deferred);
+
+    /**
      * Call this to inform a change was removed from history.
      * @param seq_num Sequence number of the removed change.
      */
