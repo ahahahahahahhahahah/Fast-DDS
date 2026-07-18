@@ -2,7 +2,8 @@
 
 This harness measures application-visible behavior independently of the experimental Fast DDS trace. It uses finite
 reliable ROS 2 nodes, embeds a sequence number and `CLOCK_MONOTONIC` timestamp in each message, and reports delivery,
-latency, inter-arrival, ordering, and goodput statistics.
+inter-arrival, ordering, and goodput statistics. Add `--same-host` to the subscriber only when both processes run on
+one host; only then does it report one-way latency from the shared monotonic clock.
 
 ## Adaptive shadow controller
 
@@ -51,8 +52,9 @@ appear.
 transports and Data Sharing, then registers only UDPv4 so `tc netem` can create repeatable packet loss. This profile is
 not part of the adaptive mechanism and is not required for normal Fast DDS operation or cross-host tests.
 
-Use unique output files for every run. The two processes must run on the same Linux host for the monotonic timestamps
-to be directly comparable.
+Use unique output files for every run. On two hosts, do not pass `--same-host`: monotonic clock epochs are unrelated,
+even when wall clocks are synchronized. Cross-host one-way latency requires a separate PTP/clock-error method; receive
+rate, loss recovery, ordering, inter-arrival, and goodput remain valid without it.
 
 The profile explicitly uses `PREALLOCATED_WITH_REALLOC` for discovery and endpoint histories. This is required when
 `RMW_FASTRTPS_USE_QOS_FROM_XML=1`: in that mode, `rmw_fastrtps` leaves these middleware settings to XML, and the
@@ -116,6 +118,7 @@ env \
   python3 "$ROOT/tools/research/ros2_udp_benchmark/subscriber.py" \
     --expected 500 \
     --timeout 30 \
+    --same-host \
     --output "/tmp/adaptive_sub_${RUN_ID}.csv"
 
 echo "subscriber_exit=$?"

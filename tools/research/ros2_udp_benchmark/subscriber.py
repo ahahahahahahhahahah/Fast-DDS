@@ -17,6 +17,11 @@ def parse_args():
     parser.add_argument("--expected", type=int, default=500)
     parser.add_argument("--depth", type=int, default=1000)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--same-host",
+        action="store_true",
+        help="calculate one-way latency only when publisher and subscriber share CLOCK_MONOTONIC",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -63,7 +68,7 @@ def main():
             sequence,
             send_ns,
             receive_ns,
-            (receive_ns - send_ns) / 1000.0,
+            (receive_ns - send_ns) / 1000.0 if args.same_host else None,
             len(message.data.encode("utf-8")),
         ))
 
@@ -91,7 +96,7 @@ def main():
         ])
         writer.writerows(records)
 
-    latencies_us = [record[3] for record in records]
+    latencies_us = [record[3] for record in records if record[3] is not None]
     receive_times = [record[2] for record in records]
     interarrival_us = [
         (current - previous) / 1000.0
@@ -108,6 +113,7 @@ def main():
         "expected": args.expected,
         "goodput_mbps": (received_bytes * 8 / elapsed_s / 1_000_000) if elapsed_s > 0 else 0.0,
         "interarrival_p95_us": percentile(interarrival_us, 0.95),
+        "latency_clock": "shared_monotonic" if args.same_host else "unavailable_cross_host",
         "latency_max_us": max(latencies_us) if latencies_us else None,
         "latency_p50_us": percentile(latencies_us, 0.50),
         "latency_p95_us": percentile(latencies_us, 0.95),
