@@ -58,6 +58,8 @@ not part of the adaptive mechanism and is not required for normal Fast DDS opera
 
 `adaptive_udp_validation.xml` adds the `/adaptive_benchmark` enable property to the same controlled UDP setup. Use it
 only for active-controller fault injection. `adaptive_enabled.xml` remains the Transport-independent normal profile.
+Unset `ROS_LOCALHOST_ONLY` for this profile: Humble's RMW implementation otherwise appends an SHM Transport after XML
+loading, allowing user data to bypass loopback netem.
 
 Use unique output files for every run. On two hosts, do not pass `--same-host`: monotonic clock epochs are unrelated,
 even when wall clocks are synchronized. Cross-host one-way latency requires a separate PTP/clock-error method; receive
