@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ros2_adaptive_benchmark</name>
+  <version>0.1.0</version>
+  <description>Finite ROS 2 benchmark for adaptive Fast DDS retransmission research.</description>
+  <maintainer email="research@example.com">Fast DDS Research</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

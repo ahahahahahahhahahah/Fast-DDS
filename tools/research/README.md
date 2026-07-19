@@ -59,3 +59,10 @@ Transport 不是功能开关；只有可控丢包实验才会选择 UDP/netem �
 
 异步 Writer 在主动 V1 中回退原始 `SEND_NOW`，因为只限制旧样本准入不能修复 Flow Controller 的新队列
 绝对优先问题。支持异步 Writer 时必须同时实现旧队列最低服务份额或 aging。
+
+## 测量工具
+
+- `ros2_adaptive_benchmark/`：正式 C++ `ament_cmake` 包，用于同机默认 Transport 和双机性能测量；
+- `ros2_udp_benchmark/`：早期 Python 冒烟工具和可选的单机 UDP 故障注入配置。
+
+主要性能结果使用 C++ 工具并关闭重传 CSV trace。Python/UDP-only 工具只用于快速诊断，不作为最终数据源。

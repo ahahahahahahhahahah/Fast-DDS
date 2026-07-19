@@ -1,5 +1,8 @@
 # ROS 2 UDP retransmission benchmark
 
+This is the early Python smoke-test harness. Use `../ros2_adaptive_benchmark/` for primary same-host and cross-host
+measurements.
+
 This harness measures application-visible behavior independently of the experimental Fast DDS trace. It uses finite
 reliable ROS 2 nodes, embeds a sequence number and `CLOCK_MONOTONIC` timestamp in each message, and reports delivery,
 inter-arrival, ordering, and goodput statistics. Add `--same-host` to the subscriber only when both processes run on
