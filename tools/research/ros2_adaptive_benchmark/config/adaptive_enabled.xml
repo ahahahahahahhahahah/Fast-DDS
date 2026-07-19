@@ -1,7 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <profiles>
+        <participant profile_name="adaptive_benchmark_participant" is_default_profile="true">
+            <rtps>
+                <builtin>
+                    <readerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</readerHistoryMemoryPolicy>
+                    <writerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</writerHistoryMemoryPolicy>
+                </builtin>
+            </rtps>
+        </participant>
+
+        <publisher profile_name="adaptive_benchmark_default_writer" is_default_profile="true">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </publisher>
+
+        <subscriber profile_name="adaptive_benchmark_default_reader" is_default_profile="true">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
+
         <publisher profile_name="/adaptive_benchmark">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
             <propertiesPolicy>
                 <properties>
                     <property>
@@ -11,5 +29,9 @@
                 </properties>
             </propertiesPolicy>
         </publisher>
+
+        <subscriber profile_name="/adaptive_benchmark">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
     </profiles>
 </dds>
