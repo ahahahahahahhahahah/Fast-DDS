@@ -101,7 +101,7 @@ int main(
 
         rclcpp::init(argc, argv);
         auto node = std::make_shared<rclcpp::Node>("adaptive_benchmark_subscriber");
-        rclcpp::QoS qos(rclcpp::KeepLast(depth));
+        rclcpp::QoS qos{rclcpp::KeepLast(depth)};
         qos.reliable();
         auto subscription = node->create_subscription<std_msgs::msg::String>(
             topic,

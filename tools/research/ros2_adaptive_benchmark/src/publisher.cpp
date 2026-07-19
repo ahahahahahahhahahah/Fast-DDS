@@ -68,7 +68,7 @@ int main(
 
         rclcpp::init(argc, argv);
         auto node = std::make_shared<rclcpp::Node>("adaptive_benchmark_publisher");
-        rclcpp::QoS qos(rclcpp::KeepLast(depth));
+        rclcpp::QoS qos{rclcpp::KeepLast(depth)};
         qos.reliable();
         auto publisher = node->create_publisher<std_msgs::msg::String>(topic, qos);
 
