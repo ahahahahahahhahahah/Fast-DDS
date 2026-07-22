@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <sstream>
 
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/messages/RTPSMessageCreator.h>
@@ -30,6 +31,8 @@
 #include <rtps/participant/RTPSParticipantImpl.h>
 
 #include <statistics/rtps/messages/RTPSStatisticsMessages.hpp>
+
+#include "../RetransmissionTrace.hpp"
 
 namespace eprosima {
 namespace fastrtps {
@@ -310,9 +313,23 @@ void RTPSMessageGroup::send()
 
             eprosima::fastdds::statistics::rtps::add_statistics_submessage(msgToSend);
 
-            if (!sender_->send(msgToSend,
-                    max_blocking_time_is_set_ ? max_blocking_time_point_ : (std::chrono::steady_clock::now() +
-                    std::chrono::hours(24))))
+            const bool sent = sender_->send(
+                msgToSend,
+                max_blocking_time_is_set_ ? max_blocking_time_point_ : (std::chrono::steady_clock::now() +
+                std::chrono::hours(24)));
+            std::ostringstream detail;
+            detail << "sent=" << sent
+                   << ";message_bytes=" << msgToSend->length
+                   << ";remote_guid_count=" << sender_->remote_guids().size()
+                   << ";remote_participant_count=" << sender_->remote_participants().size();
+            FASTDDS_TRACE_RETRANSMISSION(
+                "RTPS_SUBMIT",
+                endpoint_->getGuid(),
+                c_Guid_Unknown,
+                SequenceNumber_t::unknown(),
+                msgToSend->length,
+                detail.str());
+            if (!sent)
             {
                 throw timeout();
             }

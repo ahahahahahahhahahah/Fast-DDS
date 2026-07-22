@@ -43,6 +43,18 @@ public:
     void begin_admission_cycle(
             StatefulWriter* writer);
 
+    bool admission_planning_enabled(
+            StatefulWriter* writer);
+
+    void add_admission_candidate(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const CacheChange_t& change,
+            bool earliest_requested);
+
+    void finalize_admission_cycle(
+            StatefulWriter* writer);
+
     AdaptiveRetransmissionDecision decide_retransmission(
             StatefulWriter* writer,
             const GUID_t& reader_guid,

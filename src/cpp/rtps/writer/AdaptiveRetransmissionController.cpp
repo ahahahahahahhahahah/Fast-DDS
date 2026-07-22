@@ -9,10 +9,12 @@
 #include <cctype>
 #include <chrono>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include <fastdds/rtps/attributes/PropertyPolicy.h>
 #include <fastdds/rtps/common/CacheChange.h>
@@ -35,9 +37,14 @@ constexpr const char* enabled_property = "fastdds.adaptive_retransmission.enable
 constexpr uint32_t warmup_feedback_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
+constexpr uint32_t max_planned_changes_per_cycle = 32;
 constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
 constexpr uint32_t max_defer_ms = 50;
 constexpr double slow_feedback_ms = 25.0;
+constexpr uint64_t min_dynamic_bytes_per_cycle = 16 * 1024;
+constexpr uint64_t max_dynamic_bytes_per_cycle = 256 * 1024;
+constexpr uint64_t additive_budget_step = 8 * 1024;
+constexpr double pressure_feedback_ratio = 1.5;
 
 struct ReaderKey
 {
@@ -92,6 +99,36 @@ struct ChangeState
     steady_clock::time_point last_interest;
 };
 
+enum class RecoveryState
+{
+    NORMAL,
+    PRESSURE,
+    RECOVERY
+};
+
+struct WriterState
+{
+    uint64_t byte_budget = max_bytes_per_cycle;
+    uint64_t previous_candidate_bytes = 0;
+    double stable_feedback_ms = 0.0;
+    RecoveryState recovery_state = RecoveryState::NORMAL;
+    uint32_t pressure_cycles = 0;
+    uint32_t improving_cycles = 0;
+};
+
+struct AdmissionCandidate
+{
+    ChangeKey key;
+    uint32_t estimated_bytes = 0;
+    double request_age_ms = 0.0;
+    uint32_t requests = 0;
+    bool earliest_requested = false;
+    bool has_newer_change = false;
+    bool important = false;
+    bool replaceable = false;
+    double value_horizon_ms = 0.0;
+};
+
 double update_ewma(
         double current,
         double sample)
@@ -127,6 +164,50 @@ bool property_is_enabled(
     return "1" == normalized || "true" == normalized || "on" == normalized;
 }
 
+const std::string* find_property(
+        StatefulWriter& writer,
+        const char* name)
+{
+    return PropertyPolicyHelper::find_property(writer.getAttributes().properties, name);
+}
+
+double positive_property_or(
+        StatefulWriter& writer,
+        const char* name,
+        double fallback)
+{
+    const std::string* value = find_property(writer, name);
+    if (nullptr != value)
+    {
+        try
+        {
+            const double parsed = std::stod(*value);
+            if (parsed > 0.0)
+            {
+                return parsed;
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+    return fallback;
+}
+
+const char* recovery_state_name(
+        RecoveryState state)
+{
+    switch (state)
+    {
+        case RecoveryState::PRESSURE:
+            return "PRESSURE";
+        case RecoveryState::RECOVERY:
+            return "RECOVERY";
+        default:
+            return "NORMAL";
+    }
+}
+
 } // namespace
 
 struct AdaptiveRetransmissionController::Implementation
@@ -134,6 +215,9 @@ struct AdaptiveRetransmissionController::Implementation
     std::mutex mutex;
     std::map<ReaderKey, ReaderState> readers;
     std::map<ChangeKey, ChangeState> changes;
+    std::map<GUID_t, WriterState> writers;
+    std::map<GUID_t, std::vector<AdmissionCandidate>> cycle_candidates;
+    std::map<ChangeKey, AdaptiveRetransmissionDecision> cycle_plan;
 
     size_t outstanding_changes(
             const ReaderKey& key) const
@@ -250,6 +334,18 @@ void AdaptiveRetransmissionController::begin_admission_cycle(
     }
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->cycle_candidates[writer->getGuid()].clear();
+    for (auto it = impl_->cycle_plan.begin(); it != impl_->cycle_plan.end(); )
+    {
+        if (it->first.path.writer == writer->getGuid())
+        {
+            it = impl_->cycle_plan.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
     for (auto& item : impl_->readers)
     {
         if (item.first.writer == writer->getGuid())
@@ -258,6 +354,278 @@ void AdaptiveRetransmissionController::begin_admission_cycle(
             item.second.admitted_bytes_in_cycle = 0;
         }
     }
+}
+
+bool AdaptiveRetransmissionController::admission_planning_enabled(
+        StatefulWriter* writer)
+{
+    return nullptr != writer && property_is_enabled(*writer) && !writer->isAsync();
+}
+
+void AdaptiveRetransmissionController::add_admission_candidate(
+        StatefulWriter* writer,
+        const GUID_t& reader_guid,
+        const CacheChange_t& change,
+        bool earliest_requested)
+{
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    {
+        return;
+    }
+
+    const auto now = steady_clock::now();
+    const ReaderKey reader_key {writer->getGuid(), reader_guid};
+    const ChangeKey change_key {reader_key, change.sequenceNumber};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    ChangeState& observed = impl_->changes[change_key];
+    if (0 == observed.requests)
+    {
+        observed.first_request = now;
+        observed.estimated_bytes = change.serializedPayload.length;
+    }
+
+    AdmissionCandidate candidate;
+    candidate.key = change_key;
+    candidate.estimated_bytes = 0 == observed.estimated_bytes ?
+            change.serializedPayload.length : observed.estimated_bytes;
+    candidate.request_age_ms = std::chrono::duration<double, std::milli>(
+        now - observed.first_request).count();
+    candidate.requests = observed.requests;
+    candidate.earliest_requested = earliest_requested;
+    candidate.has_newer_change = change.sequenceNumber + 1 < writer->next_sequence_number();
+
+    const std::string* value_class = find_property(*writer,
+                    "fastdds.adaptive_retransmission.value_class");
+    candidate.important = nullptr != value_class && "important" == *value_class;
+    candidate.replaceable = nullptr != value_class && "replaceable_snapshot" == *value_class;
+    candidate.value_horizon_ms = positive_property_or(*writer,
+                    "fastdds.adaptive_retransmission.value_horizon_ms", 0.0);
+    impl_->cycle_candidates[writer->getGuid()].push_back(candidate);
+}
+
+void AdaptiveRetransmissionController::finalize_admission_cycle(
+        StatefulWriter* writer)
+{
+    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    {
+        return;
+    }
+
+    struct ChangeGroup
+    {
+        SequenceNumber_t sequence;
+        std::vector<size_t> candidates;
+        uint32_t estimated_bytes = 0;
+        double max_age_ms = 0.0;
+        uint32_t max_requests = 0;
+        bool force = false;
+        bool blocking = false;
+        bool urgent = false;
+        bool superseded = true;
+    };
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    struct PlanTrace
+    {
+        GUID_t reader;
+        SequenceNumber_t sequence;
+        uint32_t estimated_bytes;
+        std::string detail;
+    };
+    std::vector<PlanTrace> plan_traces;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
+        std::map<SequenceNumber_t, ChangeGroup> grouped;
+        const double hard_max_defer = positive_property_or(*writer,
+                        "fastdds.adaptive_retransmission.hard_max_defer_ms", max_defer_ms);
+
+        for (size_t index = 0; index < candidates.size(); ++index)
+        {
+            const AdmissionCandidate& candidate = candidates[index];
+            ChangeGroup& group = grouped[candidate.key.sequence];
+            group.sequence = candidate.key.sequence;
+            group.candidates.push_back(index);
+            group.estimated_bytes = std::max(group.estimated_bytes, candidate.estimated_bytes);
+            group.max_age_ms = std::max(group.max_age_ms, candidate.request_age_ms);
+            group.max_requests = std::max(group.max_requests, candidate.requests);
+            group.force |= candidate.request_age_ms >= hard_max_defer;
+            group.blocking |= candidate.earliest_requested;
+            group.urgent |= candidate.important && candidate.value_horizon_ms > 0.0 &&
+                    candidate.request_age_ms >= 0.75 * candidate.value_horizon_ms;
+            group.superseded &= candidate.replaceable && candidate.has_newer_change;
+        }
+
+        std::vector<ChangeGroup*> ordered;
+        uint64_t candidate_bytes = 0;
+        for (auto& item : grouped)
+        {
+            ordered.push_back(&item.second);
+            candidate_bytes += item.second.estimated_bytes;
+        }
+
+        WriterState& writer_state = impl_->writers[writer->getGuid()];
+        double feedback_ms = 0.0;
+        for (const auto& item : impl_->readers)
+        {
+            if (item.first.writer == writer->getGuid())
+            {
+                feedback_ms = std::max(feedback_ms, item.second.recovery_feedback_ewma_ms);
+            }
+        }
+        if (feedback_ms > 0.0 && 0.0 == writer_state.stable_feedback_ms)
+        {
+            writer_state.stable_feedback_ms = feedback_ms;
+        }
+
+        const bool feedback_pressure = writer_state.stable_feedback_ms > 0.0 &&
+                feedback_ms > pressure_feedback_ratio * writer_state.stable_feedback_ms;
+        const bool backlog_growing = candidate_bytes > writer_state.previous_candidate_bytes;
+        const bool pressure_signal = (feedback_pressure && backlog_growing) ||
+                candidate_bytes > 4 * writer_state.byte_budget;
+
+        if (pressure_signal)
+        {
+            ++writer_state.pressure_cycles;
+            writer_state.improving_cycles = 0;
+            if (writer_state.pressure_cycles >= 2)
+            {
+                writer_state.recovery_state = RecoveryState::PRESSURE;
+                writer_state.byte_budget = std::max(
+                    min_dynamic_bytes_per_cycle, writer_state.byte_budget / 2);
+            }
+        }
+        else
+        {
+            writer_state.pressure_cycles = 0;
+            ++writer_state.improving_cycles;
+            if (RecoveryState::PRESSURE == writer_state.recovery_state)
+            {
+                writer_state.recovery_state = RecoveryState::RECOVERY;
+            }
+            if (writer_state.improving_cycles >= 3)
+            {
+                writer_state.byte_budget = std::min(
+                    max_dynamic_bytes_per_cycle, writer_state.byte_budget + additive_budget_step);
+                if (writer_state.byte_budget >= max_bytes_per_cycle)
+                {
+                    writer_state.recovery_state = RecoveryState::NORMAL;
+                }
+            }
+            if (RecoveryState::NORMAL == writer_state.recovery_state && feedback_ms > 0.0)
+            {
+                writer_state.stable_feedback_ms = update_ewma(writer_state.stable_feedback_ms, feedback_ms);
+            }
+        }
+        writer_state.previous_candidate_bytes = candidate_bytes;
+
+        std::sort(ordered.begin(), ordered.end(),
+                [](const ChangeGroup* left, const ChangeGroup* right)
+                {
+                    if (left->force != right->force)
+                    {
+                        return left->force;
+                    }
+                    if (left->blocking != right->blocking)
+                    {
+                        return left->blocking;
+                    }
+                    if (left->urgent != right->urgent)
+                    {
+                        return left->urgent;
+                    }
+                    if (left->superseded != right->superseded)
+                    {
+                        return !left->superseded;
+                    }
+                    if (left->max_age_ms != right->max_age_ms)
+                    {
+                        return left->max_age_ms > right->max_age_ms;
+                    }
+                    if (left->max_requests != right->max_requests)
+                    {
+                        return left->max_requests > right->max_requests;
+                    }
+                    if (left->estimated_bytes != right->estimated_bytes)
+                    {
+                        return left->estimated_bytes < right->estimated_bytes;
+                    }
+                    return left->sequence < right->sequence;
+                });
+
+        uint64_t admitted_bytes = 0;
+        uint32_t admitted_changes = 0;
+        for (const ChangeGroup* group : ordered)
+        {
+            const bool within_change_limit = admitted_changes < max_planned_changes_per_cycle;
+            const bool within_byte_limit = 0 == admitted_changes ||
+                    admitted_bytes + group->estimated_bytes <= writer_state.byte_budget;
+            const bool admitted = group->force || (within_change_limit && within_byte_limit);
+
+            for (size_t index : group->candidates)
+            {
+                const AdmissionCandidate& candidate = candidates[index];
+                const AdaptiveRetransmissionDecision decision = !admitted ?
+                        AdaptiveRetransmissionDecision::DEFER :
+                        (candidate.request_age_ms >= hard_max_defer ?
+                        AdaptiveRetransmissionDecision::FORCE_SEND :
+                        AdaptiveRetransmissionDecision::SEND_NOW);
+                impl_->cycle_plan[candidate.key] = decision;
+                if (AdaptiveRetransmissionDecision::DEFER != decision)
+                {
+                    impl_->changes[candidate.key].last_interest = steady_clock::now();
+                }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                std::ostringstream detail;
+                detail << "network_state=" << recovery_state_name(writer_state.recovery_state)
+                       << ";decision=" << (AdaptiveRetransmissionDecision::DEFER == decision ? "DEFER" :
+                        (AdaptiveRetransmissionDecision::FORCE_SEND == decision ? "FORCE_SEND" : "SEND_NOW"))
+                       << ";request_age_ms=" << candidate.request_age_ms
+                       << ";estimated_bytes=" << candidate.estimated_bytes
+                       << ";cycle_byte_budget=" << writer_state.byte_budget
+                       << ";cycle_candidate_bytes=" << candidate_bytes
+                       << ";earliest_requested=" << candidate.earliest_requested
+                       << ";has_newer_change=" << candidate.has_newer_change
+                       << ";important=" << candidate.important
+                       << ";replaceable=" << candidate.replaceable
+                       << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
+                                candidate.value_horizon_ms > 0.0 &&
+                                candidate.request_age_ms >= candidate.value_horizon_ms)
+                       << ";hard_max_defer_ms=" << hard_max_defer;
+                plan_traces.push_back(
+                    PlanTrace
+                    {
+                        candidate.key.path.reader,
+                        candidate.key.sequence,
+                        candidate.estimated_bytes,
+                        detail.str()
+                    });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            }
+
+            if (admitted && !group->force)
+            {
+                ++admitted_changes;
+                admitted_bytes += group->estimated_bytes;
+            }
+        }
+    }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    for (const PlanTrace& trace : plan_traces)
+    {
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_V2_PLAN_DECISION",
+            writer->getGuid(),
+            trace.reader,
+            trace.sequence,
+            trace.estimated_bytes,
+            trace.detail);
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransmission(
@@ -280,6 +648,32 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
             change.serializedPayload.length,
             std::string("state=BYPASS;decision=SEND_NOW;reason=ASYNC_QUEUE_FAIRNESS_NOT_IMPLEMENTED"));
         return AdaptiveRetransmissionDecision::SEND_NOW;
+    }
+
+    AdaptiveRetransmissionDecision planned_decision = AdaptiveRetransmissionDecision::SEND_NOW;
+    bool has_planned_decision = false;
+    {
+        const ChangeKey key {{writer->getGuid(), reader_guid}, change.sequenceNumber};
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto planned = impl_->cycle_plan.find(key);
+        if (planned != impl_->cycle_plan.end())
+        {
+            planned_decision = planned->second;
+            has_planned_decision = true;
+        }
+    }
+    if (has_planned_decision)
+    {
+        const char* action = AdaptiveRetransmissionDecision::DEFER == planned_decision ? "DEFER" :
+                (AdaptiveRetransmissionDecision::FORCE_SEND == planned_decision ? "FORCE_SEND" : "SEND_NOW");
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ADMISSION_DECISION",
+            writer->getGuid(),
+            reader_guid,
+            change.sequenceNumber,
+            change.serializedPayload.length,
+            std::string("state=V2_PLANNED;decision=") + action + ";reason=ADMISSION_PLAN");
+        return planned_decision;
     }
 
     const auto now = steady_clock::now();
@@ -390,29 +784,67 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
 
     const auto now = steady_clock::now();
     const ReaderKey reader_key {writer->getGuid(), reader_guid};
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto reader_it = impl_->readers.find(reader_key);
-
-    for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    struct AckTrace
     {
-        const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
-        if (same_reader && it->first.sequence < sequence_number)
+        SequenceNumber_t sequence;
+        uint32_t estimated_bytes;
+        double feedback_ms;
+    };
+    std::vector<AckTrace> ack_traces;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto reader_it = impl_->readers.find(reader_key);
+
+        for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
         {
-            if (reader_it != impl_->readers.end() && it->second.last_interest != steady_clock::time_point())
+            const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
+            if (same_reader && it->first.sequence < sequence_number)
             {
-                const double feedback_ms =
-                        std::chrono::duration<double, std::milli>(now - it->second.last_interest).count();
-                ReaderState& reader = reader_it->second;
-                reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
-                ++reader.feedback_samples;
+                if (reader_it != impl_->readers.end() && it->second.last_interest != steady_clock::time_point())
+                {
+                    const double feedback_ms =
+                            std::chrono::duration<double, std::milli>(now - it->second.last_interest).count();
+                    ReaderState& reader = reader_it->second;
+                    reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
+                    ++reader.feedback_samples;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    ack_traces.push_back(
+                        AckTrace
+                        {
+                            it->first.sequence,
+                            it->second.estimated_bytes,
+                            feedback_ms
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                it = impl_->changes.erase(it);
             }
-            it = impl_->changes.erase(it);
-        }
-        else
-        {
-            ++it;
+            else
+            {
+                ++it;
+            }
         }
     }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    for (const AckTrace& trace : ack_traces)
+    {
+        std::ostringstream detail;
+        detail << "source=cumulative_ack"
+               << ";ack_base=" << sequence_number
+               << ";feedback_ms=" << trace.feedback_ms;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ACK_CONFIRMED_PROXY",
+            writer->getGuid(),
+            reader_guid,
+            trace.sequence,
+            trace.estimated_bytes,
+            detail.str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 void AdaptiveRetransmissionController::on_change_removed(

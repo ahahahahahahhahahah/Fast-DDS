@@ -37,6 +37,7 @@
 #include <fastrtps/utils/collections/ResourceLimitedVector.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <atomic>
@@ -206,6 +207,15 @@ public:
      * @return true if at least one change changed its status, false otherwise.
      */
     bool perform_nack_supression();
+
+    /**
+     * Visits all changes currently waiting for an ACKNACK response without changing their state.
+     *
+     * @param func Function executed for each REQUESTED change. The boolean argument is true for the
+     *             lowest requested sequence in this reader.
+     */
+    void for_each_requested_change(
+            const std::function<void(const ChangeForReader_t& change, bool earliest_requested)>& func) const;
 
     /**
      * Turns all REQUESTED changes into UNSENT.

@@ -56,6 +56,7 @@
 #include "AdaptiveRetransmissionController.hpp"
 
 #include <mutex>
+#include <sstream>
 #include <vector>
 #include <stdexcept>
 
@@ -683,6 +684,29 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
     uint32_t n_fragments = change->getFragmentCount();
     FragmentNumber_t min_unsent_fragment = 0;
     bool need_reactivate_periodic_heartbeat = false;
+    auto trace_data_built = [this, change, n_fragments](
+        const GUID_t& reader_guid,
+        const char* event,
+        FragmentNumber_t fragment_number,
+        uint32_t built_payload_size,
+        uint32_t locator_count,
+        bool separate_sending,
+        bool inline_qos)
+            {
+                std::ostringstream detail;
+                detail << "fragment=" << fragment_number
+                       << ";fragment_count=" << n_fragments
+                       << ";locator_count=" << locator_count
+                       << ";separate_sending=" << separate_sending
+                       << ";inline_qos=" << inline_qos;
+                FASTDDS_TRACE_RETRANSMISSION(
+                    event,
+                    getGuid(),
+                    reader_guid,
+                    change->sequenceNumber,
+                    built_payload_size,
+                    detail.str());
+            };
 
     while (DeliveryRetCode::DELIVERED == ret_code &&
             min_unsent_fragment != n_fragments + 1)
@@ -785,12 +809,25 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                             {
                                 if (group.add_data_frag(*change, min_unsent_fragment, inline_qos))
                                 {
+                                    const uint32_t fragment_start =
+                                            change->getFragmentSize() * (min_unsent_fragment - 1);
+                                    const uint32_t fragment_payload_size =
+                                            min_unsent_fragment < n_fragments ? change->getFragmentSize() :
+                                            change->serializedPayload.length - fragment_start;
                                     for (auto remote_reader = first_relevant_reader;
                                             remote_reader != matched_remote_readers_.end();
                                             ++remote_reader)
                                     {
                                         if ((*remote_reader)->active())
                                         {
+                                            trace_data_built(
+                                                (*remote_reader)->guid(),
+                                                "DATA_FRAG_BUILT",
+                                                min_unsent_fragment,
+                                                fragment_payload_size,
+                                                static_cast<uint32_t>(num_locators),
+                                                false,
+                                                inline_qos);
                                             bool allFragmentsSent = false;
                                             (*remote_reader)->mark_fragment_as_sent_for_change(
                                                 change->sequenceNumber,
@@ -831,6 +868,14 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                 {
                                     if ((*remote_reader)->active())
                                     {
+                                        trace_data_built(
+                                            (*remote_reader)->guid(),
+                                            "DATA_BUILT",
+                                            0,
+                                            change->serializedPayload.length,
+                                            static_cast<uint32_t>(num_locators),
+                                            false,
+                                            inline_qos);
                                         if (!(*remote_reader)->is_reliable())
                                         {
                                             (*remote_reader)->acked_changes_set(change->sequenceNumber + 1);
@@ -871,6 +916,19 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                 {
                                     if (group.add_data_frag(*change, min_unsent_fragment, inline_qos))
                                     {
+                                        const uint32_t fragment_start =
+                                                change->getFragmentSize() * (min_unsent_fragment - 1);
+                                        const uint32_t fragment_payload_size =
+                                                min_unsent_fragment < n_fragments ? change->getFragmentSize() :
+                                                change->serializedPayload.length - fragment_start;
+                                        trace_data_built(
+                                            (*remote_reader)->guid(),
+                                            "DATA_FRAG_BUILT",
+                                            min_unsent_fragment,
+                                            fragment_payload_size,
+                                            static_cast<uint32_t>((*remote_reader)->locators_size()),
+                                            true,
+                                            inline_qos);
                                         bool allFragmentsSent = false;
                                         (*remote_reader)->mark_fragment_as_sent_for_change(
                                             change->sequenceNumber,
@@ -903,6 +961,14 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                             {
                                 if (group.add_data(*change, (*remote_reader)->expects_inline_qos()))
                                 {
+                                    trace_data_built(
+                                        (*remote_reader)->guid(),
+                                        "DATA_BUILT",
+                                        0,
+                                        change->serializedPayload.length,
+                                        static_cast<uint32_t>((*remote_reader)->locators_size()),
+                                        true,
+                                        (*remote_reader)->expects_inline_qos());
                                     if (!(*remote_reader)->is_reliable())
                                     {
                                         (*remote_reader)->acked_changes_set(change->sequenceNumber + 1);
@@ -1857,51 +1923,89 @@ bool StatefulWriter::perform_nack_response_event()
 
     uint32_t changes_to_resend = 0;
     uint32_t deferred_changes = 0;
+    auto enqueue_retransmission = [this](
+        const GUID_t& reader_guid,
+        ChangeForReader_t& change)
+            {
+                assert(nullptr != change.getChange());
+                CacheChange_t* cache_change = change.getChange();
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "RETRANSMIT_ENQUEUE",
+                    getGuid(),
+                    reader_guid,
+                    cache_change->sequenceNumber,
+                    cache_change->serializedPayload.length,
+                    std::string());
+                const bool queued = flow_controller_->add_old_sample(this, cache_change);
+                std::ostringstream detail;
+                detail << "queued=" << queued;
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "QUEUE_ADD_RESULT",
+                    getGuid(),
+                    reader_guid,
+                    cache_change->sequenceNumber,
+                    cache_change->serializedPayload.length,
+                    detail.str());
+            };
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-    detail::AdaptiveRetransmissionController::instance().begin_admission_cycle(this);
+    const bool adaptive_admission_planning =
+            detail::AdaptiveRetransmissionController::instance().admission_planning_enabled(this);
+    if (adaptive_admission_planning)
+    {
+        detail::AdaptiveRetransmissionController::instance().begin_admission_cycle(this);
+        for (ReaderProxy* reader : matched_remote_readers_)
+        {
+            reader->for_each_requested_change(
+                [&](const ChangeForReader_t& change, bool earliest_requested)
+                {
+                    assert(nullptr != change.getChange());
+                    detail::AdaptiveRetransmissionController::instance().add_admission_candidate(
+                        this,
+                        reader->guid(),
+                        *change.getChange(),
+                        earliest_requested);
+                });
+        }
+        detail::AdaptiveRetransmissionController::instance().finalize_admission_cycle(this);
+    }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
     for (ReaderProxy* reader : matched_remote_readers_)
     {
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-        uint32_t reader_deferred = 0;
-        changes_to_resend += reader->perform_acknack_response(
-                    [&](const ChangeForReader_t& change)
-                    {
-                        assert(nullptr != change.getChange());
-                        return detail::AdaptiveRetransmissionDecision::DEFER !=
-                               detail::AdaptiveRetransmissionController::instance().decide_retransmission(
-                            this,
-                            reader->guid(),
-                            *change.getChange());
-                    },
-                    [&](ChangeForReader_t& change)
-                    {
-                        // This lambda is called if the ChangeForReader_t passes from REQUESTED to UNSENT.
-                        assert(nullptr != change.getChange());
-                        FASTDDS_TRACE_RETRANSMISSION(
-                            "RETRANSMIT_ENQUEUE",
-                            getGuid(),
-                            reader->guid(),
-                            change.getChange()->sequenceNumber,
-                            change.getChange()->serializedPayload.length,
-                            std::string());
-                        flow_controller_->add_old_sample(this, change.getChange());
-                    },
-                    reader_deferred);
-        deferred_changes += reader_deferred;
+        if (adaptive_admission_planning)
+        {
+            uint32_t reader_deferred = 0;
+            changes_to_resend += reader->perform_acknack_response(
+                        [&](const ChangeForReader_t& change)
+                        {
+                            assert(nullptr != change.getChange());
+                            return detail::AdaptiveRetransmissionDecision::DEFER !=
+                                   detail::AdaptiveRetransmissionController::instance().decide_retransmission(
+                                this,
+                                reader->guid(),
+                                *change.getChange());
+                        },
+                        [&](ChangeForReader_t& change)
+                        {
+                            // This lambda is called if the ChangeForReader_t passes from REQUESTED to UNSENT.
+                            enqueue_retransmission(reader->guid(), change);
+                        },
+                        reader_deferred);
+            deferred_changes += reader_deferred;
+        }
+        else
+        {
+            changes_to_resend += reader->perform_acknack_response(
+                        [&](ChangeForReader_t& change)
+                        {
+                            enqueue_retransmission(reader->guid(), change);
+                        });
+        }
 #else
         changes_to_resend += reader->perform_acknack_response(
                     [&](ChangeForReader_t& change)
                     {
-                        assert(nullptr != change.getChange());
-                        FASTDDS_TRACE_RETRANSMISSION(
-                            "RETRANSMIT_ENQUEUE",
-                            getGuid(),
-                            reader->guid(),
-                            change.getChange()->sequenceNumber,
-                            change.getChange()->serializedPayload.length,
-                            std::string());
-                        flow_controller_->add_old_sample(this, change.getChange());
+                        enqueue_retransmission(reader->guid(), change);
                     });
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
     }
@@ -1992,7 +2096,24 @@ bool StatefulWriter::process_acknack(
                                     if (remote_reader->process_initial_acknack([&](ChangeForReader_t& change_reader)
                                     {
                                         assert(nullptr != change_reader.getChange());
-                                        flow_controller_->add_old_sample(this, change_reader.getChange());
+                                        CacheChange_t* cache_change = change_reader.getChange();
+                                        FASTDDS_TRACE_RETRANSMISSION(
+                                            "RETRANSMIT_ENQUEUE",
+                                            getGuid(),
+                                            remote_reader->guid(),
+                                            cache_change->sequenceNumber,
+                                            cache_change->serializedPayload.length,
+                                            std::string("reason=INITIAL_ACKNACK"));
+                                        const bool queued = flow_controller_->add_old_sample(this, cache_change);
+                                        std::ostringstream detail;
+                                        detail << "queued=" << queued << ";reason=INITIAL_ACKNACK";
+                                        FASTDDS_TRACE_RETRANSMISSION(
+                                            "QUEUE_ADD_RESULT",
+                                            getGuid(),
+                                            remote_reader->guid(),
+                                            cache_change->sequenceNumber,
+                                            cache_change->serializedPayload.length,
+                                            detail.str());
                                     }))
                                     {
                                         if (remote_reader->is_remote_and_reliable())

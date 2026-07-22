@@ -564,6 +564,20 @@ bool ReaderProxy::perform_nack_supression()
     return 0 != convert_status_on_all_changes(UNDERWAY, UNACKNOWLEDGED);
 }
 
+void ReaderProxy::for_each_requested_change(
+        const std::function<void(const ChangeForReader_t& change, bool earliest_requested)>& func) const
+{
+    bool earliest_requested = true;
+    for (const ChangeForReader_t& change : changes_for_reader_)
+    {
+        if (REQUESTED == change.getStatus())
+        {
+            func(change, earliest_requested);
+            earliest_requested = false;
+        }
+    }
+}
+
 uint32_t ReaderProxy::perform_acknack_response(
         const std::function<void(ChangeForReader_t& change)>& func)
 {
