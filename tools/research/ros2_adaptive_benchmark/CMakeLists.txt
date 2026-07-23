@@ -21,13 +21,26 @@ add_executable(adaptive_benchmark_subscriber src/subscriber.cpp)
 target_include_directories(adaptive_benchmark_subscriber PRIVATE include)
 ament_target_dependencies(adaptive_benchmark_subscriber rclcpp std_msgs)
 
+add_executable(adaptive_value_workload_publisher src/value_workload_publisher.cpp)
+target_include_directories(adaptive_value_workload_publisher PRIVATE include)
+ament_target_dependencies(adaptive_value_workload_publisher rclcpp std_msgs)
+
+add_executable(adaptive_value_workload_subscriber src/value_workload_subscriber.cpp)
+target_include_directories(adaptive_value_workload_subscriber PRIVATE include)
+ament_target_dependencies(adaptive_value_workload_subscriber rclcpp std_msgs)
+
 install(TARGETS
   adaptive_benchmark_publisher
   adaptive_benchmark_subscriber
+  adaptive_value_workload_publisher
+  adaptive_value_workload_subscriber
   DESTINATION lib/${PROJECT_NAME})
 
 install(FILES
   config/adaptive_enabled.xml
+  config/adaptive_off.xml
+  config/adaptive_topics_enabled.xml
+  config/adaptive_topics_off.xml
   DESTINATION share/${PROJECT_NAME}/config)
 
 ament_package()

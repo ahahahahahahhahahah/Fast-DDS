@@ -39,6 +39,35 @@ adaptive-enabled      adaptive library loaded, Topic property present
 Primary measurements must use Fast DDS builds with `FASTDDS_RETRANSMISSION_TRACE=OFF`. Use a trace-enabled build only
 for separate controller-action evidence.
 
+## Executables
+
+Single-topic pressure benchmark:
+
+```text
+adaptive_benchmark_publisher
+adaptive_benchmark_subscriber
+```
+
+Topic-level value workload benchmark:
+
+```text
+adaptive_value_workload_publisher
+adaptive_value_workload_subscriber
+```
+
+The value workload publishes three reliable topics from one process and subscribes to the same three topics from the
+peer process:
+
+```text
+/adaptive/control_cmd      small, important control stream
+/adaptive/robot_state      medium state stream
+/adaptive/sensor_snapshot  high-rate replaceable snapshot stream
+```
+
+Use `adaptive_topics_off.xml` for the adaptive-disabled control group and `adaptive_topics_enabled.xml` for the
+topic-level adaptive-enabled group. This benchmark validates writer-local old-sample admission under different topic
+value properties. It does not by itself validate cross-writer FlowController priority scheduling.
+
 ## Same-Host Default Transport
 
 Start the Subscriber in Terminal A:

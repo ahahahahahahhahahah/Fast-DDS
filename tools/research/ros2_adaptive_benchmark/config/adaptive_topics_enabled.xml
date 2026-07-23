@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <participant profile_name="adaptive_value_workload_participant" is_default_profile="true">
+            <rtps>
+                <builtin>
+                    <readerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</readerHistoryMemoryPolicy>
+                    <writerHistoryMemoryPolicy>PREALLOCATED_WITH_REALLOC</writerHistoryMemoryPolicy>
+                </builtin>
+            </rtps>
+        </participant>
+
+        <publisher profile_name="adaptive_value_workload_default_writer" is_default_profile="true">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </publisher>
+
+        <subscriber profile_name="adaptive_value_workload_default_reader" is_default_profile="true">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
+
+        <publisher profile_name="/adaptive/control_cmd">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+            <propertiesPolicy>
+                <properties>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.enabled</name>
+                        <value>true</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_class</name>
+                        <value>important</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_horizon_ms</name>
+                        <value>100</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.hard_max_defer_ms</name>
+                        <value>30</value>
+                    </property>
+                </properties>
+            </propertiesPolicy>
+        </publisher>
+
+        <publisher profile_name="/adaptive/robot_state">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+            <propertiesPolicy>
+                <properties>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.enabled</name>
+                        <value>true</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_class</name>
+                        <value>default</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_horizon_ms</name>
+                        <value>300</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.hard_max_defer_ms</name>
+                        <value>50</value>
+                    </property>
+                </properties>
+            </propertiesPolicy>
+        </publisher>
+
+        <publisher profile_name="/adaptive/sensor_snapshot">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+            <propertiesPolicy>
+                <properties>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.enabled</name>
+                        <value>true</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_class</name>
+                        <value>replaceable_snapshot</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.value_horizon_ms</name>
+                        <value>80</value>
+                    </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.hard_max_defer_ms</name>
+                        <value>80</value>
+                    </property>
+                </properties>
+            </propertiesPolicy>
+        </publisher>
+
+        <subscriber profile_name="/adaptive/control_cmd">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
+
+        <subscriber profile_name="/adaptive/robot_state">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
+
+        <subscriber profile_name="/adaptive/sensor_snapshot">
+            <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+        </subscriber>
+    </profiles>
+</dds>

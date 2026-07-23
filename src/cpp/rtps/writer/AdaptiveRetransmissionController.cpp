@@ -106,6 +106,13 @@ enum class RecoveryState
     RECOVERY
 };
 
+enum class CandidateValueClass
+{
+    DEFAULT,
+    IMPORTANT,
+    REPLACEABLE_SNAPSHOT
+};
+
 struct WriterState
 {
     uint64_t byte_budget = max_bytes_per_cycle;
@@ -127,6 +134,7 @@ struct AdmissionCandidate
     bool important = false;
     bool replaceable = false;
     double value_horizon_ms = 0.0;
+    CandidateValueClass value_class = CandidateValueClass::DEFAULT;
 };
 
 double update_ewma(
@@ -206,6 +214,40 @@ const char* recovery_state_name(
         default:
             return "NORMAL";
     }
+}
+
+const char* value_class_name(
+        CandidateValueClass value_class)
+{
+    switch (value_class)
+    {
+        case CandidateValueClass::IMPORTANT:
+            return "important";
+        case CandidateValueClass::REPLACEABLE_SNAPSHOT:
+            return "replaceable_snapshot";
+        default:
+            return "default";
+    }
+}
+
+void classify_value(
+        StatefulWriter& writer,
+        AdmissionCandidate& candidate)
+{
+    const std::string* value_class = find_property(writer,
+                    "fastdds.adaptive_retransmission.value_class");
+    candidate.important = nullptr != value_class && "important" == *value_class;
+    candidate.replaceable = nullptr != value_class && "replaceable_snapshot" == *value_class;
+    if (candidate.important)
+    {
+        candidate.value_class = CandidateValueClass::IMPORTANT;
+    }
+    else if (candidate.replaceable)
+    {
+        candidate.value_class = CandidateValueClass::REPLACEABLE_SNAPSHOT;
+    }
+    candidate.value_horizon_ms = positive_property_or(writer,
+                    "fastdds.adaptive_retransmission.value_horizon_ms", 0.0);
 }
 
 } // namespace
@@ -393,13 +435,7 @@ void AdaptiveRetransmissionController::add_admission_candidate(
     candidate.requests = observed.requests;
     candidate.earliest_requested = earliest_requested;
     candidate.has_newer_change = change.sequenceNumber + 1 < writer->next_sequence_number();
-
-    const std::string* value_class = find_property(*writer,
-                    "fastdds.adaptive_retransmission.value_class");
-    candidate.important = nullptr != value_class && "important" == *value_class;
-    candidate.replaceable = nullptr != value_class && "replaceable_snapshot" == *value_class;
-    candidate.value_horizon_ms = positive_property_or(*writer,
-                    "fastdds.adaptive_retransmission.value_horizon_ms", 0.0);
+    classify_value(*writer, candidate);
     impl_->cycle_candidates[writer->getGuid()].push_back(candidate);
 }
 
@@ -420,6 +456,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         uint32_t max_requests = 0;
         bool force = false;
         bool blocking = false;
+        bool important = false;
         bool urgent = false;
         bool superseded = true;
     };
@@ -453,6 +490,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             group.max_requests = std::max(group.max_requests, candidate.requests);
             group.force |= candidate.request_age_ms >= hard_max_defer;
             group.blocking |= candidate.earliest_requested;
+            group.important |= candidate.important;
             group.urgent |= candidate.important && candidate.value_horizon_ms > 0.0 &&
                     candidate.request_age_ms >= 0.75 * candidate.value_horizon_ms;
             group.superseded &= candidate.replaceable && candidate.has_newer_change;
@@ -532,6 +570,10 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     {
                         return left->blocking;
                     }
+                    if (left->important != right->important)
+                    {
+                        return left->important;
+                    }
                     if (left->urgent != right->urgent)
                     {
                         return left->urgent;
@@ -591,6 +633,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                        << ";has_newer_change=" << candidate.has_newer_change
                        << ";important=" << candidate.important
                        << ";replaceable=" << candidate.replaceable
+                       << ";value_class=" << value_class_name(candidate.value_class)
+                       << ";value_horizon_ms=" << candidate.value_horizon_ms
                        << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
                                 candidate.value_horizon_ms > 0.0 &&
                                 candidate.request_age_ms >= candidate.value_horizon_ms)
