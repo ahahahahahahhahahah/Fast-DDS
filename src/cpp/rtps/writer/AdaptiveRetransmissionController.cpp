@@ -113,6 +113,14 @@ enum class CandidateValueClass
     REPLACEABLE_SNAPSHOT
 };
 
+enum class ForceClass
+{
+    NONE,
+    SOFT,
+    NORMAL,
+    STRONG
+};
+
 struct WriterState
 {
     uint64_t byte_budget = max_bytes_per_cycle;
@@ -237,6 +245,48 @@ const char* value_class_name(
         default:
             return "default";
     }
+}
+
+const char* force_class_name(
+        ForceClass force_class)
+{
+    switch (force_class)
+    {
+        case ForceClass::STRONG:
+            return "strong";
+        case ForceClass::NORMAL:
+            return "normal";
+        case ForceClass::SOFT:
+            return "soft";
+        default:
+            return "none";
+    }
+}
+
+ForceClass stronger_force(
+        ForceClass left,
+        ForceClass right)
+{
+    return static_cast<int>(left) >= static_cast<int>(right) ? left : right;
+}
+
+ForceClass classify_force(
+        const AdmissionCandidate& candidate,
+        double hard_max_defer)
+{
+    if (candidate.request_age_ms < hard_max_defer)
+    {
+        return ForceClass::NONE;
+    }
+    if (candidate.important)
+    {
+        return ForceClass::STRONG;
+    }
+    if (candidate.replaceable && candidate.has_newer_change)
+    {
+        return ForceClass::SOFT;
+    }
+    return ForceClass::NORMAL;
 }
 
 void classify_value(
@@ -463,11 +513,11 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         uint32_t estimated_bytes = 0;
         double max_age_ms = 0.0;
         uint32_t max_requests = 0;
-        bool force = false;
         bool blocking = false;
         bool important = false;
         bool urgent = false;
         bool superseded = true;
+        ForceClass force_class = ForceClass::NONE;
     };
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -496,7 +546,9 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             group.estimated_bytes = std::max(group.estimated_bytes, candidate.estimated_bytes);
             group.max_age_ms = std::max(group.max_age_ms, candidate.request_age_ms);
             group.max_requests = std::max(group.max_requests, candidate.requests);
-            group.force |= candidate.request_age_ms >= hard_max_defer;
+            group.force_class = stronger_force(
+                group.force_class,
+                classify_force(candidate, hard_max_defer));
             group.blocking |= candidate.earliest_requested;
             group.important |= candidate.important;
             group.urgent |= candidate.important && candidate.value_horizon_ms > 0.0 &&
@@ -570,9 +622,11 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         std::sort(ordered.begin(), ordered.end(),
                 [](const ChangeGroup* left, const ChangeGroup* right)
                 {
-                    if (left->force != right->force)
+                    const bool left_strong = ForceClass::STRONG == left->force_class;
+                    const bool right_strong = ForceClass::STRONG == right->force_class;
+                    if (left_strong != right_strong)
                     {
-                        return left->force;
+                        return left_strong;
                     }
                     if (left->blocking != right->blocking)
                     {
@@ -586,9 +640,21 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     {
                         return left->urgent;
                     }
+                    const bool left_normal_force = ForceClass::NORMAL == left->force_class;
+                    const bool right_normal_force = ForceClass::NORMAL == right->force_class;
+                    if (left_normal_force != right_normal_force)
+                    {
+                        return left_normal_force;
+                    }
                     if (left->superseded != right->superseded)
                     {
                         return !left->superseded;
+                    }
+                    const bool left_soft_force = ForceClass::SOFT == left->force_class;
+                    const bool right_soft_force = ForceClass::SOFT == right->force_class;
+                    if (left_soft_force != right_soft_force)
+                    {
+                        return left_soft_force;
                     }
                     if (left->max_age_ms != right->max_age_ms)
                     {
@@ -612,14 +678,16 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             const bool within_change_limit = admitted_changes < max_planned_changes_per_cycle;
             const bool within_byte_limit = 0 == admitted_changes ||
                     admitted_bytes + group->estimated_bytes <= writer_state.byte_budget;
-            const bool admitted = group->force || (within_change_limit && within_byte_limit);
+            const bool strong_force = ForceClass::STRONG == group->force_class;
+            const bool admitted = strong_force || (within_change_limit && within_byte_limit);
 
             for (size_t index : group->candidates)
             {
                 const AdmissionCandidate& candidate = candidates[index];
+                const ForceClass candidate_force_class = classify_force(candidate, hard_max_defer);
                 const AdaptiveRetransmissionDecision decision = !admitted ?
                         AdaptiveRetransmissionDecision::DEFER :
-                        (candidate.request_age_ms >= hard_max_defer ?
+                        (ForceClass::NONE != candidate_force_class ?
                         AdaptiveRetransmissionDecision::FORCE_SEND :
                         AdaptiveRetransmissionDecision::SEND_NOW);
                 impl_->cycle_plan[candidate.key] = decision;
@@ -642,6 +710,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                        << ";important=" << candidate.important
                        << ";replaceable=" << candidate.replaceable
                        << ";value_class=" << value_class_name(candidate.value_class)
+                       << ";force_class=" << force_class_name(group->force_class)
+                       << ";candidate_force_class=" << force_class_name(candidate_force_class)
                        << ";value_horizon_ms=" << candidate.value_horizon_ms
                        << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
                                 candidate.value_horizon_ms > 0.0 &&
@@ -658,7 +728,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
 #endif // FASTDDS_RETRANSMISSION_TRACE
             }
 
-            if (admitted && !group->force)
+            if (admitted && !strong_force)
             {
                 ++admitted_changes;
                 admitted_bytes += group->estimated_bytes;
