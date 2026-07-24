@@ -39,7 +39,7 @@ constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
 constexpr uint32_t max_planned_changes_per_cycle = 32;
 constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
-constexpr uint32_t max_defer_ms = 50;
+constexpr uint32_t default_hard_max_defer_ms = 50;
 constexpr double slow_feedback_ms = 25.0;
 constexpr uint64_t min_dynamic_bytes_per_cycle = 16 * 1024;
 constexpr uint64_t max_dynamic_bytes_per_cycle = 256 * 1024;
@@ -200,6 +200,15 @@ double positive_property_or(
         }
     }
     return fallback;
+}
+
+double hard_max_defer_or(
+        StatefulWriter& writer)
+{
+    return positive_property_or(
+        writer,
+        "fastdds.adaptive_retransmission.hard_max_defer_ms",
+        default_hard_max_defer_ms);
 }
 
 const char* recovery_state_name(
@@ -476,8 +485,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         std::lock_guard<std::mutex> lock(impl_->mutex);
         std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
         std::map<SequenceNumber_t, ChangeGroup> grouped;
-        const double hard_max_defer = positive_property_or(*writer,
-                        "fastdds.adaptive_retransmission.hard_max_defer_ms", max_defer_ms);
+        const double hard_max_defer = hard_max_defer_or(*writer);
 
         for (size_t index = 0; index < candidates.size(); ++index)
         {
@@ -746,6 +754,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
         const uint64_t pending_bytes = impl_->outstanding_bytes(reader_key);
 #endif // FASTDDS_RETRANSMISSION_TRACE
         const double age_ms = std::chrono::duration<double, std::milli>(now - observed.first_request).count();
+        const double hard_max_defer = hard_max_defer_or(*writer);
         const bool feedback_pressure = reader.feedback_samples >= warmup_feedback_samples &&
                 reader.recovery_feedback_ewma_ms > slow_feedback_ms;
         const bool recovery_pressure = pending >= pressure_request_count ||
@@ -758,7 +767,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
 #endif // FASTDDS_RETRANSMISSION_TRACE
         if (recovery_pressure)
         {
-            if (age_ms >= max_defer_ms)
+            if (age_ms >= hard_max_defer)
             {
                 decision = AdaptiveRetransmissionDecision::FORCE_SEND;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -798,7 +807,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
                << ";cycle_admitted_bytes=" << reader.admitted_bytes_in_cycle
                << ";cycle_change_budget=" << max_changes_per_cycle
                << ";cycle_byte_budget=" << max_bytes_per_cycle
-               << ";max_defer_ms=" << max_defer_ms
+               << ";hard_max_defer_ms=" << hard_max_defer
                << ";feedback_samples=" << reader.feedback_samples
                << ";recovery_feedback_ewma_ms=" << reader.recovery_feedback_ewma_ms;
         trace_detail = detail.str();
