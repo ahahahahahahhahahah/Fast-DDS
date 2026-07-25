@@ -86,6 +86,10 @@
                         <name>fastdds.adaptive_retransmission.hard_max_defer_ms</name>
                         <value>80</value>
                     </property>
+                    <property>
+                        <name>fastdds.adaptive_retransmission.defer_cooldown_ms</name>
+                        <value>20</value>
+                    </property>
                 </properties>
             </propertiesPolicy>
         </publisher>

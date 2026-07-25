@@ -40,6 +40,7 @@ constexpr uint32_t max_changes_per_cycle = 2;
 constexpr uint32_t max_planned_changes_per_cycle = 32;
 constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
 constexpr uint32_t default_hard_max_defer_ms = 50;
+constexpr uint32_t default_defer_cooldown_ms = 20;
 constexpr double slow_feedback_ms = 25.0;
 constexpr uint64_t min_dynamic_bytes_per_cycle = 16 * 1024;
 constexpr uint64_t max_dynamic_bytes_per_cycle = 256 * 1024;
@@ -97,6 +98,7 @@ struct ChangeState
     steady_clock::time_point first_request;
     steady_clock::time_point last_request;
     steady_clock::time_point last_interest;
+    steady_clock::time_point defer_cooldown_until;
 };
 
 enum class RecoveryState
@@ -210,6 +212,29 @@ double positive_property_or(
     return fallback;
 }
 
+double nonnegative_property_or(
+        StatefulWriter& writer,
+        const char* name,
+        double fallback)
+{
+    const std::string* value = find_property(writer, name);
+    if (nullptr != value)
+    {
+        try
+        {
+            const double parsed = std::stod(*value);
+            if (parsed >= 0.0)
+            {
+                return parsed;
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+    return fallback;
+}
+
 double hard_max_defer_or(
         StatefulWriter& writer)
 {
@@ -217,6 +242,22 @@ double hard_max_defer_or(
         writer,
         "fastdds.adaptive_retransmission.hard_max_defer_ms",
         default_hard_max_defer_ms);
+}
+
+double defer_cooldown_or(
+        StatefulWriter& writer)
+{
+    return nonnegative_property_or(
+        writer,
+        "fastdds.adaptive_retransmission.defer_cooldown_ms",
+        default_defer_cooldown_ms);
+}
+
+steady_clock::duration milliseconds_duration(
+        double milliseconds)
+{
+    return std::chrono::duration_cast<steady_clock::duration>(
+        std::chrono::duration<double, std::milli>(milliseconds));
 }
 
 const char* recovery_state_name(
@@ -520,6 +561,9 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         ForceClass force_class = ForceClass::NONE;
     };
 
+    uint32_t cooldown_skipped_changes = 0;
+    uint64_t cooldown_skipped_bytes = 0;
+
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     struct PlanTrace
     {
@@ -529,26 +573,49 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         std::string detail;
     };
     std::vector<PlanTrace> plan_traces;
+    double min_cooldown_remaining_ms = 0.0;
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
         std::map<SequenceNumber_t, ChangeGroup> grouped;
+        const auto now = steady_clock::now();
         const double hard_max_defer = hard_max_defer_or(*writer);
+        const double defer_cooldown_ms = defer_cooldown_or(*writer);
 
         for (size_t index = 0; index < candidates.size(); ++index)
         {
             const AdmissionCandidate& candidate = candidates[index];
+            ChangeState& observed = impl_->changes[candidate.key];
+            const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
+            const bool cooldown_active = defer_cooldown_ms > 0.0 && candidate.replaceable &&
+                    candidate.has_newer_change && ForceClass::NONE == candidate_force &&
+                    observed.defer_cooldown_until != steady_clock::time_point() &&
+                    now < observed.defer_cooldown_until;
+            if (cooldown_active)
+            {
+                impl_->cycle_plan[candidate.key] = AdaptiveRetransmissionDecision::DEFER;
+                ++cooldown_skipped_changes;
+                cooldown_skipped_bytes += candidate.estimated_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                const double remaining_ms = std::chrono::duration<double, std::milli>(
+                    observed.defer_cooldown_until - now).count();
+                if (0.0 == min_cooldown_remaining_ms || remaining_ms < min_cooldown_remaining_ms)
+                {
+                    min_cooldown_remaining_ms = remaining_ms;
+                }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                continue;
+            }
+
             ChangeGroup& group = grouped[candidate.key.sequence];
             group.sequence = candidate.key.sequence;
             group.candidates.push_back(index);
             group.estimated_bytes = std::max(group.estimated_bytes, candidate.estimated_bytes);
             group.max_age_ms = std::max(group.max_age_ms, candidate.request_age_ms);
             group.max_requests = std::max(group.max_requests, candidate.requests);
-            group.force_class = stronger_force(
-                group.force_class,
-                classify_force(candidate, hard_max_defer));
+            group.force_class = stronger_force(group.force_class, candidate_force);
             group.blocking |= candidate.earliest_requested;
             group.important |= candidate.important;
             group.urgent |= candidate.important && candidate.value_horizon_ms > 0.0 &&
@@ -563,6 +630,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             ordered.push_back(&item.second);
             candidate_bytes += item.second.estimated_bytes;
         }
+        const uint64_t pressure_candidate_bytes = candidate_bytes + cooldown_skipped_bytes;
 
         WriterState& writer_state = impl_->writers[writer->getGuid()];
         double feedback_ms = 0.0;
@@ -580,9 +648,9 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
 
         const bool feedback_pressure = writer_state.stable_feedback_ms > 0.0 &&
                 feedback_ms > pressure_feedback_ratio * writer_state.stable_feedback_ms;
-        const bool backlog_growing = candidate_bytes > writer_state.previous_candidate_bytes;
+        const bool backlog_growing = pressure_candidate_bytes > writer_state.previous_candidate_bytes;
         const bool pressure_signal = (feedback_pressure && backlog_growing) ||
-                candidate_bytes > 4 * writer_state.byte_budget;
+                pressure_candidate_bytes > 4 * writer_state.byte_budget;
 
         if (pressure_signal)
         {
@@ -617,7 +685,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 writer_state.stable_feedback_ms = update_ewma(writer_state.stable_feedback_ms, feedback_ms);
             }
         }
-        writer_state.previous_candidate_bytes = candidate_bytes;
+        writer_state.previous_candidate_bytes = pressure_candidate_bytes;
 
         std::sort(ordered.begin(), ordered.end(),
                 [](const ChangeGroup* left, const ChangeGroup* right)
@@ -694,6 +762,12 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 if (AdaptiveRetransmissionDecision::DEFER != decision)
                 {
                     impl_->changes[candidate.key].last_interest = steady_clock::now();
+                    impl_->changes[candidate.key].defer_cooldown_until = steady_clock::time_point();
+                }
+                else if (defer_cooldown_ms > 0.0 && candidate.replaceable && candidate.has_newer_change &&
+                        ForceClass::NONE == candidate_force_class)
+                {
+                    impl_->changes[candidate.key].defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
                 }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -705,6 +779,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                        << ";estimated_bytes=" << candidate.estimated_bytes
                        << ";cycle_byte_budget=" << writer_state.byte_budget
                        << ";cycle_candidate_bytes=" << candidate_bytes
+                       << ";pressure_candidate_bytes=" << pressure_candidate_bytes
+                       << ";cooldown_skipped_changes=" << cooldown_skipped_changes
                        << ";earliest_requested=" << candidate.earliest_requested
                        << ";has_newer_change=" << candidate.has_newer_change
                        << ";important=" << candidate.important
@@ -716,7 +792,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                        << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
                                 candidate.value_horizon_ms > 0.0 &&
                                 candidate.request_age_ms >= candidate.value_horizon_ms)
-                       << ";hard_max_defer_ms=" << hard_max_defer;
+                       << ";hard_max_defer_ms=" << hard_max_defer
+                       << ";defer_cooldown_ms=" << defer_cooldown_ms;
                 plan_traces.push_back(
                     PlanTrace
                     {
@@ -746,6 +823,20 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             trace.sequence,
             trace.estimated_bytes,
             trace.detail);
+    }
+    if (cooldown_skipped_changes > 0)
+    {
+        std::ostringstream detail;
+        detail << "skipped_changes=" << cooldown_skipped_changes
+               << ";skipped_bytes=" << cooldown_skipped_bytes
+               << ";min_remaining_ms=" << min_cooldown_remaining_ms;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_V2_COOLDOWN_SKIP",
+            writer->getGuid(),
+            GUID_t::unknown(),
+            SequenceNumber_t::unknown(),
+            0,
+            detail.str());
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
