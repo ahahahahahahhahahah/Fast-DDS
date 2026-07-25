@@ -260,6 +260,7 @@ steady_clock::duration milliseconds_duration(
         std::chrono::duration<double, std::milli>(milliseconds));
 }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
 const char* recovery_state_name(
         RecoveryState state)
 {
@@ -303,6 +304,7 @@ const char* force_class_name(
             return "none";
     }
 }
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 ForceClass stronger_force(
         ForceClass left,
@@ -883,6 +885,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
     }
     if (has_planned_decision)
     {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
         const char* action = AdaptiveRetransmissionDecision::DEFER == planned_decision ? "DEFER" :
                 (AdaptiveRetransmissionDecision::FORCE_SEND == planned_decision ? "FORCE_SEND" : "SEND_NOW");
         FASTDDS_TRACE_RETRANSMISSION(
@@ -892,6 +895,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
             change.sequenceNumber,
             change.serializedPayload.length,
             std::string("state=V2_PLANNED;decision=") + action + ";reason=ADMISSION_PLAN");
+#endif // FASTDDS_RETRANSMISSION_TRACE
         return planned_decision;
     }
 

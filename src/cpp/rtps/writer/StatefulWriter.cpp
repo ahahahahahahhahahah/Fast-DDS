@@ -684,6 +684,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
     uint32_t n_fragments = change->getFragmentCount();
     FragmentNumber_t min_unsent_fragment = 0;
     bool need_reactivate_periodic_heartbeat = false;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     auto trace_data_built = [this, change, n_fragments](
         const GUID_t& reader_guid,
         const char* event,
@@ -707,6 +708,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                     built_payload_size,
                     detail.str());
             };
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     while (DeliveryRetCode::DELIVERED == ret_code &&
             min_unsent_fragment != n_fragments + 1)
@@ -809,17 +811,20 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                             {
                                 if (group.add_data_frag(*change, min_unsent_fragment, inline_qos))
                                 {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                     const uint32_t fragment_start =
                                             change->getFragmentSize() * (min_unsent_fragment - 1);
                                     const uint32_t fragment_payload_size =
                                             min_unsent_fragment < n_fragments ? change->getFragmentSize() :
                                             change->serializedPayload.length - fragment_start;
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                     for (auto remote_reader = first_relevant_reader;
                                             remote_reader != matched_remote_readers_.end();
                                             ++remote_reader)
                                     {
                                         if ((*remote_reader)->active())
                                         {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                             trace_data_built(
                                                 (*remote_reader)->guid(),
                                                 "DATA_FRAG_BUILT",
@@ -828,6 +833,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                                 static_cast<uint32_t>(num_locators),
                                                 false,
                                                 inline_qos);
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                             bool allFragmentsSent = false;
                                             (*remote_reader)->mark_fragment_as_sent_for_change(
                                                 change->sequenceNumber,
@@ -868,6 +874,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                 {
                                     if ((*remote_reader)->active())
                                     {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                         trace_data_built(
                                             (*remote_reader)->guid(),
                                             "DATA_BUILT",
@@ -876,6 +883,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                             static_cast<uint32_t>(num_locators),
                                             false,
                                             inline_qos);
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                         if (!(*remote_reader)->is_reliable())
                                         {
                                             (*remote_reader)->acked_changes_set(change->sequenceNumber + 1);
@@ -916,6 +924,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                 {
                                     if (group.add_data_frag(*change, min_unsent_fragment, inline_qos))
                                     {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                         const uint32_t fragment_start =
                                                 change->getFragmentSize() * (min_unsent_fragment - 1);
                                         const uint32_t fragment_payload_size =
@@ -929,6 +938,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                             static_cast<uint32_t>((*remote_reader)->locators_size()),
                                             true,
                                             inline_qos);
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                         bool allFragmentsSent = false;
                                         (*remote_reader)->mark_fragment_as_sent_for_change(
                                             change->sequenceNumber,
@@ -961,6 +971,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                             {
                                 if (group.add_data(*change, (*remote_reader)->expects_inline_qos()))
                                 {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                     trace_data_built(
                                         (*remote_reader)->guid(),
                                         "DATA_BUILT",
@@ -969,6 +980,7 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                         static_cast<uint32_t>((*remote_reader)->locators_size()),
                                         true,
                                         (*remote_reader)->expects_inline_qos());
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                     if (!(*remote_reader)->is_reliable())
                                     {
                                         (*remote_reader)->acked_changes_set(change->sequenceNumber + 1);
@@ -1929,6 +1941,7 @@ bool StatefulWriter::perform_nack_response_event()
             {
                 assert(nullptr != change.getChange());
                 CacheChange_t* cache_change = change.getChange();
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                 FASTDDS_TRACE_RETRANSMISSION(
                     "RETRANSMIT_ENQUEUE",
                     getGuid(),
@@ -1946,6 +1959,10 @@ bool StatefulWriter::perform_nack_response_event()
                     cache_change->sequenceNumber,
                     cache_change->serializedPayload.length,
                     detail.str());
+#else
+                static_cast<void>(reader_guid);
+                flow_controller_->add_old_sample(this, cache_change);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             };
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
     const bool adaptive_admission_planning =
@@ -2097,6 +2114,7 @@ bool StatefulWriter::process_acknack(
                                     {
                                         assert(nullptr != change_reader.getChange());
                                         CacheChange_t* cache_change = change_reader.getChange();
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                                         FASTDDS_TRACE_RETRANSMISSION(
                                             "RETRANSMIT_ENQUEUE",
                                             getGuid(),
@@ -2114,6 +2132,9 @@ bool StatefulWriter::process_acknack(
                                             cache_change->sequenceNumber,
                                             cache_change->serializedPayload.length,
                                             detail.str());
+#else
+                                        flow_controller_->add_old_sample(this, cache_change);
+#endif // FASTDDS_RETRANSMISSION_TRACE
                                     }))
                                     {
                                         if (remote_reader->is_remote_and_reliable())
