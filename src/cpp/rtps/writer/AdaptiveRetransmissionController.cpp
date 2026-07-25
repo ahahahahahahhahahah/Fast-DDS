@@ -330,6 +330,14 @@ ForceClass classify_force(
     return ForceClass::NORMAL;
 }
 
+bool cooldown_eligible(
+        const AdmissionCandidate& candidate,
+        ForceClass force_class)
+{
+    return candidate.replaceable && candidate.has_newer_change &&
+           (ForceClass::NONE == force_class || ForceClass::SOFT == force_class);
+}
+
 void classify_value(
         StatefulWriter& writer,
         AdmissionCandidate& candidate)
@@ -589,8 +597,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             const AdmissionCandidate& candidate = candidates[index];
             ChangeState& observed = impl_->changes[candidate.key];
             const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
-            const bool cooldown_active = defer_cooldown_ms > 0.0 && candidate.replaceable &&
-                    candidate.has_newer_change && ForceClass::NONE == candidate_force &&
+            const bool cooldown_active = defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
                     observed.defer_cooldown_until != steady_clock::time_point() &&
                     now < observed.defer_cooldown_until;
             if (cooldown_active)
@@ -764,8 +771,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     impl_->changes[candidate.key].last_interest = steady_clock::now();
                     impl_->changes[candidate.key].defer_cooldown_until = steady_clock::time_point();
                 }
-                else if (defer_cooldown_ms > 0.0 && candidate.replaceable && candidate.has_newer_change &&
-                        ForceClass::NONE == candidate_force_class)
+                else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
                 {
                     impl_->changes[candidate.key].defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
                 }
