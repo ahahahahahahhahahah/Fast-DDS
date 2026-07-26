@@ -599,7 +599,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             const AdmissionCandidate& candidate = candidates[index];
             ChangeState& observed = impl_->changes[candidate.key];
             const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
-            const bool cooldown_active = defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
+            const bool cooldown_active = ForceClass::NONE == candidate_force &&
+                    defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
                     observed.defer_cooldown_until != steady_clock::time_point() &&
                     now < observed.defer_cooldown_until;
             if (cooldown_active)
