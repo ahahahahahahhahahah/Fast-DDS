@@ -755,8 +755,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             const bool within_change_limit = admitted_changes < max_planned_changes_per_cycle;
             const bool within_byte_limit = 0 == admitted_changes ||
                     admitted_bytes + group->estimated_bytes <= writer_state.byte_budget;
-            const bool strong_force = ForceClass::STRONG == group->force_class;
-            const bool admitted = strong_force || (within_change_limit && within_byte_limit);
+            const bool force_due = ForceClass::NONE != group->force_class;
+            const bool admitted = force_due || (within_change_limit && within_byte_limit);
 
             for (size_t index : group->candidates)
             {
