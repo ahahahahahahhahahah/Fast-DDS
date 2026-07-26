@@ -813,7 +813,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
 #endif // FASTDDS_RETRANSMISSION_TRACE
             }
 
-            if (admitted && !strong_force)
+            if (admitted && !force_due)
             {
                 ++admitted_changes;
                 admitted_bytes += group->estimated_bytes;
