@@ -267,6 +267,7 @@ extern const char* FIFO;
 extern const char* HIGH_PRIORITY;
 extern const char* ROUND_ROBIN;
 extern const char* PRIORITY_WITH_RESERVATION;
+extern const char* ADAPTIVE_VALUE;
 extern const char* FLOW_CONTROLLER_NAME;
 extern const char* PORT_BASE;
 extern const char* DOMAIN_ID_GAIN;

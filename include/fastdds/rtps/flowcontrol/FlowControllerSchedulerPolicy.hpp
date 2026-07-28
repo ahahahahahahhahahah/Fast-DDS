@@ -37,7 +37,9 @@ enum class FlowControllerSchedulerPolicy : int32_t
     HIGH_PRIORITY,
     //! Priority with reservation scheduler policy: guarantee each DataWriter's minimum reservation of throughput.
     //! Samples not fitting the reservation are scheduled by priority.
-    PRIORITY_WITH_RESERVATION
+    PRIORITY_WITH_RESERVATION,
+    //! Adaptive value scheduler policy: schedules samples using writer value class, reservation, priority, and aging.
+    ADAPTIVE_VALUE
 };
 
 } // namespace rtps

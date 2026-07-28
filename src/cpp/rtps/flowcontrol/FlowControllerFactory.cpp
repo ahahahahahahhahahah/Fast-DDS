@@ -93,6 +93,14 @@ void FlowControllerFactory::register_flow_controller (
                                 FlowControllerPriorityWithReservationSchedule>(participant_,
                                 &flow_controller_descr))));
                 break;
+            case FlowControllerSchedulerPolicy::ADAPTIVE_VALUE:
+                flow_controllers_.insert(decltype(flow_controllers_)::value_type(
+                            flow_controller_descr.name,
+                            std::unique_ptr<FlowController>(
+                                new FlowControllerImpl<FlowControllerLimitedAsyncPublishMode,
+                                FlowControllerAdaptiveValueSchedule>(participant_,
+                                &flow_controller_descr))));
+                break;
             default:
                 assert(false);
         }
@@ -130,6 +138,14 @@ void FlowControllerFactory::register_flow_controller (
                             std::unique_ptr<FlowController>(
                                 new FlowControllerImpl<FlowControllerAsyncPublishMode,
                                 FlowControllerPriorityWithReservationSchedule>(participant_,
+                                &flow_controller_descr))));
+                break;
+            case FlowControllerSchedulerPolicy::ADAPTIVE_VALUE:
+                flow_controllers_.insert(decltype(flow_controllers_)::value_type(
+                            flow_controller_descr.name,
+                            std::unique_ptr<FlowController>(
+                                new FlowControllerImpl<FlowControllerAsyncPublishMode,
+                                FlowControllerAdaptiveValueSchedule>(participant_,
                                 &flow_controller_descr))));
                 break;
             default:
