@@ -926,7 +926,8 @@ struct FlowControllerAdaptiveValueSchedule
 
         int32_t priority = 0;
         uint32_t reservation = 30;
-        apply_value_class_defaults(writer, priority, reservation);
+        ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
+        apply_value_class_defaults(writer, priority, reservation, value_class);
 
         int32_t parsed_priority = priority;
         if (parse_int32_property(writer, "fastdds.adaptive_async.priority", -10, 10, parsed_priority) ||
@@ -945,8 +946,10 @@ struct FlowControllerAdaptiveValueSchedule
 
         WriterQueue writer_queue;
         writer_queue.priority = priority;
+        writer_queue.value_class = value_class;
         writer_queue.reservation_percent = reservation;
         writer_queue.reservation_bytes = reservation_bytes(reservation);
+        writer_queue.credit_bytes = static_cast<int64_t>(writer_queue.reservation_bytes);
 
         auto ret = writers_queue_.emplace(writer, std::move(writer_queue));
         (void)ret;
@@ -981,7 +984,7 @@ struct FlowControllerAdaptiveValueSchedule
             auto writer = writers_queue_.find(writer_being_processed_);
             if (writer != writers_queue_.end())
             {
-                writer->second.used_bytes += size_being_processed_;
+                writer->second.credit_bytes -= static_cast<int64_t>(size_being_processed_);
             }
             writer_being_processed_ = nullptr;
             size_being_processed_ = 0;
@@ -1012,59 +1015,10 @@ struct FlowControllerAdaptiveValueSchedule
         fastrtps::rtps::CacheChange_t* selected_change = nullptr;
         uint32_t selected_size = 0;
 
-        for (auto& priority : priorities_)
-        {
-            for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
-            {
-                auto writer = writers_queue_.find(writer_ptr);
-                assert(writer != writers_queue_.end());
-                fastrtps::rtps::CacheChange_t* change = writer->second.queue.get_next_change();
-                if (nullptr != change)
-                {
-                    const uint32_t size = size_to_check(change);
-                    if (writer->second.reservation_bytes > writer->second.used_bytes + size)
-                    {
-                        selected_writer = writer_ptr;
-                        selected_change = change;
-                        selected_size = size;
-                        break;
-                    }
-                }
-            }
-
-            if (nullptr != selected_change)
-            {
-                break;
-            }
-        }
-
+        select_credit_eligible(selected_writer, selected_change, selected_size);
         if (nullptr == selected_change)
         {
-            int32_t best_score = (std::numeric_limits<int32_t>::max)();
-            int32_t best_priority = (std::numeric_limits<int32_t>::max)();
-            for (auto& priority : priorities_)
-            {
-                for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
-                {
-                    auto writer = writers_queue_.find(writer_ptr);
-                    assert(writer != writers_queue_.end());
-                    fastrtps::rtps::CacheChange_t* change = writer->second.queue.get_next_change();
-                    if (nullptr != change)
-                    {
-                        const uint32_t age_credit = std::min(writer->second.age_credit, max_age_credit);
-                        const int32_t score = writer->second.priority - static_cast<int32_t>(age_credit);
-                        if (score < best_score ||
-                                (score == best_score && writer->second.priority < best_priority))
-                        {
-                            selected_writer = writer_ptr;
-                            selected_change = change;
-                            selected_size = size_to_check(change);
-                            best_score = score;
-                            best_priority = writer->second.priority;
-                        }
-                    }
-                }
-            }
+            select_fallback(selected_writer, selected_change, selected_size);
         }
 
         if (nullptr != selected_writer)
@@ -1090,6 +1044,9 @@ struct FlowControllerAdaptiveValueSchedule
         for (auto& writer : writers_queue_)
         {
             writer.second.reservation_bytes = reservation_bytes(writer.second.reservation_percent);
+            writer.second.credit_bytes = std::min<int64_t>(
+                writer.second.credit_bytes + static_cast<int64_t>(writer.second.reservation_bytes),
+                static_cast<int64_t>(credit_cap_bytes()));
         }
     }
 
@@ -1097,19 +1054,29 @@ struct FlowControllerAdaptiveValueSchedule
     {
         for (auto& writer : writers_queue_)
         {
-            writer.second.used_bytes = 0;
+            writer.second.credit_bytes = std::min<int64_t>(
+                writer.second.credit_bytes + static_cast<int64_t>(writer.second.reservation_bytes),
+                static_cast<int64_t>(credit_cap_bytes()));
         }
     }
 
 private:
 
+    enum class ValueClassRank : int32_t
+    {
+        IMPORTANT = 0,
+        DEFAULT_VALUE = 1,
+        REPLACEABLE_SNAPSHOT = 2
+    };
+
     struct WriterQueue
     {
         FlowQueue queue;
         int32_t priority = 0;
+        ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
         uint32_t reservation_percent = 30;
         uint32_t reservation_bytes = 0;
-        uint32_t used_bytes = 0;
+        int64_t credit_bytes = 0;
         uint32_t age_credit = 0;
     };
 
@@ -1175,7 +1142,8 @@ private:
     static void apply_value_class_defaults(
             fastrtps::rtps::RTPSWriter* writer,
             int32_t& priority,
-            uint32_t& reservation)
+            uint32_t& reservation,
+            ValueClassRank& value_class)
     {
         auto property = find_property(writer, "fastdds.adaptive_retransmission.value_class");
         if (nullptr == property)
@@ -1187,11 +1155,13 @@ private:
         {
             priority = -10;
             reservation = 50;
+            value_class = ValueClassRank::IMPORTANT;
         }
         else if ("replaceable_snapshot" == *property)
         {
             priority = 10;
             reservation = 20;
+            value_class = ValueClassRank::REPLACEABLE_SNAPSHOT;
         }
     }
 
@@ -1210,6 +1180,101 @@ private:
             size = change->getFragmentSize();
         }
         return size;
+    }
+
+    uint32_t credit_cap_bytes() const
+    {
+        return 0 == bandwidth_limit_ ? (std::numeric_limits<uint32_t>::max)() : bandwidth_limit_;
+    }
+
+    void select_credit_eligible(
+            fastrtps::rtps::RTPSWriter*& selected_writer,
+            fastrtps::rtps::CacheChange_t*& selected_change,
+            uint32_t& selected_size)
+    {
+        ValueClassRank best_class = ValueClassRank::REPLACEABLE_SNAPSHOT;
+        int32_t best_score = (std::numeric_limits<int32_t>::max)();
+        int32_t best_priority = (std::numeric_limits<int32_t>::max)();
+        bool found = false;
+
+        for (auto& priority : priorities_)
+        {
+            for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
+            {
+                auto writer = writers_queue_.find(writer_ptr);
+                assert(writer != writers_queue_.end());
+                fastrtps::rtps::CacheChange_t* change = writer->second.queue.get_next_change();
+                if (nullptr == change)
+                {
+                    continue;
+                }
+
+                const uint32_t size = size_to_check(change);
+                if (writer->second.credit_bytes < static_cast<int64_t>(size))
+                {
+                    continue;
+                }
+
+                const uint32_t age_credit = std::min(writer->second.age_credit, max_age_credit);
+                const int32_t score = writer->second.priority - static_cast<int32_t>(age_credit);
+                if (!found ||
+                        writer->second.value_class < best_class ||
+                        (writer->second.value_class == best_class && score < best_score) ||
+                        (writer->second.value_class == best_class && score == best_score &&
+                        writer->second.priority < best_priority))
+                {
+                    selected_writer = writer_ptr;
+                    selected_change = change;
+                    selected_size = size;
+                    best_class = writer->second.value_class;
+                    best_score = score;
+                    best_priority = writer->second.priority;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    void select_fallback(
+            fastrtps::rtps::RTPSWriter*& selected_writer,
+            fastrtps::rtps::CacheChange_t*& selected_change,
+            uint32_t& selected_size)
+    {
+        ValueClassRank best_class = ValueClassRank::REPLACEABLE_SNAPSHOT;
+        int32_t best_score = (std::numeric_limits<int32_t>::max)();
+        int32_t best_priority = (std::numeric_limits<int32_t>::max)();
+        bool found = false;
+
+        for (auto& priority : priorities_)
+        {
+            for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
+            {
+                auto writer = writers_queue_.find(writer_ptr);
+                assert(writer != writers_queue_.end());
+                fastrtps::rtps::CacheChange_t* change = writer->second.queue.get_next_change();
+                if (nullptr == change)
+                {
+                    continue;
+                }
+
+                const uint32_t age_credit = std::min(writer->second.age_credit, max_age_credit);
+                const int32_t score = writer->second.priority - static_cast<int32_t>(age_credit);
+                if (!found ||
+                        writer->second.value_class < best_class ||
+                        (writer->second.value_class == best_class && score < best_score) ||
+                        (writer->second.value_class == best_class && score == best_score &&
+                        writer->second.priority < best_priority))
+                {
+                    selected_writer = writer_ptr;
+                    selected_change = change;
+                    selected_size = size_to_check(change);
+                    best_class = writer->second.value_class;
+                    best_score = score;
+                    best_priority = writer->second.priority;
+                    found = true;
+                }
+            }
+        }
     }
 
     void record_selection(
