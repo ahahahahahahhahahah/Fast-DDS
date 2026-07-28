@@ -2,6 +2,7 @@
 #define _RTPS_FLOWCONTROL_FLOWCONTROLLERIMPL_HPP_
 
 #include "FlowController.hpp"
+#include "../RetransmissionTrace.hpp"
 #include <fastdds/rtps/common/Guid.h>
 #include <fastdds/rtps/writer/RTPSWriter.h>
 
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1014,15 +1016,24 @@ struct FlowControllerAdaptiveValueSchedule
         fastrtps::rtps::RTPSWriter* selected_writer = nullptr;
         fastrtps::rtps::CacheChange_t* selected_change = nullptr;
         uint32_t selected_size = 0;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        bool selected_by_credit = true;
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
         select_credit_eligible(selected_writer, selected_change, selected_size);
         if (nullptr == selected_change)
         {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            selected_by_credit = false;
+#endif // FASTDDS_RETRANSMISSION_TRACE
             select_fallback(selected_writer, selected_change, selected_size);
         }
 
         if (nullptr != selected_writer)
         {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_selection(selected_writer, selected_change, selected_size, selected_by_credit);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             record_selection(selected_writer, selected_size);
         }
 
@@ -1165,6 +1176,22 @@ private:
         }
     }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    static const char* value_class_name(
+            ValueClassRank value_class)
+    {
+        switch (value_class)
+        {
+            case ValueClassRank::IMPORTANT:
+                return "important";
+            case ValueClassRank::REPLACEABLE_SNAPSHOT:
+                return "replaceable_snapshot";
+            default:
+                return "default";
+        }
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
     uint32_t reservation_bytes(
             uint32_t reservation_percent) const
     {
@@ -1276,6 +1303,41 @@ private:
             }
         }
     }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    void trace_selection(
+            fastrtps::rtps::RTPSWriter* selected_writer,
+            fastrtps::rtps::CacheChange_t* selected_change,
+            uint32_t selected_size,
+            bool selected_by_credit)
+    {
+        auto writer = writers_queue_.find(selected_writer);
+        if (writer == writers_queue_.end() || nullptr == selected_change)
+        {
+            return;
+        }
+
+        std::ostringstream detail;
+        detail << "scheduler=ADAPTIVE_VALUE"
+               << ";selection=" << (selected_by_credit ? "credit_eligible" : "fallback")
+               << ";value_class=" << value_class_name(writer->second.value_class)
+               << ";priority=" << writer->second.priority
+               << ";reservation_percent=" << writer->second.reservation_percent
+               << ";reservation_bytes=" << writer->second.reservation_bytes
+               << ";credit_bytes_before=" << writer->second.credit_bytes
+               << ";age_credit=" << writer->second.age_credit
+               << ";selected_size=" << selected_size
+               << ";bandwidth_limit=" << bandwidth_limit_;
+
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ASYNC_SCHEDULER_SELECTED",
+            selected_writer->getGuid(),
+            fastrtps::rtps::GUID_t::unknown(),
+            selected_change->sequenceNumber,
+            selected_change->serializedPayload.length,
+            detail.str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     void record_selection(
             fastrtps::rtps::RTPSWriter* selected_writer,
