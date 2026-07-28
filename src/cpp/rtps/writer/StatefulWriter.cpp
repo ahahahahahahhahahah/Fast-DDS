@@ -1961,8 +1961,17 @@ bool StatefulWriter::perform_nack_response_event()
                     detail.str());
 #else
                 static_cast<void>(reader_guid);
-                flow_controller_->add_old_sample(this, cache_change);
+                const bool queued = flow_controller_->add_old_sample(this, cache_change);
 #endif // FASTDDS_RETRANSMISSION_TRACE
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                detail::AdaptiveRetransmissionController::instance().on_old_sample_enqueued(
+                    this,
+                    reader_guid,
+                    *cache_change,
+                    queued);
+#else
+                static_cast<void>(queued);
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
             };
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
     const bool adaptive_admission_planning =

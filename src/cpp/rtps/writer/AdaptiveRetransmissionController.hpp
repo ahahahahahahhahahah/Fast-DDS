@@ -40,6 +40,12 @@ public:
             uint32_t requested_fragments,
             uint32_t estimated_bytes);
 
+    void on_old_sample_enqueued(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const CacheChange_t& change,
+            bool queued);
+
     void begin_admission_cycle(
             StatefulWriter* writer);
 

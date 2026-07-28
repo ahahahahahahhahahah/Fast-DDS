@@ -32,6 +32,7 @@ namespace {
 using steady_clock = std::chrono::steady_clock;
 
 constexpr const char* enabled_property = "fastdds.adaptive_retransmission.enabled";
+constexpr const char* async_observe_property = "fastdds.adaptive_async.observe_old_samples";
 
 // Provisional safety defaults. These are experiment inputs, not calibrated link classifications.
 constexpr uint32_t warmup_feedback_samples = 3;
@@ -155,17 +156,13 @@ double update_ewma(
     return 0.0 == current ? sample : alpha * sample + (1.0 - alpha) * current;
 }
 
-bool property_is_enabled(
-        StatefulWriter& writer)
+bool boolean_property_is_enabled(
+        StatefulWriter& writer,
+        const char* property_name)
 {
-    if (writer.getGuid().is_builtin())
-    {
-        return false;
-    }
-
     const std::string* value = PropertyPolicyHelper::find_property(
         writer.getAttributes().properties,
-        enabled_property);
+        property_name);
 
     if (nullptr == value)
     {
@@ -180,6 +177,30 @@ bool property_is_enabled(
                 return static_cast<char>(std::tolower(character));
             });
     return "1" == normalized || "true" == normalized || "on" == normalized;
+}
+
+bool property_is_enabled(
+        StatefulWriter& writer)
+{
+    if (writer.getGuid().is_builtin())
+    {
+        return false;
+    }
+
+    return boolean_property_is_enabled(writer, enabled_property);
+}
+
+bool sync_admission_enabled(
+        StatefulWriter& writer)
+{
+    return property_is_enabled(writer) && !writer.isAsync();
+}
+
+bool async_observe_enabled(
+        StatefulWriter& writer)
+{
+    return !writer.getGuid().is_builtin() && writer.isAsync() &&
+           boolean_property_is_enabled(writer, async_observe_property);
 }
 
 const std::string* find_property(
@@ -423,7 +444,13 @@ void AdaptiveRetransmissionController::on_requested(
         uint32_t requested_fragments,
         uint32_t estimated_bytes)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    const bool async_observe = async_observe_enabled(*writer);
+    if (!sync_admission_enabled(*writer) && !async_observe)
     {
         return;
     }
@@ -458,7 +485,8 @@ void AdaptiveRetransmissionController::on_requested(
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         std::ostringstream detail;
-        detail << "requests=" << observed.requests
+        detail << "mode=" << (async_observe ? "ASYNC_OBSERVE" : "SYNC_ADMISSION")
+               << ";requests=" << observed.requests
                << ";requested_fragments=" << requested_fragments
                << ";estimated_bytes=" << estimated_bytes
                << ";path_outstanding_changes=" << impl_->outstanding_changes(reader_key)
@@ -469,7 +497,64 @@ void AdaptiveRetransmissionController::on_requested(
     }
 
     FASTDDS_TRACE_RETRANSMISSION(
-        "ADAPT_REQUEST_OBSERVED",
+        async_observe ? "ADAPT_ASYNC_REQUEST_OBSERVED" : "ADAPT_REQUEST_OBSERVED",
+        writer->getGuid(),
+        reader_guid,
+        change.sequenceNumber,
+        change.serializedPayload.length,
+        trace_detail);
+}
+
+void AdaptiveRetransmissionController::on_old_sample_enqueued(
+        StatefulWriter* writer,
+        const GUID_t& reader_guid,
+        const CacheChange_t& change,
+        bool queued)
+{
+    if (nullptr == writer || !async_observe_enabled(*writer))
+    {
+        return;
+    }
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+    static_cast<void>(queued);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    const auto now = steady_clock::now();
+    const ReaderKey reader_key {writer->getGuid(), reader_guid};
+    const ChangeKey change_key {reader_key, change.sequenceNumber};
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::string trace_detail;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        ChangeState& observed = impl_->changes[change_key];
+        if (0 == observed.requests)
+        {
+            observed.first_request = now;
+        }
+        if (0 == observed.estimated_bytes)
+        {
+            observed.estimated_bytes = change.serializedPayload.length;
+        }
+        observed.last_interest = now;
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        const double age_ms = std::chrono::duration<double, std::milli>(
+            now - observed.first_request).count();
+        std::ostringstream detail;
+        detail << "mode=ASYNC_OBSERVE"
+               << ";queued=" << queued
+               << ";requests=" << observed.requests
+               << ";age_ms=" << age_ms
+               << ";estimated_bytes=" << observed.estimated_bytes
+               << ";path_outstanding_changes=" << impl_->outstanding_changes(reader_key)
+               << ";path_outstanding_bytes=" << impl_->outstanding_bytes(reader_key);
+        trace_detail = detail.str();
+#endif // FASTDDS_RETRANSMISSION_TRACE
+    }
+
+    FASTDDS_TRACE_RETRANSMISSION(
+        "ADAPT_ASYNC_OLD_SAMPLE_ENQUEUED",
         writer->getGuid(),
         reader_guid,
         change.sequenceNumber,
@@ -480,7 +565,7 @@ void AdaptiveRetransmissionController::on_requested(
 void AdaptiveRetransmissionController::begin_admission_cycle(
         StatefulWriter* writer)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer || !sync_admission_enabled(*writer))
     {
         return;
     }
@@ -511,7 +596,7 @@ void AdaptiveRetransmissionController::begin_admission_cycle(
 bool AdaptiveRetransmissionController::admission_planning_enabled(
         StatefulWriter* writer)
 {
-    return nullptr != writer && property_is_enabled(*writer) && !writer->isAsync();
+    return nullptr != writer && sync_admission_enabled(*writer);
 }
 
 void AdaptiveRetransmissionController::add_admission_candidate(
@@ -520,7 +605,7 @@ void AdaptiveRetransmissionController::add_admission_candidate(
         const CacheChange_t& change,
         bool earliest_requested)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer || !sync_admission_enabled(*writer))
     {
         return;
     }
@@ -552,7 +637,7 @@ void AdaptiveRetransmissionController::add_admission_candidate(
 void AdaptiveRetransmissionController::finalize_admission_cycle(
         StatefulWriter* writer)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer || !sync_admission_enabled(*writer))
     {
         return;
     }
@@ -1002,7 +1087,13 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         const GUID_t& reader_guid,
         const SequenceNumber_t& sequence_number)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    const bool async_observe = async_observe_enabled(*writer);
+    if (!sync_admission_enabled(*writer) && !async_observe)
     {
         return;
     }
@@ -1058,11 +1149,12 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
     for (const AckTrace& trace : ack_traces)
     {
         std::ostringstream detail;
-        detail << "source=cumulative_ack"
+        detail << "mode=" << (async_observe ? "ASYNC_OBSERVE" : "SYNC_ADMISSION")
+               << ";source=cumulative_ack"
                << ";ack_base=" << sequence_number
                << ";feedback_ms=" << trace.feedback_ms;
         FASTDDS_TRACE_RETRANSMISSION(
-            "ACK_CONFIRMED_PROXY",
+            async_observe ? "ADAPT_ASYNC_ACK_CONFIRMED" : "ACK_CONFIRMED_PROXY",
             writer->getGuid(),
             reader_guid,
             trace.sequence,
@@ -1077,38 +1169,94 @@ void AdaptiveRetransmissionController::on_change_removed(
         const GUID_t& reader_guid,
         const SequenceNumber_t& sequence_number)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    const bool async_observe = async_observe_enabled(*writer);
+    if (!sync_admission_enabled(*writer) && !async_observe)
     {
         return;
     }
 
     const ChangeKey key {{writer->getGuid(), reader_guid}, sequence_number};
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    uint32_t estimated_bytes = 0;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto change = impl_->changes.find(key);
+        if (change != impl_->changes.end())
+        {
+            estimated_bytes = change->second.estimated_bytes;
+            impl_->changes.erase(change);
+            removed = true;
+        }
+    }
+
+    if (async_observe && removed)
+    {
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ASYNC_CHANGE_REMOVED",
+            writer->getGuid(),
+            reader_guid,
+            sequence_number,
+            estimated_bytes,
+            std::string("mode=ASYNC_OBSERVE"));
+    }
+#else
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->changes.erase(key);
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 void AdaptiveRetransmissionController::on_reader_removed(
         StatefulWriter* writer,
         const GUID_t& reader_guid)
 {
-    if (nullptr == writer || !property_is_enabled(*writer) || writer->isAsync())
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    const bool async_observe = async_observe_enabled(*writer);
+    if (!sync_admission_enabled(*writer) && !async_observe)
     {
         return;
     }
 
     const ReaderKey key {writer->getGuid(), reader_guid};
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->readers.erase(key);
-    for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
+    uint32_t removed_changes = 0;
     {
-        if (!(it->first.path < key) && !(key < it->first.path))
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->readers.erase(key);
+        for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
         {
-            it = impl_->changes.erase(it);
+            if (!(it->first.path < key) && !(key < it->first.path))
+            {
+                it = impl_->changes.erase(it);
+                ++removed_changes;
+            }
+            else
+            {
+                ++it;
+            }
         }
-        else
-        {
-            ++it;
-        }
+    }
+
+    if (async_observe)
+    {
+        std::ostringstream detail;
+        detail << "mode=ASYNC_OBSERVE"
+               << ";removed_changes=" << removed_changes;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ASYNC_READER_REMOVED",
+            writer->getGuid(),
+            reader_guid,
+            SequenceNumber_t::unknown(),
+            0,
+            detail.str());
     }
 }
 
