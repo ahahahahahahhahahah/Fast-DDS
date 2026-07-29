@@ -28,6 +28,7 @@
 #include <vector>
 #include <chrono>
 #include <cassert>
+#include <cstdint>
 #include <memory>
 
 
@@ -322,6 +323,41 @@ private:
     uint32_t sent_bytes_limitation_ = 0;
 
     uint32_t current_sent_bytes_ = 0;
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    uint64_t current_trace_message_id_ = 0;
+
+    uint32_t trace_data_submessages_ = 0;
+
+    uint32_t trace_data_frag_submessages_ = 0;
+
+    uint32_t trace_heartbeat_submessages_ = 0;
+
+    uint32_t trace_acknack_submessages_ = 0;
+
+    uint32_t trace_nackfrag_submessages_ = 0;
+
+    uint32_t trace_gap_submessages_ = 0;
+
+    SequenceNumber_t trace_min_sequence_ = SequenceNumber_t::unknown();
+
+    SequenceNumber_t trace_max_sequence_ = SequenceNumber_t::unknown();
+
+    static uint64_t next_trace_message_id();
+
+    void reset_trace_message_summary();
+
+    void ensure_trace_message_id();
+
+    void trace_data_submessage(
+            const char* event,
+            const CacheChange_t& change,
+            uint32_t payload_size,
+            const char* extra_detail);
+
+    void update_trace_sequence_range(
+            const SequenceNumber_t& sequence);
+#endif // FASTDDS_RETRANSMISSION_TRACE
 };
 
 }        /* namespace rtps */

@@ -18,6 +18,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <sstream>
 
 #include <fastdds/dds/log/Log.hpp>
@@ -185,6 +186,83 @@ const EntityId_t& get_entity_id(
     return entityid;
 }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+uint64_t RTPSMessageGroup::next_trace_message_id()
+{
+    static std::atomic<uint64_t> next_id{1};
+    return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RTPSMessageGroup::reset_trace_message_summary()
+{
+    current_trace_message_id_ = 0;
+    trace_data_submessages_ = 0;
+    trace_data_frag_submessages_ = 0;
+    trace_heartbeat_submessages_ = 0;
+    trace_acknack_submessages_ = 0;
+    trace_nackfrag_submessages_ = 0;
+    trace_gap_submessages_ = 0;
+    trace_min_sequence_ = SequenceNumber_t::unknown();
+    trace_max_sequence_ = SequenceNumber_t::unknown();
+}
+
+void RTPSMessageGroup::ensure_trace_message_id()
+{
+    if (0 == current_trace_message_id_)
+    {
+        current_trace_message_id_ = next_trace_message_id();
+    }
+}
+
+void RTPSMessageGroup::update_trace_sequence_range(
+        const SequenceNumber_t& sequence)
+{
+    if (SequenceNumber_t::unknown() == trace_min_sequence_ || sequence < trace_min_sequence_)
+    {
+        trace_min_sequence_ = sequence;
+    }
+
+    if (SequenceNumber_t::unknown() == trace_max_sequence_ || sequence > trace_max_sequence_)
+    {
+        trace_max_sequence_ = sequence;
+    }
+}
+
+void RTPSMessageGroup::trace_data_submessage(
+        const char* event,
+        const CacheChange_t& change,
+        uint32_t payload_size,
+        const char* extra_detail)
+{
+    ensure_trace_message_id();
+    update_trace_sequence_range(change.sequenceNumber);
+
+    GUID_t reader_guid = c_Guid_Unknown;
+    if (nullptr != sender_ && 1 == sender_->remote_guids().size())
+    {
+        reader_guid = sender_->remote_guids().front();
+    }
+
+    std::ostringstream detail;
+    detail << "message_id=" << current_trace_message_id_
+           << ";message_bytes_pending=" << full_msg_->length
+           << ";current_sent_bytes=" << current_sent_bytes_
+           << ";sent_bytes_limitation=" << sent_bytes_limitation_;
+    if (nullptr != extra_detail && '\0' != extra_detail[0])
+    {
+        detail << ';' << extra_detail;
+    }
+
+    FASTDDS_TRACE_RETRANSMISSION(
+        event,
+        endpoint_->getGuid(),
+        reader_guid,
+        change.sequenceNumber,
+        payload_size,
+        detail.str());
+}
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
 RTPSMessageGroup::RTPSMessageGroup(
         RTPSParticipantImpl* participant,
         bool internal_buffer)
@@ -270,6 +348,9 @@ void RTPSMessageGroup::reset_to_header()
     CDRMessage::initCDRMsg(full_msg_);
     full_msg_->pos = RTPSMESSAGE_HEADER_SIZE;
     full_msg_->length = RTPSMESSAGE_HEADER_SIZE;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    reset_trace_message_summary();
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 void RTPSMessageGroup::flush()
@@ -317,7 +398,22 @@ void RTPSMessageGroup::send()
                 msgToSend,
                 max_blocking_time_is_set_ ? max_blocking_time_point_ : (std::chrono::steady_clock::now() +
                 std::chrono::hours(24)));
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            ensure_trace_message_id();
+#endif // FASTDDS_RETRANSMISSION_TRACE
             std::ostringstream detail;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            detail << "message_id=" << current_trace_message_id_
+                   << ";data_submessages=" << trace_data_submessages_
+                   << ";data_frag_submessages=" << trace_data_frag_submessages_
+                   << ";heartbeat_submessages=" << trace_heartbeat_submessages_
+                   << ";acknack_submessages=" << trace_acknack_submessages_
+                   << ";nackfrag_submessages=" << trace_nackfrag_submessages_
+                   << ";gap_submessages=" << trace_gap_submessages_
+                   << ";min_sequence=" << trace_min_sequence_
+                   << ";max_sequence=" << trace_max_sequence_
+                   << ';';
+#endif // FASTDDS_RETRANSMISSION_TRACE
             detail << "sent=" << sent
                    << ";message_bytes=" << msgToSend->length
                    << ";remote_guid_count=" << sender_->remote_guids().size()
@@ -551,7 +647,23 @@ bool RTPSMessageGroup::add_data(
     }
 #endif // if HAVE_SECURITY
 
-    return insert_submessage(is_big_submessage);
+    const bool inserted = insert_submessage(is_big_submessage);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ++trace_data_submessages_;
+        std::ostringstream detail;
+        detail << "is_big_submessage=" << is_big_submessage
+               << ";expects_inline_qos=" << expectsInlineQos;
+        trace_data_submessage(
+            "RTPS_DATA_SUBMESSAGE_QUEUED",
+            change,
+            change.serializedPayload.length,
+            detail.str().c_str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 bool RTPSMessageGroup::add_data_frag(
@@ -654,7 +766,24 @@ bool RTPSMessageGroup::add_data_frag(
     }
 #endif // if HAVE_SECURITY
 
-    return insert_submessage(false);
+    const bool inserted = insert_submessage(false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ++trace_data_frag_submessages_;
+        std::ostringstream detail;
+        detail << "fragment_number=" << fragment_number
+               << ";fragment_size=" << fragment_size
+               << ";expects_inline_qos=" << expectsInlineQos;
+        trace_data_submessage(
+            "RTPS_DATA_FRAG_SUBMESSAGE_QUEUED",
+            change,
+            fragment_size,
+            detail.str().c_str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 bool RTPSMessageGroup::add_heartbeat(
@@ -707,7 +836,16 @@ bool RTPSMessageGroup::add_heartbeat(
     }
 #endif // if HAVE_SECURITY
 
-    return insert_submessage(false);
+    const bool inserted = insert_submessage(false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ensure_trace_message_id();
+        ++trace_heartbeat_submessages_;
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 // TODO (Ricardo) Check with standard 8.3.7.4.5
@@ -742,7 +880,16 @@ bool RTPSMessageGroup::add_gap(
         return false;
     }
 
-    return insert_submessage(false);
+    const bool inserted = insert_submessage(false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ensure_trace_message_id();
+        ++trace_gap_submessages_;
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 bool RTPSMessageGroup::add_gap(
@@ -760,7 +907,16 @@ bool RTPSMessageGroup::add_gap(
         return false;
     }
 
-    return insert_submessage(reader_guid.guidPrefix, false);
+    const bool inserted = insert_submessage(reader_guid.guidPrefix, false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ensure_trace_message_id();
+        ++trace_gap_submessages_;
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 bool RTPSMessageGroup::create_gap_submessage(
@@ -872,7 +1028,16 @@ bool RTPSMessageGroup::add_acknack(
     assert(nullptr != dynamic_cast<RTPSReader*>(endpoint_));
     static_cast<fastdds::statistics::StatisticsReaderImpl*>(static_cast<RTPSReader*>(endpoint_))->on_acknack(count);
 
-    return insert_submessage(false);
+    const bool inserted = insert_submessage(false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ensure_trace_message_id();
+        ++trace_acknack_submessages_;
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 bool RTPSMessageGroup::add_nackfrag(
@@ -928,7 +1093,16 @@ bool RTPSMessageGroup::add_nackfrag(
     assert(nullptr != dynamic_cast<RTPSReader*>(endpoint_));
     static_cast<RTPSReader*>(endpoint_)->on_nackfrag(count);
 
-    return insert_submessage(false);
+    const bool inserted = insert_submessage(false);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (inserted)
+    {
+        ensure_trace_message_id();
+        ++trace_nackfrag_submessages_;
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    return inserted;
 }
 
 } /* namespace rtps */

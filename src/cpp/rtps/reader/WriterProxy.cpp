@@ -29,9 +29,12 @@
 #include <fastdds/rtps/resources/TimedEvent.h>
 #include <fastdds/rtps/messages/RTPSMessageCreator.h>
 #include <rtps/participant/RTPSParticipantImpl.h>
+#include "../RetransmissionTrace.hpp"
 
 #include "rtps/RTPSDomainImpl.hpp"
 #include "utils/collections/node_size_helpers.hpp"
+
+#include <sstream>
 
 #if !defined(NDEBUG) && defined(FASTRTPS_SOURCE) && defined(__unix__)
 #define SHOULD_DEBUG_LINUX
@@ -278,6 +281,19 @@ bool WriterProxy::received_change_set(
     {
         logInfo(RTPS_READER, "Change " << seq_num << " <= than max available sequence number "
                                        << changes_from_writer_low_mark_);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        std::ostringstream detail;
+        detail << "result=0;reason=at_or_below_low_mark"
+               << ";low_mark=" << changes_from_writer_low_mark_
+               << ";max_sequence=" << max_sequence_number_;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "WRITER_PROXY_RECEIVED_SET",
+            guid(),
+            reader_->getGuid(),
+            seq_num,
+            0,
+            detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
         return false;
     }
 
@@ -308,12 +324,39 @@ bool WriterProxy::received_change_set(
             // Check if already received
             if (changes_received_.find(seq_num) != changes_received_.end())
             {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                std::ostringstream detail;
+                detail << "result=0;reason=duplicate"
+                       << ";low_mark=" << changes_from_writer_low_mark_
+                       << ";max_sequence=" << max_sequence_number_;
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "WRITER_PROXY_RECEIVED_SET",
+                    guid(),
+                    reader_->getGuid(),
+                    seq_num,
+                    0,
+                    detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
                 return false;
             }
 
             changes_received_.insert(seq_num);
         }
     }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::ostringstream detail;
+    detail << "result=1"
+           << ";low_mark=" << changes_from_writer_low_mark_
+           << ";max_sequence=" << max_sequence_number_;
+    FASTDDS_TRACE_RETRANSMISSION(
+        "WRITER_PROXY_RECEIVED_SET",
+        guid(),
+        reader_->getGuid(),
+        seq_num,
+        0,
+        detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     return true;
 }

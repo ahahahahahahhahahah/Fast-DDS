@@ -37,10 +37,37 @@
 #include <mutex>
 #include <cassert>
 #include <algorithm>
+#include <sstream>
 
 namespace eprosima {
 namespace fastrtps {
 namespace rtps {
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+namespace {
+
+const char* change_for_reader_status_name(
+        ChangeForReaderStatus_t status)
+{
+    switch (status)
+    {
+        case UNSENT:
+            return "UNSENT";
+        case UNACKNOWLEDGED:
+            return "UNACKNOWLEDGED";
+        case REQUESTED:
+            return "REQUESTED";
+        case UNDERWAY:
+            return "UNDERWAY";
+        case ACKNOWLEDGED:
+            return "ACKNOWLEDGED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+} // namespace
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 ReaderProxy::ReaderProxy(
         const WriterTimes& times,
@@ -348,6 +375,20 @@ bool ReaderProxy::change_is_unsent(
 void ReaderProxy::acked_changes_set(
         const SequenceNumber_t& seq_num)
 {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (is_active_ && is_remote_and_reliable())
+    {
+        std::ostringstream detail;
+        detail << "reason=acked;base=" << seq_num;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "READER_PROXY_ACK_BASE",
+            writer_->getGuid(),
+            guid(),
+            seq_num,
+            0,
+            detail.str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
     if (is_active_ && is_remote_and_reliable())
     {
@@ -447,6 +488,15 @@ bool ReaderProxy::requested_changes_set(
                         if (UNACKNOWLEDGED == chit->getStatus())
                         {
                             chit->setStatus(REQUESTED);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                            FASTDDS_TRACE_RETRANSMISSION(
+                                "READER_PROXY_STATUS",
+                                writer_->getGuid(),
+                                guid(),
+                                sit,
+                                chit->getChange()->serializedPayload.length,
+                                std::string("from=UNACKNOWLEDGED;to=REQUESTED;reason=acknack"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
                             chit->markAllFragmentsAsUnsent();
                             FASTDDS_TRACE_RETRANSMISSION(
                                 "REQUESTED",
@@ -526,7 +576,25 @@ void ReaderProxy::from_unsent_to_status(
         return;
     }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    const ChangeForReaderStatus_t previous_status = it->getStatus();
+#endif // FASTDDS_RETRANSMISSION_TRACE
     it->setStatus(status);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::ostringstream detail;
+    detail << "from=" << change_for_reader_status_name(previous_status)
+           << ";to=" << change_for_reader_status_name(status)
+           << ";reason=sent"
+           << ";restart_nack_suppression=" << restart_nack_supression
+           << ";delivered=" << delivered;
+    FASTDDS_TRACE_RETRANSMISSION(
+        "READER_PROXY_STATUS",
+        writer_->getGuid(),
+        guid(),
+        seq_num,
+        0,
+        detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     if (delivered)
     {
@@ -561,7 +629,24 @@ bool ReaderProxy::mark_fragment_as_sent_for_change(
 
 bool ReaderProxy::perform_nack_supression()
 {
-    return 0 != convert_status_on_all_changes(UNDERWAY, UNACKNOWLEDGED);
+    return 0 != convert_status_on_all_changes(
+        UNDERWAY,
+        UNACKNOWLEDGED,
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        [&](ChangeForReader_t& change)
+        {
+            FASTDDS_TRACE_RETRANSMISSION(
+                "READER_PROXY_STATUS",
+                writer_->getGuid(),
+                guid(),
+                change.getSequenceNumber(),
+                nullptr != change.getChange() ? change.getChange()->serializedPayload.length : 0,
+                std::string("from=UNDERWAY;to=UNACKNOWLEDGED;reason=nack_suppression"));
+        }
+#else
+        nullptr
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        );
 }
 
 void ReaderProxy::for_each_requested_change(
@@ -604,6 +689,15 @@ uint32_t ReaderProxy::perform_acknack_response(
 
             ++changed;
             change.setStatus(UNSENT);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            FASTDDS_TRACE_RETRANSMISSION(
+                "READER_PROXY_STATUS",
+                writer_->getGuid(),
+                guid(),
+                change.getSequenceNumber(),
+                nullptr != change.getChange() ? change.getChange()->serializedPayload.length : 0,
+                std::string("from=REQUESTED;to=UNSENT;reason=acknack_response"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
             if (func)
             {
                 func(change);

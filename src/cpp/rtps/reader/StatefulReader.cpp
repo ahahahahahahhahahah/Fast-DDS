@@ -22,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <cassert>
+#include <sstream>
 
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/builtin/BuiltinProtocols.h>
@@ -41,6 +42,7 @@
 #include <rtps/participant/RTPSParticipantImpl.h>
 #include <rtps/reader/WriterProxy.h>
 #include <rtps/RTPSDomainImpl.hpp>
+#include "../RetransmissionTrace.hpp"
 
 #define IDSTRING "(ID:" << std::this_thread::get_id() << ") " <<
 
@@ -89,6 +91,41 @@ static inline void send_ack_if_datasharing(
         send_datasharing_ack(reader, history, writer, sequence_number);
     }
 }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+static std::string acknack_trace_detail(
+        const SequenceNumberSet_t& sns,
+        uint32_t count,
+        bool final_flag,
+        const char* reason)
+{
+    uint32_t missing_count = 0;
+    SequenceNumber_t missing_min = SequenceNumber_t::unknown();
+    SequenceNumber_t missing_max = SequenceNumber_t::unknown();
+    sns.for_each([&](SequenceNumber_t seq)
+            {
+                ++missing_count;
+                if (SequenceNumber_t::unknown() == missing_min || seq < missing_min)
+                {
+                    missing_min = seq;
+                }
+                if (SequenceNumber_t::unknown() == missing_max || seq > missing_max)
+                {
+                    missing_max = seq;
+                }
+            });
+
+    std::ostringstream detail;
+    detail << "count=" << count
+           << ";base=" << sns.base()
+           << ";final=" << final_flag
+           << ";missing_count=" << missing_count
+           << ";missing_min=" << missing_min
+           << ";missing_max=" << missing_max
+           << ";reason=" << reason;
+    return detail.str();
+}
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 StatefulReader::~StatefulReader()
 {
@@ -1013,6 +1050,25 @@ bool StatefulReader::change_received(
         }
     }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    const GUID_t writer_guid = a_change->writerGUID;
+    const SequenceNumber_t sequence = a_change->sequenceNumber;
+    const uint32_t payload_length_before_history = a_change->serializedPayload.length;
+    const bool fully_assembled_before_history = a_change->is_fully_assembled();
+    {
+        std::ostringstream detail;
+        detail << "unknown_missing_changes_up_to=" << unknown_missing_changes_up_to
+               << ";fully_assembled=" << fully_assembled_before_history;
+        FASTDDS_TRACE_RETRANSMISSION(
+            "READER_DATA_RECEIVED",
+            writer_guid,
+            m_guid,
+            sequence,
+            payload_length_before_history,
+            detail.str());
+    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
     // NOTE: Depending on QoS settings, one change can be removed from history
     // inside the call to mp_history->received_change
     if (mp_history->received_change(a_change, unknown_missing_changes_up_to))
@@ -1021,10 +1077,32 @@ bool StatefulReader::change_received(
 
         Time_t::now(a_change->reader_info.receptionTimestamp);
         bool ret = true;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        FASTDDS_TRACE_RETRANSMISSION(
+            "READER_HISTORY_ACCEPTED",
+            writer_guid,
+            m_guid,
+            sequence,
+            payload_length,
+            std::string("result=accepted"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
         if (a_change->is_fully_assembled())
         {
             ret = prox->received_change_set(a_change->sequenceNumber);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            std::ostringstream detail;
+            detail << "result=" << ret
+                   << ";fully_assembled=1"
+                   << ";available_max=" << prox->available_changes_max();
+            FASTDDS_TRACE_RETRANSMISSION(
+                "READER_CHANGE_MARKED_RECEIVED",
+                writer_guid,
+                m_guid,
+                sequence,
+                payload_length,
+                detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
         }
         else
         {
@@ -1035,6 +1113,15 @@ bool StatefulReader::change_received(
             {
                 prox->irrelevant_change_set(a_change->sequenceNumber);
                 ret = false;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "READER_CHANGE_MARKED_RECEIVED",
+                    writer_guid,
+                    m_guid,
+                    sequence,
+                    payload_length,
+                    std::string("result=0;fully_assembled=0;reason=fragment_not_in_history"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
             }
         }
 
@@ -1046,6 +1133,16 @@ bool StatefulReader::change_received(
 
         return ret;
     }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    FASTDDS_TRACE_RETRANSMISSION(
+        "READER_HISTORY_REJECTED",
+        writer_guid,
+        m_guid,
+        sequence,
+        payload_length_before_history,
+        std::string("result=rejected"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
     return false;
 }
@@ -1360,6 +1457,16 @@ void StatefulReader::send_acknack(
 
     logInfo(RTPS_READER, "Sending ACKNACK: " << sns);
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    FASTDDS_TRACE_RETRANSMISSION(
+        "READER_ACKNACK_SENT",
+        writer->guid(),
+        m_guid,
+        sns.base(),
+        0,
+        acknack_trace_detail(sns, acknack_count_, is_final, "direct"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
     RTPSMessageGroup group(getRTPSParticipant(), this, sender);
     group.add_acknack(sns, acknack_count_, is_final);
 }
@@ -1422,6 +1529,20 @@ void StatefulReader::send_acknack(
                         ++nackfrag_count_;
                         logInfo(RTPS_READER, "Sending NACKFRAG for sample" << seq << ": " << frag_sns; );
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                        std::ostringstream detail;
+                        detail << "count=" << nackfrag_count_
+                               << ";fragment_base=" << frag_sns.base()
+                               << ";reason=missing_fragments";
+                        FASTDDS_TRACE_RETRANSMISSION(
+                            "READER_NACKFRAG_SENT",
+                            writer->guid(),
+                            m_guid,
+                            seq,
+                            uncomplete_change->serializedPayload.length,
+                            detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
                         group.add_nackfrag(seq, frag_sns, nackfrag_count_);
                     }
 
@@ -1431,6 +1552,15 @@ void StatefulReader::send_acknack(
             logInfo(RTPS_READER, "Sending ACKNACK: " << sns; );
 
             bool final = sns.empty();
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            FASTDDS_TRACE_RETRANSMISSION(
+                "READER_ACKNACK_SENT",
+                writer->guid(),
+                m_guid,
+                sns.base(),
+                0,
+                acknack_trace_detail(sns, acknack_count_, final, "heartbeat_response"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
             group.add_acknack(sns, acknack_count_, final);
         }
     }
