@@ -39,6 +39,12 @@ install(TARGETS
 install(FILES
   config/adaptive_enabled.xml
   config/adaptive_off.xml
+  config/adaptive_topics_async_adaptive_value.xml
+  config/adaptive_topics_async_adaptive_value_admission.xml
+  config/adaptive_topics_async_adaptive_value_observe.xml
+  config/adaptive_topics_async_fifo.xml
+  config/adaptive_topics_async_high_priority.xml
+  config/adaptive_topics_async_priority.xml
   config/adaptive_topics_enabled.xml
   config/adaptive_topics_off.xml
   DESTINATION share/${PROJECT_NAME}/config)

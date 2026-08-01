@@ -44,9 +44,10 @@ RETRANSMIT_ENQUEUE
 The admission decision may be `SEND_NOW`, `DEFER`, or `FORCE_SEND`. Deferred changes remain `REQUESTED` and the
 existing nack-response timer schedules another admission cycle. No sample is removed and no GAP is sent.
 
-Active V1 admission applies to synchronous writers. Asynchronous writers emit a
-`reason=ASYNC_QUEUE_FAIRNESS_NOT_IMPLEMENTED` bypass decision and retain the original behavior until old-queue aging
-or a minimum service share is implemented in the Flow Controller.
+Synchronous writers opt in with `fastdds.adaptive_retransmission.enabled=true`. Asynchronous writers only enable
+adaptive admission when the same property is set and their FlowController uses the `ADAPTIVE_VALUE` scheduler.
+`fastdds.adaptive_async.observe_old_samples=true` only enables async old-sample tracking and trace events; by itself it
+does not change retransmission admission.
 
 The controller is Transport-independent: it applies to Reliable readers in `matched_remote_readers_`, whether their
 RTPS traffic uses UDP, SHM Transport, or another registered Transport. Intraprocess readers and Data Sharing readers

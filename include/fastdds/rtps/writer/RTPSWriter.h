@@ -273,6 +273,8 @@ public:
         return is_async_;
     }
 
+    RTPS_DllAPI bool uses_adaptive_value_flow_controller() const;
+
     /**
      * Remove an specified max number of changes
      * @param max Maximum number of changes to remove.

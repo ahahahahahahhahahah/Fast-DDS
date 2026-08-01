@@ -159,6 +159,11 @@ RTPSWriter::~RTPSWriter()
     mp_history->mp_mutex = nullptr;
 }
 
+bool RTPSWriter::uses_adaptive_value_flow_controller() const
+{
+    return nullptr != flow_controller_ && flow_controller_->is_adaptive_value_scheduler();
+}
+
 void RTPSWriter::deinit()
 {
     // First, unregister changes from FlowController. This action must be protected.

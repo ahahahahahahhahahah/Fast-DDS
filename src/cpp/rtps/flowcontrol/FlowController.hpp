@@ -92,6 +92,13 @@ public:
      * @return Maximum number of bytes of a RTPS message.
      */
     virtual uint32_t get_max_payload() = 0;
+
+    /*!
+     * Whether this flow controller uses the adaptive value scheduler.
+     *
+     * @return true when writers registered in this flow controller are managed by ADAPTIVE_VALUE scheduling.
+     */
+    virtual bool is_adaptive_value_scheduler() const = 0;
 };
 
 } // namespace rtps
