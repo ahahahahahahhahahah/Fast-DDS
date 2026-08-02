@@ -19,7 +19,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
+#include <string>
+#include <utility>
 
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/messages/RTPSMessageCreator.h>
@@ -38,6 +45,231 @@
 namespace eprosima {
 namespace fastrtps {
 namespace rtps {
+
+namespace {
+
+std::string adaptive_summary_guid_to_string(
+        const GUID_t& guid)
+{
+    std::ostringstream out;
+    out << guid;
+    return out.str();
+}
+
+bool adaptive_summary_enabled()
+{
+    static const bool enabled = []()
+            {
+                const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+                return nullptr != path && '\0' != path[0];
+            }();
+    return enabled;
+}
+
+uint64_t adaptive_summary_window_ms()
+{
+    static const uint64_t window_ms = []()
+            {
+                const char* value = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_WINDOW_MS");
+                if (nullptr == value || '\0' == value[0])
+                {
+                    return uint64_t{0};
+                }
+
+                char* end = nullptr;
+                const unsigned long parsed = strtoul(value, &end, 10);
+                if (value == end)
+                {
+                    return uint64_t{0};
+                }
+                return static_cast<uint64_t>(parsed);
+            }();
+    return window_ms;
+}
+
+struct AdaptiveRtpsWriterCounters
+{
+    uint64_t submit_messages = 0;
+    uint64_t submit_sent = 0;
+    uint64_t submit_failed = 0;
+    uint64_t submit_bytes = 0;
+    uint64_t data_submessages = 0;
+    uint64_t data_frag_submessages = 0;
+    SequenceNumber_t min_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t max_sequence = SequenceNumber_t::unknown();
+};
+
+class AdaptiveRtpsWriterSummary
+{
+public:
+
+    ~AdaptiveRtpsWriterSummary()
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+        if (nullptr == path)
+        {
+            return;
+        }
+
+        std::ofstream out(path, std::ios::app);
+        if (!out)
+        {
+            return;
+        }
+
+        for (const auto& item : counters_)
+        {
+            const AdaptiveRtpsWriterCounters& c = item.second;
+            out << "component=RTPS_WRITER_SUMMARY"
+                << ";writer_guid=" << item.first
+                << ";submit_messages=" << c.submit_messages
+                << ";submit_sent=" << c.submit_sent
+                << ";submit_failed=" << c.submit_failed
+                << ";submit_bytes=" << c.submit_bytes
+                << ";data_submessages=" << c.data_submessages
+                << ";data_frag_submessages=" << c.data_frag_submessages
+                << ";min_sequence=" << c.min_sequence
+                << ";max_sequence=" << c.max_sequence
+                << '\n';
+        }
+
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        for (const auto& item : window_counters_)
+        {
+            const AdaptiveRtpsWriterCounters& c = item.second;
+            out << "component=RTPS_WRITER_SUMMARY_WINDOW"
+                << ";writer_guid=" << item.first.first
+                << ";window_index=" << item.first.second
+                << ";window_start_ms=" << item.first.second * window_ms
+                << ";window_end_ms=" << (item.first.second + 1) * window_ms
+                << ";submit_messages=" << c.submit_messages
+                << ";submit_sent=" << c.submit_sent
+                << ";submit_failed=" << c.submit_failed
+                << ";submit_bytes=" << c.submit_bytes
+                << ";data_submessages=" << c.data_submessages
+                << ";data_frag_submessages=" << c.data_frag_submessages
+                << ";min_sequence=" << c.min_sequence
+                << ";max_sequence=" << c.max_sequence
+                << '\n';
+        }
+    }
+
+    void record(
+            const GUID_t& writer_guid,
+            bool sent,
+            uint32_t message_bytes,
+            uint32_t data_submessages,
+            uint32_t data_frag_submessages,
+            const SequenceNumber_t& min_sequence,
+            const SequenceNumber_t& max_sequence)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        if (0 == data_submessages && 0 == data_frag_submessages)
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string writer_key = adaptive_summary_guid_to_string(writer_guid);
+        update_counters(
+            counters_[writer_key],
+            sent,
+            message_bytes,
+            data_submessages,
+            data_frag_submessages,
+            min_sequence,
+            max_sequence);
+
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        if (0 != window_ms)
+        {
+            update_counters(
+                window_counters_[std::make_pair(writer_key, current_window_index(window_ms))],
+                sent,
+                message_bytes,
+                data_submessages,
+                data_frag_submessages,
+                min_sequence,
+                max_sequence);
+        }
+    }
+
+private:
+
+    uint64_t current_window_index(
+            uint64_t window_ms) const
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time_).count();
+        return static_cast<uint64_t>(elapsed) / window_ms;
+    }
+
+    static void update_counters(
+            AdaptiveRtpsWriterCounters& c,
+            bool sent,
+            uint32_t message_bytes,
+            uint32_t data_submessages,
+            uint32_t data_frag_submessages,
+            const SequenceNumber_t& min_sequence,
+            const SequenceNumber_t& max_sequence)
+    {
+        ++c.submit_messages;
+        if (sent)
+        {
+            ++c.submit_sent;
+        }
+        else
+        {
+            ++c.submit_failed;
+        }
+        c.submit_bytes += message_bytes;
+        c.data_submessages += data_submessages;
+        c.data_frag_submessages += data_frag_submessages;
+        update_range(c.min_sequence, c.max_sequence, min_sequence);
+        update_range(c.min_sequence, c.max_sequence, max_sequence);
+    }
+
+    static void update_range(
+            SequenceNumber_t& min_sequence,
+            SequenceNumber_t& max_sequence,
+            const SequenceNumber_t& sequence)
+    {
+        if (SequenceNumber_t::unknown() == sequence)
+        {
+            return;
+        }
+        if (SequenceNumber_t::unknown() == min_sequence || sequence < min_sequence)
+        {
+            min_sequence = sequence;
+        }
+        if (SequenceNumber_t::unknown() == max_sequence || sequence > max_sequence)
+        {
+            max_sequence = sequence;
+        }
+    }
+
+    std::mutex mutex_;
+    std::map<std::string, AdaptiveRtpsWriterCounters> counters_;
+    std::map<std::pair<std::string, uint64_t>, AdaptiveRtpsWriterCounters> window_counters_;
+    std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
+};
+
+AdaptiveRtpsWriterSummary& adaptive_rtps_writer_summary()
+{
+    static AdaptiveRtpsWriterSummary summary;
+    return summary;
+}
+
+} // namespace
 
 /**
  * An InlineQosWriter that puts the inline_qos of a CacheChange_t into a CDRMessage_t.
@@ -263,6 +495,28 @@ void RTPSMessageGroup::trace_data_submessage(
 }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
+void RTPSMessageGroup::reset_adaptive_summary_message()
+{
+    summary_data_submessages_ = 0;
+    summary_data_frag_submessages_ = 0;
+    summary_min_sequence_ = SequenceNumber_t::unknown();
+    summary_max_sequence_ = SequenceNumber_t::unknown();
+}
+
+void RTPSMessageGroup::update_adaptive_summary_sequence_range(
+        const SequenceNumber_t& sequence)
+{
+    if (SequenceNumber_t::unknown() == summary_min_sequence_ || sequence < summary_min_sequence_)
+    {
+        summary_min_sequence_ = sequence;
+    }
+
+    if (SequenceNumber_t::unknown() == summary_max_sequence_ || sequence > summary_max_sequence_)
+    {
+        summary_max_sequence_ = sequence;
+    }
+}
+
 RTPSMessageGroup::RTPSMessageGroup(
         RTPSParticipantImpl* participant,
         bool internal_buffer)
@@ -348,6 +602,7 @@ void RTPSMessageGroup::reset_to_header()
     CDRMessage::initCDRMsg(full_msg_);
     full_msg_->pos = RTPSMESSAGE_HEADER_SIZE;
     full_msg_->length = RTPSMESSAGE_HEADER_SIZE;
+    reset_adaptive_summary_message();
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     reset_trace_message_summary();
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -398,6 +653,14 @@ void RTPSMessageGroup::send()
                 msgToSend,
                 max_blocking_time_is_set_ ? max_blocking_time_point_ : (std::chrono::steady_clock::now() +
                 std::chrono::hours(24)));
+            adaptive_rtps_writer_summary().record(
+                endpoint_->getGuid(),
+                sent,
+                msgToSend->length,
+                summary_data_submessages_,
+                summary_data_frag_submessages_,
+                summary_min_sequence_,
+                summary_max_sequence_);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             ensure_trace_message_id();
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -648,6 +911,11 @@ bool RTPSMessageGroup::add_data(
 #endif // if HAVE_SECURITY
 
     const bool inserted = insert_submessage(is_big_submessage);
+    if (inserted)
+    {
+        ++summary_data_submessages_;
+        update_adaptive_summary_sequence_range(change.sequenceNumber);
+    }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     if (inserted)
     {
@@ -767,6 +1035,11 @@ bool RTPSMessageGroup::add_data_frag(
 #endif // if HAVE_SECURITY
 
     const bool inserted = insert_submessage(false);
+    if (inserted)
+    {
+        ++summary_data_frag_submessages_;
+        update_adaptive_summary_sequence_range(change.sequenceNumber);
+    }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     if (inserted)
     {

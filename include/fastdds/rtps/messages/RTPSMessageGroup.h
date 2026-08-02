@@ -294,6 +294,11 @@ private:
             const SequenceNumberSet_t& gap_bitmap,
             const EntityId_t& reader_id);
 
+    void reset_adaptive_summary_message();
+
+    void update_adaptive_summary_sequence_range(
+            const SequenceNumber_t& sequence);
+
     RTPSMessageSenderInterface* sender_ = nullptr;
 
     Endpoint* endpoint_ = nullptr;
@@ -323,6 +328,14 @@ private:
     uint32_t sent_bytes_limitation_ = 0;
 
     uint32_t current_sent_bytes_ = 0;
+
+    uint32_t summary_data_submessages_ = 0;
+
+    uint32_t summary_data_frag_submessages_ = 0;
+
+    SequenceNumber_t summary_min_sequence_ = SequenceNumber_t::unknown();
+
+    SequenceNumber_t summary_max_sequence_ = SequenceNumber_t::unknown();
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     uint64_t current_trace_message_id_ = 0;

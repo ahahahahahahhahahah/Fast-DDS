@@ -19,10 +19,16 @@
 
 #include <fastdds/rtps/reader/StatefulReader.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <cassert>
 #include <sstream>
+#include <string>
+#include <utility>
 
 #include <fastdds/dds/log/Log.hpp>
 #include <fastdds/rtps/builtin/BuiltinProtocols.h>
@@ -47,6 +53,460 @@
 #define IDSTRING "(ID:" << std::this_thread::get_id() << ") " <<
 
 using namespace eprosima::fastrtps::rtps;
+
+namespace {
+
+std::string adaptive_summary_guid_to_string(
+        const GUID_t& guid)
+{
+    std::ostringstream out;
+    out << guid;
+    return out.str();
+}
+
+bool adaptive_summary_enabled()
+{
+    static const bool enabled = []()
+            {
+                const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+                return nullptr != path && '\0' != path[0];
+            }();
+    return enabled;
+}
+
+uint64_t adaptive_summary_window_ms()
+{
+    static const uint64_t window_ms = []()
+            {
+                const char* value = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_WINDOW_MS");
+                if (nullptr == value || '\0' == value[0])
+                {
+                    return uint64_t{0};
+                }
+
+                char* end = nullptr;
+                const unsigned long parsed = strtoul(value, &end, 10);
+                if (value == end)
+                {
+                    return uint64_t{0};
+                }
+                return static_cast<uint64_t>(parsed);
+            }();
+    return window_ms;
+}
+
+struct AdaptiveRtpsReaderCounters
+{
+    uint64_t data_received = 0;
+    uint64_t history_accepted = 0;
+    uint64_t marked_received = 0;
+    uint64_t marked_received_failed = 0;
+    uint64_t acknack_direct = 0;
+    uint64_t acknack_heartbeat = 0;
+    uint64_t acknack_final = 0;
+    uint64_t acknack_nonfinal = 0;
+    uint64_t acknack_missing_total = 0;
+    uint64_t nackfrag_sent = 0;
+    SequenceNumber_t min_data_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t max_data_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t min_history_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t max_history_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t min_marked_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t max_marked_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t min_acknack_base = SequenceNumber_t::unknown();
+    SequenceNumber_t max_acknack_base = SequenceNumber_t::unknown();
+    SequenceNumber_t min_acknack_missing = SequenceNumber_t::unknown();
+    SequenceNumber_t max_acknack_missing = SequenceNumber_t::unknown();
+    SequenceNumber_t min_nackfrag_sequence = SequenceNumber_t::unknown();
+    SequenceNumber_t max_nackfrag_sequence = SequenceNumber_t::unknown();
+};
+
+class AdaptiveRtpsReaderSummary
+{
+public:
+
+    ~AdaptiveRtpsReaderSummary()
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+        if (nullptr == path)
+        {
+            return;
+        }
+
+        std::ofstream out(path, std::ios::app);
+        if (!out)
+        {
+            return;
+        }
+
+        for (const auto& item : counters_)
+        {
+            const AdaptiveRtpsReaderCounters& c = item.second;
+            out << "component=RTPS_READER_SUMMARY"
+                << ";guid_pair=" << item.first
+                << ";data_received=" << c.data_received
+                << ";history_accepted=" << c.history_accepted
+                << ";marked_received=" << c.marked_received
+                << ";marked_received_failed=" << c.marked_received_failed
+                << ";acknack_direct=" << c.acknack_direct
+                << ";acknack_heartbeat=" << c.acknack_heartbeat
+                << ";acknack_final=" << c.acknack_final
+                << ";acknack_nonfinal=" << c.acknack_nonfinal
+                << ";acknack_missing_total=" << c.acknack_missing_total
+                << ";nackfrag_sent=" << c.nackfrag_sent
+                << ";min_data_sequence=" << c.min_data_sequence
+                << ";max_data_sequence=" << c.max_data_sequence
+                << ";min_history_sequence=" << c.min_history_sequence
+                << ";max_history_sequence=" << c.max_history_sequence
+                << ";min_marked_sequence=" << c.min_marked_sequence
+                << ";max_marked_sequence=" << c.max_marked_sequence
+                << ";min_acknack_base=" << c.min_acknack_base
+                << ";max_acknack_base=" << c.max_acknack_base
+                << ";min_acknack_missing=" << c.min_acknack_missing
+                << ";max_acknack_missing=" << c.max_acknack_missing
+                << ";min_nackfrag_sequence=" << c.min_nackfrag_sequence
+                << ";max_nackfrag_sequence=" << c.max_nackfrag_sequence
+                << '\n';
+        }
+
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        for (const auto& item : window_counters_)
+        {
+            const AdaptiveRtpsReaderCounters& c = item.second;
+            out << "component=RTPS_READER_SUMMARY_WINDOW"
+                << ";guid_pair=" << item.first.first
+                << ";window_index=" << item.first.second
+                << ";window_start_ms=" << item.first.second * window_ms
+                << ";window_end_ms=" << (item.first.second + 1) * window_ms
+                << ";data_received=" << c.data_received
+                << ";history_accepted=" << c.history_accepted
+                << ";marked_received=" << c.marked_received
+                << ";marked_received_failed=" << c.marked_received_failed
+                << ";acknack_direct=" << c.acknack_direct
+                << ";acknack_heartbeat=" << c.acknack_heartbeat
+                << ";acknack_final=" << c.acknack_final
+                << ";acknack_nonfinal=" << c.acknack_nonfinal
+                << ";acknack_missing_total=" << c.acknack_missing_total
+                << ";nackfrag_sent=" << c.nackfrag_sent
+                << ";min_data_sequence=" << c.min_data_sequence
+                << ";max_data_sequence=" << c.max_data_sequence
+                << ";min_history_sequence=" << c.min_history_sequence
+                << ";max_history_sequence=" << c.max_history_sequence
+                << ";min_marked_sequence=" << c.min_marked_sequence
+                << ";max_marked_sequence=" << c.max_marked_sequence
+                << ";min_acknack_base=" << c.min_acknack_base
+                << ";max_acknack_base=" << c.max_acknack_base
+                << ";min_acknack_missing=" << c.min_acknack_missing
+                << ";max_acknack_missing=" << c.max_acknack_missing
+                << ";min_nackfrag_sequence=" << c.min_nackfrag_sequence
+                << ";max_nackfrag_sequence=" << c.max_nackfrag_sequence
+                << '\n';
+        }
+    }
+
+    void record_data_received(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string pair_key = key(writer_guid, reader_guid);
+        record_data_received_nts(counters_[pair_key], sequence);
+        record_data_received_window_nts(pair_key, sequence);
+    }
+
+    void record_history_accepted(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string pair_key = key(writer_guid, reader_guid);
+        record_history_accepted_nts(counters_[pair_key], sequence);
+        record_history_accepted_window_nts(pair_key, sequence);
+    }
+
+    void record_marked_received(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence,
+            bool result)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string pair_key = key(writer_guid, reader_guid);
+        record_marked_received_nts(counters_[pair_key], sequence, result);
+        record_marked_received_window_nts(pair_key, sequence, result);
+    }
+
+    void record_acknack(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid,
+            const SequenceNumberSet_t& sns,
+            bool final_flag,
+            const char* reason)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        uint32_t missing_count = 0;
+        SequenceNumber_t missing_min = SequenceNumber_t::unknown();
+        SequenceNumber_t missing_max = SequenceNumber_t::unknown();
+        sns.for_each([&](SequenceNumber_t seq)
+                {
+                    ++missing_count;
+                    update_range(missing_min, missing_max, seq);
+                });
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string pair_key = key(writer_guid, reader_guid);
+        record_acknack_nts(
+            counters_[pair_key],
+            sns.base(),
+            final_flag,
+            reason,
+            missing_count,
+            missing_min,
+            missing_max);
+        record_acknack_window_nts(
+            pair_key,
+            sns.base(),
+            final_flag,
+            reason,
+            missing_count,
+            missing_min,
+            missing_max);
+    }
+
+    void record_nackfrag(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid,
+            const SequenceNumber_t& sequence)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> guard(mutex_);
+        const std::string pair_key = key(writer_guid, reader_guid);
+        record_nackfrag_nts(counters_[pair_key], sequence);
+        record_nackfrag_window_nts(pair_key, sequence);
+    }
+
+private:
+
+    uint64_t current_window_index(
+            uint64_t window_ms) const
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time_).count();
+        return static_cast<uint64_t>(elapsed) / window_ms;
+    }
+
+    AdaptiveRtpsReaderCounters* window_counters(
+            const std::string& pair_key)
+    {
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        if (0 == window_ms)
+        {
+            return nullptr;
+        }
+        return &window_counters_[std::make_pair(pair_key, current_window_index(window_ms))];
+    }
+
+    void record_data_received_window_nts(
+            const std::string& pair_key,
+            const SequenceNumber_t& sequence)
+    {
+        AdaptiveRtpsReaderCounters* counters = window_counters(pair_key);
+        if (nullptr != counters)
+        {
+            record_data_received_nts(*counters, sequence);
+        }
+    }
+
+    static void record_data_received_nts(
+            AdaptiveRtpsReaderCounters& c,
+            const SequenceNumber_t& sequence)
+    {
+        ++c.data_received;
+        update_range(c.min_data_sequence, c.max_data_sequence, sequence);
+    }
+
+    void record_history_accepted_window_nts(
+            const std::string& pair_key,
+            const SequenceNumber_t& sequence)
+    {
+        AdaptiveRtpsReaderCounters* counters = window_counters(pair_key);
+        if (nullptr != counters)
+        {
+            record_history_accepted_nts(*counters, sequence);
+        }
+    }
+
+    static void record_history_accepted_nts(
+            AdaptiveRtpsReaderCounters& c,
+            const SequenceNumber_t& sequence)
+    {
+        ++c.history_accepted;
+        update_range(c.min_history_sequence, c.max_history_sequence, sequence);
+    }
+
+    void record_marked_received_window_nts(
+            const std::string& pair_key,
+            const SequenceNumber_t& sequence,
+            bool result)
+    {
+        AdaptiveRtpsReaderCounters* counters = window_counters(pair_key);
+        if (nullptr != counters)
+        {
+            record_marked_received_nts(*counters, sequence, result);
+        }
+    }
+
+    static void record_marked_received_nts(
+            AdaptiveRtpsReaderCounters& c,
+            const SequenceNumber_t& sequence,
+            bool result)
+    {
+        if (result)
+        {
+            ++c.marked_received;
+            update_range(c.min_marked_sequence, c.max_marked_sequence, sequence);
+        }
+        else
+        {
+            ++c.marked_received_failed;
+        }
+    }
+
+    void record_acknack_window_nts(
+            const std::string& pair_key,
+            const SequenceNumber_t& base,
+            bool final_flag,
+            const char* reason,
+            uint32_t missing_count,
+            const SequenceNumber_t& missing_min,
+            const SequenceNumber_t& missing_max)
+    {
+        AdaptiveRtpsReaderCounters* counters = window_counters(pair_key);
+        if (nullptr != counters)
+        {
+            record_acknack_nts(*counters, base, final_flag, reason, missing_count, missing_min, missing_max);
+        }
+    }
+
+    static void record_acknack_nts(
+            AdaptiveRtpsReaderCounters& c,
+            const SequenceNumber_t& base,
+            bool final_flag,
+            const char* reason,
+            uint32_t missing_count,
+            const SequenceNumber_t& missing_min,
+            const SequenceNumber_t& missing_max)
+    {
+        if (nullptr != reason && 0 == std::string("direct").compare(reason))
+        {
+            ++c.acknack_direct;
+        }
+        else
+        {
+            ++c.acknack_heartbeat;
+        }
+        if (final_flag)
+        {
+            ++c.acknack_final;
+        }
+        else
+        {
+            ++c.acknack_nonfinal;
+        }
+        c.acknack_missing_total += missing_count;
+        update_range(c.min_acknack_base, c.max_acknack_base, base);
+        update_range(c.min_acknack_missing, c.max_acknack_missing, missing_min);
+        update_range(c.min_acknack_missing, c.max_acknack_missing, missing_max);
+    }
+
+    void record_nackfrag_window_nts(
+            const std::string& pair_key,
+            const SequenceNumber_t& sequence)
+    {
+        AdaptiveRtpsReaderCounters* counters = window_counters(pair_key);
+        if (nullptr != counters)
+        {
+            record_nackfrag_nts(*counters, sequence);
+        }
+    }
+
+    static void record_nackfrag_nts(
+            AdaptiveRtpsReaderCounters& c,
+            const SequenceNumber_t& sequence)
+    {
+        ++c.nackfrag_sent;
+        update_range(c.min_nackfrag_sequence, c.max_nackfrag_sequence, sequence);
+    }
+
+    static std::string key(
+            const GUID_t& writer_guid,
+            const GUID_t& reader_guid)
+    {
+        return adaptive_summary_guid_to_string(writer_guid) + "->" + adaptive_summary_guid_to_string(reader_guid);
+    }
+
+    static void update_range(
+            SequenceNumber_t& min_sequence,
+            SequenceNumber_t& max_sequence,
+            const SequenceNumber_t& sequence)
+    {
+        if (SequenceNumber_t::unknown() == sequence)
+        {
+            return;
+        }
+        if (SequenceNumber_t::unknown() == min_sequence || sequence < min_sequence)
+        {
+            min_sequence = sequence;
+        }
+        if (SequenceNumber_t::unknown() == max_sequence || sequence > max_sequence)
+        {
+            max_sequence = sequence;
+        }
+    }
+
+    std::mutex mutex_;
+    std::map<std::string, AdaptiveRtpsReaderCounters> counters_;
+    std::map<std::pair<std::string, uint64_t>, AdaptiveRtpsReaderCounters> window_counters_;
+    std::chrono::steady_clock::time_point start_time_ = std::chrono::steady_clock::now();
+};
+
+AdaptiveRtpsReaderSummary& adaptive_rtps_reader_summary()
+{
+    static AdaptiveRtpsReaderSummary summary;
+    return summary;
+}
+
+} // namespace
 
 static void send_datasharing_ack(
         StatefulReader* reader,
@@ -1050,9 +1510,10 @@ bool StatefulReader::change_received(
         }
     }
 
-#ifdef FASTDDS_RETRANSMISSION_TRACE
     const GUID_t writer_guid = a_change->writerGUID;
     const SequenceNumber_t sequence = a_change->sequenceNumber;
+    adaptive_rtps_reader_summary().record_data_received(writer_guid, m_guid, sequence);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     const uint32_t payload_length_before_history = a_change->serializedPayload.length;
     const bool fully_assembled_before_history = a_change->is_fully_assembled();
     {
@@ -1077,6 +1538,7 @@ bool StatefulReader::change_received(
 
         Time_t::now(a_change->reader_info.receptionTimestamp);
         bool ret = true;
+        adaptive_rtps_reader_summary().record_history_accepted(writer_guid, m_guid, sequence);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         FASTDDS_TRACE_RETRANSMISSION(
             "READER_HISTORY_ACCEPTED",
@@ -1090,6 +1552,7 @@ bool StatefulReader::change_received(
         if (a_change->is_fully_assembled())
         {
             ret = prox->received_change_set(a_change->sequenceNumber);
+            adaptive_rtps_reader_summary().record_marked_received(writer_guid, m_guid, sequence, ret);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             std::ostringstream detail;
             detail << "result=" << ret
@@ -1113,6 +1576,7 @@ bool StatefulReader::change_received(
             {
                 prox->irrelevant_change_set(a_change->sequenceNumber);
                 ret = false;
+                adaptive_rtps_reader_summary().record_marked_received(writer_guid, m_guid, sequence, false);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 FASTDDS_TRACE_RETRANSMISSION(
                     "READER_CHANGE_MARKED_RECEIVED",
@@ -1457,6 +1921,7 @@ void StatefulReader::send_acknack(
 
     logInfo(RTPS_READER, "Sending ACKNACK: " << sns);
 
+    adaptive_rtps_reader_summary().record_acknack(writer->guid(), m_guid, sns, is_final, "direct");
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     FASTDDS_TRACE_RETRANSMISSION(
         "READER_ACKNACK_SENT",
@@ -1529,6 +1994,7 @@ void StatefulReader::send_acknack(
                         ++nackfrag_count_;
                         logInfo(RTPS_READER, "Sending NACKFRAG for sample" << seq << ": " << frag_sns; );
 
+                        adaptive_rtps_reader_summary().record_nackfrag(writer->guid(), m_guid, seq);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                         std::ostringstream detail;
                         detail << "count=" << nackfrag_count_
@@ -1552,6 +2018,12 @@ void StatefulReader::send_acknack(
             logInfo(RTPS_READER, "Sending ACKNACK: " << sns; );
 
             bool final = sns.empty();
+            adaptive_rtps_reader_summary().record_acknack(
+                writer->guid(),
+                m_guid,
+                sns,
+                final,
+                "heartbeat_response");
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             FASTDDS_TRACE_RETRANSMISSION(
                 "READER_ACKNACK_SENT",

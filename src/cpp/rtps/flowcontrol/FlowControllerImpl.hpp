@@ -1026,6 +1026,11 @@ struct FlowControllerAdaptiveValueSchedule
         it->second.queue.add_new_sample(change);
         ++it->second.summary.new_enqueue;
         it->second.summary.last_new_enqueue_sequence = change->sequenceNumber.to64long();
+        if (WriterQueue::Summary* window = mutable_window_summary(it->second))
+        {
+            ++window->new_enqueue;
+            window->last_new_enqueue_sequence = change->sequenceNumber.to64long();
+        }
     }
 
     void add_old_sample(
@@ -1037,6 +1042,11 @@ struct FlowControllerAdaptiveValueSchedule
         it->second.queue.add_old_sample(change);
         ++it->second.summary.old_enqueue;
         it->second.summary.last_old_enqueue_sequence = change->sequenceNumber.to64long();
+        if (WriterQueue::Summary* window = mutable_window_summary(it->second))
+        {
+            ++window->old_enqueue;
+            window->last_old_enqueue_sequence = change->sequenceNumber.to64long();
+        }
     }
 
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
@@ -1126,10 +1136,67 @@ private:
             uint64_t last_old_enqueue_sequence = 0;
             uint64_t last_selected_sequence = 0;
         } summary;
+        std::map<uint64_t, Summary> window_summary;
     };
 
     static constexpr uint32_t max_age_credit = 20;
     static constexpr uint32_t deficit_cap_periods = 2;
+
+    static bool adaptive_summary_enabled()
+    {
+        static const bool enabled = []()
+                {
+                    const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+                    return nullptr != path && '\0' != path[0];
+                }();
+        return enabled;
+    }
+
+    static uint64_t adaptive_summary_window_ms()
+    {
+        static const uint64_t window_ms = []()
+                {
+                    const char* value = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_WINDOW_MS");
+                    if (nullptr == value || '\0' == value[0])
+                    {
+                        return uint64_t{0};
+                    }
+
+                    char* end = nullptr;
+                    const unsigned long parsed = strtoul(value, &end, 10);
+                    if (value == end)
+                    {
+                        return uint64_t{0};
+                    }
+                    return static_cast<uint64_t>(parsed);
+                }();
+        return window_ms;
+    }
+
+    uint64_t current_window_index(
+            uint64_t window_ms) const
+    {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - summary_start_time_).count();
+        return static_cast<uint64_t>(elapsed) / window_ms;
+    }
+
+    WriterQueue::Summary* mutable_window_summary(
+            WriterQueue& queue)
+    {
+        if (!adaptive_summary_enabled())
+        {
+            return nullptr;
+        }
+
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        if (0 == window_ms)
+        {
+            return nullptr;
+        }
+
+        return &queue.window_summary[current_window_index(window_ms)];
+    }
 
     uint32_t initial_quantum_bytes(
             uint32_t weight) const
@@ -1158,6 +1225,10 @@ private:
             if (!writer.second.queue.has_pending_change())
             {
                 ++writer.second.summary.refill_idle;
+                if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                {
+                    ++window->refill_idle;
+                }
                 writer.second.quantum_bytes = 0;
                 writer.second.deficit_bytes = std::min<int64_t>(
                     writer.second.deficit_bytes,
@@ -1167,6 +1238,10 @@ private:
                 continue;
             }
             ++writer.second.summary.refill_pending;
+            if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+            {
+                ++window->refill_pending;
+            }
             writer.second.quantum_bytes = quantum_bytes(writer.second, total_weight);
             writer.second.deficit_bytes = std::min<int64_t>(
                 writer.second.deficit_bytes + static_cast<int64_t>(writer.second.quantum_bytes),
@@ -1443,10 +1518,18 @@ private:
                     if (sample_is_old)
                     {
                         ++writer->second.summary.borrow_denied_old;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer->second))
+                        {
+                            ++window->borrow_denied_old;
+                        }
                     }
                     else
                     {
                         ++writer->second.summary.borrow_denied_new;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer->second))
+                        {
+                            ++window->borrow_denied_new;
+                        }
                     }
                     continue;
                 }
@@ -1529,10 +1612,18 @@ private:
                     if (selected_sample_is_old)
                     {
                         ++writer.second.summary.selected_deficit_old;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                        {
+                            ++window->selected_deficit_old;
+                        }
                     }
                     else
                     {
                         ++writer.second.summary.selected_deficit_new;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                        {
+                            ++window->selected_deficit_new;
+                        }
                     }
                 }
                 else
@@ -1540,16 +1631,28 @@ private:
                     if (selected_sample_is_old)
                     {
                         ++writer.second.summary.selected_borrow_old;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                        {
+                            ++window->selected_borrow_old;
+                        }
                     }
                     else
                     {
                         ++writer.second.summary.selected_borrow_new;
+                        if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                        {
+                            ++window->selected_borrow_new;
+                        }
                     }
                 }
                 if (nullptr != change_being_processed_)
                 {
                     writer.second.summary.last_selected_sequence =
                             change_being_processed_->sequenceNumber.to64long();
+                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                    {
+                        window->last_selected_sequence = change_being_processed_->sequenceNumber.to64long();
+                    }
                 }
                 writer.second.age_credit = 0;
                 writer.second.selections_in_period = std::min(
@@ -1606,6 +1709,35 @@ private:
                << ";last_selected_sequence=" << queue.summary.last_selected_sequence
                << ";final_deficit_bytes=" << queue.deficit_bytes
                << '\n';
+
+        const uint64_t window_ms = adaptive_summary_window_ms();
+        for (const auto& item : queue.window_summary)
+        {
+            const WriterQueue::Summary& summary = item.second;
+            output << "component=ADAPTIVE_VALUE_SCHEDULER_WINDOW"
+                   << ";writer_guid=" << writer->getGuid()
+                   << ";value_class=" << value_class_name(queue.value_class)
+                   << ";priority=" << queue.priority
+                   << ";base_weight=" << queue.base_weight
+                   << ";adaptive_weight=" << queue.adaptive_weight
+                   << ";window_index=" << item.first
+                   << ";window_start_ms=" << item.first * window_ms
+                   << ";window_end_ms=" << (item.first + 1) * window_ms
+                   << ";new_enqueue=" << summary.new_enqueue
+                   << ";old_enqueue=" << summary.old_enqueue
+                   << ";selected_deficit_new=" << summary.selected_deficit_new
+                   << ";selected_deficit_old=" << summary.selected_deficit_old
+                   << ";selected_borrow_new=" << summary.selected_borrow_new
+                   << ";selected_borrow_old=" << summary.selected_borrow_old
+                   << ";borrow_denied_new=" << summary.borrow_denied_new
+                   << ";borrow_denied_old=" << summary.borrow_denied_old
+                   << ";refill_pending=" << summary.refill_pending
+                   << ";refill_idle=" << summary.refill_idle
+                   << ";last_new_enqueue_sequence=" << summary.last_new_enqueue_sequence
+                   << ";last_old_enqueue_sequence=" << summary.last_old_enqueue_sequence
+                   << ";last_selected_sequence=" << summary.last_selected_sequence
+                   << '\n';
+        }
     }
 
     std::unordered_map<fastrtps::rtps::RTPSWriter*, WriterQueue> writers_queue_;
@@ -1623,6 +1755,8 @@ private:
     bool selected_by_deficit_being_processed_ = true;
 
     bool selected_sample_is_old_being_processed_ = false;
+
+    std::chrono::steady_clock::time_point summary_start_time_ = std::chrono::steady_clock::now();
 };
 
 template<typename PublishMode, typename SampleScheduling>
