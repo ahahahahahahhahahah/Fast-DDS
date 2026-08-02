@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -978,6 +979,7 @@ struct FlowControllerAdaptiveValueSchedule
     {
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
+        emit_summary(writer, it->second);
         int32_t priority = it->second.priority;
         writers_queue_.erase(it);
         auto priority_it = priorities_.find(priority);
@@ -1022,6 +1024,8 @@ struct FlowControllerAdaptiveValueSchedule
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
         it->second.queue.add_new_sample(change);
+        ++it->second.summary.new_enqueue;
+        it->second.summary.last_new_enqueue_sequence = change->sequenceNumber.to64long();
     }
 
     void add_old_sample(
@@ -1031,6 +1035,8 @@ struct FlowControllerAdaptiveValueSchedule
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
         it->second.queue.add_old_sample(change);
+        ++it->second.summary.old_enqueue;
+        it->second.summary.last_old_enqueue_sequence = change->sequenceNumber.to64long();
     }
 
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
@@ -1104,6 +1110,22 @@ private:
         uint32_t age_credit = 0;
         uint32_t selections_in_period = 0;
         uint32_t borrow_selections_in_period = 0;
+        struct Summary
+        {
+            uint64_t new_enqueue = 0;
+            uint64_t old_enqueue = 0;
+            uint64_t selected_deficit_new = 0;
+            uint64_t selected_deficit_old = 0;
+            uint64_t selected_borrow_new = 0;
+            uint64_t selected_borrow_old = 0;
+            uint64_t borrow_denied_new = 0;
+            uint64_t borrow_denied_old = 0;
+            uint64_t refill_pending = 0;
+            uint64_t refill_idle = 0;
+            uint64_t last_new_enqueue_sequence = 0;
+            uint64_t last_old_enqueue_sequence = 0;
+            uint64_t last_selected_sequence = 0;
+        } summary;
     };
 
     static constexpr uint32_t max_age_credit = 20;
@@ -1135,6 +1157,7 @@ private:
         {
             if (!writer.second.queue.has_pending_change())
             {
+                ++writer.second.summary.refill_idle;
                 writer.second.quantum_bytes = 0;
                 writer.second.deficit_bytes = std::min<int64_t>(
                     writer.second.deficit_bytes,
@@ -1143,6 +1166,7 @@ private:
                 writer.second.borrow_selections_in_period = 0;
                 continue;
             }
+            ++writer.second.summary.refill_pending;
             writer.second.quantum_bytes = quantum_bytes(writer.second, total_weight);
             writer.second.deficit_bytes = std::min<int64_t>(
                 writer.second.deficit_bytes + static_cast<int64_t>(writer.second.quantum_bytes),
@@ -1285,7 +1309,6 @@ private:
         }
     }
 
-#ifdef FASTDDS_RETRANSMISSION_TRACE
     static const char* value_class_name(
             ValueClassRank value_class)
     {
@@ -1299,7 +1322,6 @@ private:
                 return "default";
         }
     }
-#endif // FASTDDS_RETRANSMISSION_TRACE
 
     static uint32_t size_to_check(
             fastrtps::rtps::CacheChange_t* change)
@@ -1418,6 +1440,14 @@ private:
                 const bool sample_is_old = writer->second.queue.next_change_is_old();
                 if (!borrow_allowed(writer->second, sample_is_old, size))
                 {
+                    if (sample_is_old)
+                    {
+                        ++writer->second.summary.borrow_denied_old;
+                    }
+                    else
+                    {
+                        ++writer->second.summary.borrow_denied_new;
+                    }
                     continue;
                 }
                 const uint32_t age_credit = std::min(writer->second.age_credit, max_age_credit);
@@ -1494,6 +1524,33 @@ private:
         {
             if (writer.first == selected_writer)
             {
+                if (selected_by_deficit)
+                {
+                    if (selected_sample_is_old)
+                    {
+                        ++writer.second.summary.selected_deficit_old;
+                    }
+                    else
+                    {
+                        ++writer.second.summary.selected_deficit_new;
+                    }
+                }
+                else
+                {
+                    if (selected_sample_is_old)
+                    {
+                        ++writer.second.summary.selected_borrow_old;
+                    }
+                    else
+                    {
+                        ++writer.second.summary.selected_borrow_new;
+                    }
+                }
+                if (nullptr != change_being_processed_)
+                {
+                    writer.second.summary.last_selected_sequence =
+                            change_being_processed_->sequenceNumber.to64long();
+                }
                 writer.second.age_credit = 0;
                 writer.second.selections_in_period = std::min(
                     (std::numeric_limits<uint32_t>::max)(),
@@ -1510,6 +1567,45 @@ private:
                 writer.second.age_credit = std::min(max_age_credit, writer.second.age_credit + 1);
             }
         }
+    }
+
+    void emit_summary(
+            fastrtps::rtps::RTPSWriter* writer,
+            const WriterQueue& queue) const noexcept
+    {
+        const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+        if (nullptr == path || '\0' == path[0])
+        {
+            return;
+        }
+
+        std::ofstream output(path, std::ios::app);
+        if (!output)
+        {
+            return;
+        }
+
+        output << "component=ADAPTIVE_VALUE_SCHEDULER"
+               << ";writer_guid=" << writer->getGuid()
+               << ";value_class=" << value_class_name(queue.value_class)
+               << ";priority=" << queue.priority
+               << ";base_weight=" << queue.base_weight
+               << ";adaptive_weight=" << queue.adaptive_weight
+               << ";new_enqueue=" << queue.summary.new_enqueue
+               << ";old_enqueue=" << queue.summary.old_enqueue
+               << ";selected_deficit_new=" << queue.summary.selected_deficit_new
+               << ";selected_deficit_old=" << queue.summary.selected_deficit_old
+               << ";selected_borrow_new=" << queue.summary.selected_borrow_new
+               << ";selected_borrow_old=" << queue.summary.selected_borrow_old
+               << ";borrow_denied_new=" << queue.summary.borrow_denied_new
+               << ";borrow_denied_old=" << queue.summary.borrow_denied_old
+               << ";refill_pending=" << queue.summary.refill_pending
+               << ";refill_idle=" << queue.summary.refill_idle
+               << ";last_new_enqueue_sequence=" << queue.summary.last_new_enqueue_sequence
+               << ";last_old_enqueue_sequence=" << queue.summary.last_old_enqueue_sequence
+               << ";last_selected_sequence=" << queue.summary.last_selected_sequence
+               << ";final_deficit_bytes=" << queue.deficit_bytes
+               << '\n';
     }
 
     std::unordered_map<fastrtps::rtps::RTPSWriter*, WriterQueue> writers_queue_;
