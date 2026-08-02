@@ -506,6 +506,55 @@ AdaptiveRtpsReaderSummary& adaptive_rtps_reader_summary()
     return summary;
 }
 
+void emit_adaptive_reader_proxy_final(
+        const char* reason,
+        const GUID_t& reader_guid,
+        WriterProxy* writer,
+        const SequenceNumber_t& last_notified)
+{
+    if (!adaptive_summary_enabled() || nullptr == writer)
+    {
+        return;
+    }
+
+    const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
+    std::ofstream out(path, std::ios::app);
+    if (!out)
+    {
+        return;
+    }
+
+    SequenceNumberSet_t missing = writer->missing_changes();
+    uint32_t missing_count = 0;
+    SequenceNumber_t missing_min = SequenceNumber_t::unknown();
+    SequenceNumber_t missing_max = SequenceNumber_t::unknown();
+    missing.for_each([&](SequenceNumber_t seq)
+            {
+                ++missing_count;
+                if (SequenceNumber_t::unknown() == missing_min || seq < missing_min)
+                {
+                    missing_min = seq;
+                }
+                if (SequenceNumber_t::unknown() == missing_max || seq > missing_max)
+                {
+                    missing_max = seq;
+                }
+            });
+
+    out << "component=RTPS_READER_PROXY_FINAL"
+        << ";reason=" << reason
+        << ";writer_guid=" << writer->guid()
+        << ";reader_guid=" << reader_guid
+        << ";available_changes_max=" << writer->available_changes_max()
+        << ";last_notified=" << last_notified
+        << ";are_there_missing_changes=" << writer->are_there_missing_changes()
+        << ";number_of_changes_from_writer=" << writer->number_of_changes_from_writer()
+        << ";missing_count=" << missing_count
+        << ";missing_min=" << missing_min
+        << ";missing_max=" << missing_max
+        << '\n';
+}
+
 } // namespace
 
 static void send_datasharing_ack(
@@ -608,41 +657,9 @@ StatefulReader::~StatefulReader()
 
     if (adaptive_summary_enabled())
     {
-        const char* path = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_FILE");
-        std::ofstream out(path, std::ios::app);
-        if (out)
+        for (WriterProxy* writer : matched_writers_)
         {
-            for (WriterProxy* writer : matched_writers_)
-            {
-                SequenceNumberSet_t missing = writer->missing_changes();
-                uint32_t missing_count = 0;
-                SequenceNumber_t missing_min = SequenceNumber_t::unknown();
-                SequenceNumber_t missing_max = SequenceNumber_t::unknown();
-                missing.for_each([&](SequenceNumber_t seq)
-                        {
-                            ++missing_count;
-                            if (SequenceNumber_t::unknown() == missing_min || seq < missing_min)
-                            {
-                                missing_min = seq;
-                            }
-                            if (SequenceNumber_t::unknown() == missing_max || seq > missing_max)
-                            {
-                                missing_max = seq;
-                            }
-                        });
-
-                out << "component=RTPS_READER_PROXY_FINAL"
-                    << ";writer_guid=" << writer->guid()
-                    << ";reader_guid=" << m_guid
-                    << ";available_changes_max=" << writer->available_changes_max()
-                    << ";last_notified=" << get_last_notified(writer->guid())
-                    << ";are_there_missing_changes=" << writer->are_there_missing_changes()
-                    << ";number_of_changes_from_writer=" << writer->number_of_changes_from_writer()
-                    << ";missing_count=" << missing_count
-                    << ";missing_min=" << missing_min
-                    << ";missing_max=" << missing_max
-                    << '\n';
-            }
+            emit_adaptive_reader_proxy_final("destructor", m_guid, writer, get_last_notified(writer->guid()));
         }
     }
 
@@ -901,6 +918,11 @@ bool StatefulReader::matched_writer_remove(
 
         if (wproxy != nullptr)
         {
+            emit_adaptive_reader_proxy_final(
+                "matched_writer_remove",
+                m_guid,
+                wproxy,
+                get_last_notified(wproxy->guid()));
             remove_persistence_guid(wproxy->guid(), wproxy->persistence_guid(), removed_by_lease);
             if (wproxy->is_datasharing_writer())
             {
