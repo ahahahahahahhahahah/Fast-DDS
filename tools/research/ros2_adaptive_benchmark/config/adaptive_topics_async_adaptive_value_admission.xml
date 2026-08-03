@@ -10,7 +10,7 @@
                 <flow_controller_descriptor_list>
                     <flow_controller_descriptor>
                         <name>adaptive_value_async_admission_fc</name>
-                        <scheduler>ADAPTIVE_VALUE</scheduler>
+                        <scheduler>ADAPTIVE_VALUE_UTILITY</scheduler>
                         <max_bytes_per_period>24000</max_bytes_per_period>
                         <period_ms>10</period_ms>
                     </flow_controller_descriptor>

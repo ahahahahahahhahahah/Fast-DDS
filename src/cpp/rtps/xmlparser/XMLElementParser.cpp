@@ -795,7 +795,7 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
                     <xs:enumeration value="ROUND_ROBIN" />
                     <xs:enumeration value="HIGH_PRIORITY" />
                     <xs:enumeration value="PRIORITY_WITH_RESERVATION" />
-                    <xs:enumeration value="ADAPTIVE_VALUE" />
+                    <xs:enumeration value="ADAPTIVE_VALUE_UTILITY" />
                 </xs:restriction>
             </xs:simpleType>
          */
@@ -857,7 +857,7 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
                         ROUND_ROBIN, fastdds::rtps::FlowControllerSchedulerPolicy::ROUND_ROBIN,
                         PRIORITY_WITH_RESERVATION,
                         fastdds::rtps::FlowControllerSchedulerPolicy::PRIORITY_WITH_RESERVATION,
-                        ADAPTIVE_VALUE, fastdds::rtps::FlowControllerSchedulerPolicy::ADAPTIVE_VALUE))
+                        ADAPTIVE_VALUE_UTILITY, fastdds::rtps::FlowControllerSchedulerPolicy::ADAPTIVE_VALUE_UTILITY))
                 {
                     logError(XMLPARSER, "Node '" << SCHEDULER << "' with bad content");
                     return XMLP_ret::XML_ERROR;

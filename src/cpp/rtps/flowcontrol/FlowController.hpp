@@ -96,7 +96,7 @@ public:
     /*!
      * Whether this flow controller uses the adaptive value scheduler.
      *
-     * @return true when writers registered in this flow controller are managed by ADAPTIVE_VALUE scheduling.
+     * @return true when writers registered in this flow controller are managed by ADAPTIVE_VALUE_UTILITY scheduling.
      */
     virtual bool is_adaptive_value_scheduler() const = 0;
 };
