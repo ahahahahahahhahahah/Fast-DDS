@@ -276,6 +276,18 @@ struct FlowControllerAsyncPublishMode
         return false;
     }
 
+    bool wait_for(
+            std::unique_lock<std::mutex>& lock,
+            std::chrono::microseconds duration)
+    {
+        if (duration <= std::chrono::milliseconds::zero())
+        {
+            return true;
+        }
+
+        return std::cv_status::timeout == cv.wait_for(lock, duration);
+    }
+
     bool force_wait() const
     {
         return false;
@@ -483,6 +495,16 @@ struct FlowControllerFifoSchedule
     {
     }
 
+    bool requires_periodic_wakeup() const
+    {
+        return false;
+    }
+
+    std::chrono::microseconds periodic_wait_duration() const
+    {
+        return std::chrono::microseconds::zero();
+    }
+
     void remove_change(
             fastrtps::rtps::CacheChange_t*) const
     {
@@ -626,6 +648,16 @@ struct FlowControllerRoundRobinSchedule
     {
     }
 
+    bool requires_periodic_wakeup() const
+    {
+        return false;
+    }
+
+    std::chrono::microseconds periodic_wait_duration() const
+    {
+        return std::chrono::microseconds::zero();
+    }
+
     void remove_change(
             fastrtps::rtps::CacheChange_t*) const
     {
@@ -748,6 +780,16 @@ struct FlowControllerHighPrioritySchedule
 
     void trigger_bandwidth_limit_reset() const
     {
+    }
+
+    bool requires_periodic_wakeup() const
+    {
+        return false;
+    }
+
+    std::chrono::microseconds periodic_wait_duration() const
+    {
+        return std::chrono::microseconds::zero();
     }
 
     void remove_change(
@@ -961,6 +1003,16 @@ struct FlowControllerPriorityWithReservationSchedule
         }
     }
 
+    bool requires_periodic_wakeup() const
+    {
+        return false;
+    }
+
+    std::chrono::microseconds periodic_wait_duration() const
+    {
+        return std::chrono::microseconds::zero();
+    }
+
     void remove_change(
             fastrtps::rtps::CacheChange_t*) const
     {
@@ -1059,6 +1111,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
                 trace_selection(writer_being_processed_, change_being_processed_, size_being_processed_,
                         selected_sample_is_old_being_processed_);
 #endif // FASTDDS_RETRANSMISSION_TRACE
+                record_send_budget_success(size_being_processed_);
                 record_successful_selection(writer_being_processed_,
                         selected_sample_is_old_being_processed_);
             }
@@ -1082,6 +1135,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         touch_sample(it->second, change, false);
         ++it->second.summary.new_enqueue;
         ++it->second.feedback_window.new_enqueue;
+        ++control_window_.new_enqueue;
         it->second.summary.last_new_enqueue_sequence = change->sequenceNumber.to64long();
         it->second.feedback_window.last_new_enqueue_sequence = change->sequenceNumber.to64long();
         if (WriterQueue::Summary* window = mutable_window_summary(it->second))
@@ -1101,6 +1155,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         touch_sample(it->second, change, true);
         ++it->second.summary.old_enqueue;
         ++it->second.feedback_window.old_enqueue;
+        ++control_window_.old_enqueue;
         it->second.summary.last_old_enqueue_sequence = change->sequenceNumber.to64long();
         it->second.feedback_window.last_old_enqueue_sequence = change->sequenceNumber.to64long();
         if (WriterQueue::Summary* window = mutable_window_summary(it->second))
@@ -1112,6 +1167,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
 
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
     {
+        refill_send_budget(std::chrono::steady_clock::now());
+
         CandidateView selected;
         select_utility_candidate(selected);
 
@@ -1145,6 +1202,32 @@ struct FlowControllerAdaptiveValueUtilitySchedule
 
     void trigger_bandwidth_limit_reset()
     {
+        refill_send_budget(std::chrono::steady_clock::now());
+    }
+
+    bool requires_periodic_wakeup() const
+    {
+        return true;
+    }
+
+    std::chrono::microseconds periodic_wait_duration() const
+    {
+        if (!send_budget_initialized_)
+        {
+            return std::chrono::microseconds::zero();
+        }
+
+        if (send_balance_bytes_ > 0)
+        {
+            return std::chrono::microseconds::zero();
+        }
+
+        const uint64_t period_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
+        const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
+        const uint64_t debt = static_cast<uint64_t>(1 - send_balance_bytes_);
+        const uint64_t wait_us = (debt * period_us + budget - 1u) / budget;
+        return std::chrono::microseconds(static_cast<int64_t>(wait_us));
     }
 
     void remove_change(
@@ -1228,7 +1311,39 @@ private:
         int32_t contention_level = 1;
         int32_t old_repair_level = 0;
         int32_t send_load_level = 1;
+        int32_t link_pressure_level = 0;
+        int32_t queue_pressure_level = 0;
+        int32_t scheduling_pressure_level = 0;
         int32_t aggregate_level = 1;
+    };
+
+    enum class SendLoadState : int32_t
+    {
+        NORMAL = 0,
+        PRESSURE = 1,
+        RECOVERY = 2
+    };
+
+    struct ControlWindow
+    {
+        uint64_t selected_bytes = 0;
+        uint64_t selected_new = 0;
+        uint64_t selected_old = 0;
+        uint64_t new_enqueue = 0;
+        uint64_t old_enqueue = 0;
+        uint64_t superseded = 0;
+        uint64_t throttled = 0;
+
+        void reset()
+        {
+            selected_bytes = 0;
+            selected_new = 0;
+            selected_old = 0;
+            new_enqueue = 0;
+            old_enqueue = 0;
+            superseded = 0;
+            throttled = 0;
+        }
     };
 
     struct UtilityBreakdown
@@ -1264,6 +1379,11 @@ private:
     static constexpr uint32_t max_age_boost = 20;
     static constexpr uint32_t max_old_age_boost = 35;
     static constexpr uint32_t feedback_decay_interval = 256;
+    static constexpr uint32_t min_send_budget_bytes = 8u * 1024u;
+    static constexpr uint32_t initial_send_budget_bytes = 64u * 1024u;
+    static constexpr uint32_t max_send_budget_bytes = 256u * 1024u;
+    static constexpr uint32_t recovery_step_bytes = 4u * 1024u;
+    static constexpr uint32_t normal_step_bytes = 1024u;
     static bool adaptive_summary_enabled()
     {
         static const bool enabled = []()
@@ -1468,6 +1588,9 @@ private:
         pressure.old_service = pressure.selected_old;
         pressure.old_excess = pressure.old_demand > pressure.old_service ?
                 pressure.old_demand - pressure.old_service : 0u;
+        pressure.queue_pressure_level = pressure.pending_writers >= 3u || pressure.pending_old_writers >= 2u ? 2 :
+                (pressure.pending_writers > 0u ? 1 : 0);
+        pressure.scheduling_pressure_level = pressure.contention_level - 1;
         if (pressure.old_excess > pressure.selected_new / 4u + 16u)
         {
             pressure.old_repair_level = 3;
@@ -1485,6 +1608,8 @@ private:
             pressure.old_repair_level = 0;
         }
 
+        pressure.link_pressure_level = pressure.send_load_level >= 3 && pressure.old_repair_level >= 2 ? 2 :
+                (pressure.send_load_level >= 2 && pressure.old_repair_level >= 1 ? 1 : 0);
         pressure.aggregate_level = (std::max)(pressure.contention_level,
                         (std::max)(1, pressure.old_repair_level));
         return pressure;
@@ -1594,6 +1719,152 @@ private:
         return pressure_snapshot().aggregate_level;
     }
 
+    static uint32_t clamp_budget(
+            uint32_t value)
+    {
+        return (std::max)(min_send_budget_bytes, (std::min)(max_send_budget_bytes, value));
+    }
+
+    int64_t max_positive_send_balance() const
+    {
+        return static_cast<int64_t>(current_send_budget_bytes_);
+    }
+
+    bool can_send_with_balance(
+            uint32_t sample_size) const
+    {
+        static_cast<void>(sample_size);
+        return send_balance_bytes_ > 0;
+    }
+
+    void record_send_budget_success(
+            uint32_t selected_size)
+    {
+        const int64_t charge = static_cast<int64_t>((std::max)(1u, selected_size));
+        send_balance_bytes_ -= charge;
+        control_window_.selected_bytes += charge;
+        if (selected_sample_is_old_being_processed_)
+        {
+            ++control_window_.selected_old;
+        }
+        else
+        {
+            ++control_window_.selected_new;
+        }
+    }
+
+    void refill_send_budget(
+            const std::chrono::steady_clock::time_point& now)
+    {
+        if (!send_budget_initialized_)
+        {
+            send_budget_initialized_ = true;
+            last_send_budget_refill_ = now;
+            current_send_budget_bytes_ = initial_send_budget_bytes;
+            send_balance_bytes_ = initial_send_budget_bytes;
+            return;
+        }
+
+        if (now <= last_send_budget_refill_)
+        {
+            return;
+        }
+
+        const auto period_us = std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count();
+        if (0 >= period_us)
+        {
+            return;
+        }
+
+        while (last_send_budget_refill_ + control_period_ <= now)
+        {
+            const auto boundary = last_send_budget_refill_ + control_period_;
+            accrue_balance_until(boundary);
+
+            const bool debt_repayment_only = send_balance_bytes_ < 0 && 0u == control_window_.selected_bytes;
+            if (!debt_repayment_only)
+            {
+                update_send_budget_from_window();
+            }
+            control_window_.reset();
+            last_send_budget_refill_ = boundary;
+        }
+
+        accrue_balance_until(now);
+    }
+
+    void accrue_balance_until(
+            const std::chrono::steady_clock::time_point& now)
+    {
+        if (now <= last_send_budget_refill_)
+        {
+            return;
+        }
+
+        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_send_budget_refill_).count();
+        const uint64_t period_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
+        const uint64_t effective_budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
+        const uint64_t credit_numerator = static_cast<uint64_t>(elapsed_us) * effective_budget + balance_refill_remainder_;
+        const uint64_t credit = credit_numerator / period_us;
+        balance_refill_remainder_ = credit_numerator % period_us;
+        if (0u == credit)
+        {
+            return;
+        }
+
+        send_balance_bytes_ = (std::min)(
+            max_positive_send_balance(),
+            send_balance_bytes_ + static_cast<int64_t>(credit));
+    }
+
+    void update_send_budget_from_window()
+    {
+        const PressureSnapshot pressure = pressure_snapshot();
+        const bool saturated = control_window_.selected_bytes >=
+                (static_cast<uint64_t>(current_send_budget_bytes_) * 7u) / 10u;
+        const bool repair_growth = control_window_.old_enqueue + control_window_.superseded >
+                control_window_.selected_old + 1u;
+        const bool active_queue_pressure = pressure.pending_writers > 0u ||
+                pressure.pending_old_writers > 0u || control_window_.old_enqueue > 0u;
+        const bool link_pressure = saturated && repair_growth;
+
+        if (link_pressure || (saturated && pressure.old_repair_level >= 2))
+        {
+            send_load_state_ = SendLoadState::PRESSURE;
+            current_send_budget_bytes_ = clamp_budget(
+                static_cast<uint32_t>((static_cast<uint64_t>(current_send_budget_bytes_) * 3u) / 4u));
+            return;
+        }
+
+        if (active_queue_pressure)
+        {
+            if (SendLoadState::PRESSURE == send_load_state_)
+            {
+                send_load_state_ = SendLoadState::RECOVERY;
+            }
+            current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + normal_step_bytes);
+            return;
+        }
+
+        send_load_state_ = SendLoadState::NORMAL;
+        current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes);
+    }
+
+    static const char* send_load_state_name(
+            SendLoadState state)
+    {
+        switch (state)
+        {
+            case SendLoadState::PRESSURE:
+                return "pressure";
+            case SendLoadState::RECOVERY:
+                return "recovery";
+            default:
+                return "normal";
+        }
+    }
+
     int32_t recent_service_penalty(
             const WriterQueue& writer,
             bool sample_is_old,
@@ -1686,6 +1957,7 @@ private:
     {
         const auto now = std::chrono::steady_clock::now();
         const PressureSnapshot pressure = pressure_snapshot();
+        CandidateView best_overall;
         for (auto& priority : priorities_)
         {
             for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
@@ -1693,12 +1965,27 @@ private:
                 auto writer = writers_queue_.find(writer_ptr);
                 assert(writer != writers_queue_.end());
 
-                consider_candidate(selected, writer_ptr, writer->second,
+                consider_candidate(best_overall, writer_ptr, writer->second,
                         writer->second.queue.get_next_new_change(), false, pressure, now);
-                consider_candidate(selected, writer_ptr, writer->second,
+                consider_candidate(best_overall, writer_ptr, writer->second,
                         writer->second.queue.get_next_old_change(), true, pressure, now);
             }
         }
+
+        if (nullptr == best_overall.writer)
+        {
+            return;
+        }
+
+        if (!can_send_with_balance(best_overall.size))
+        {
+            ++control_window_.throttled;
+            throttled_waiting_for_budget_ = true;
+            return;
+        }
+
+        throttled_waiting_for_budget_ = false;
+        selected = best_overall;
     }
 
     void record_replaceable_old_superseded(
@@ -1706,11 +1993,22 @@ private:
     {
         ++writer.summary.replaceable_old_superseded;
         ++writer.feedback_window.replaceable_old_superseded;
+        ++control_window_.superseded;
         if (WriterQueue::Summary* window = mutable_window_summary(writer))
         {
             ++window->replaceable_old_superseded;
         }
     }
+
+    ControlWindow control_window_;
+    SendLoadState send_load_state_ = SendLoadState::NORMAL;
+    bool send_budget_initialized_ = false;
+    bool throttled_waiting_for_budget_ = false;
+    uint32_t current_send_budget_bytes_ = initial_send_budget_bytes;
+    int64_t send_balance_bytes_ = initial_send_budget_bytes;
+    uint64_t balance_refill_remainder_ = 0;
+    std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
+    std::chrono::milliseconds control_period_ {10};
 
     static const std::string* find_property(
             fastrtps::rtps::RTPSWriter* writer,
@@ -1844,6 +2142,9 @@ private:
                << ";value_class=" << value_class_name(writer->second.value_class)
                << ";sample_kind=" << (selected_sample_is_old ? "old" : "new")
                << ";priority=" << writer->second.priority
+               << ";send_load_state=" << send_load_state_name(send_load_state_)
+               << ";current_send_budget_bytes=" << current_send_budget_bytes_
+               << ";send_balance_bytes=" << send_balance_bytes_
                << ";age_boost=" << writer->second.age_boost
                << ";old_age_boost=" << writer->second.old_age_boost
                << ";sample_age_ms=" << sample_age_ms
@@ -1862,6 +2163,9 @@ private:
                << ";old_demand=" << pressure.old_demand
                << ";old_service=" << pressure.old_service
                << ";old_excess=" << pressure.old_excess
+               << ";link_pressure_level=" << pressure.link_pressure_level
+               << ";queue_pressure_level=" << pressure.queue_pressure_level
+               << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level
                << ";selected_size=" << selected_size
                << ";utility_base=" << utility_breakdown_being_processed_.base
                << ";utility_sample_kind_adjust=" << utility_breakdown_being_processed_.sample_kind_adjust
@@ -2465,7 +2769,15 @@ private:
                 {
                     // Release main mutex to allow registering/unregistering writers while this thread is waiting.
                     lock.unlock();
-                    bool ret = async_mode.wait(in_lock);
+                    bool ret = false;
+                    if (sched.requires_periodic_wakeup())
+                    {
+                        ret = async_mode.wait_for(in_lock, sched.periodic_wait_duration());
+                    }
+                    else
+                    {
+                        ret = async_mode.wait(in_lock);
+                    }
 
                     in_lock.unlock();
                     lock.lock();
