@@ -1823,11 +1823,19 @@ private:
         const PressureSnapshot pressure = pressure_snapshot();
         const bool saturated = control_window_.selected_bytes >=
                 (static_cast<uint64_t>(current_send_budget_bytes_) * 7u) / 10u;
+        const uint64_t adaptive_pressure_floor = (std::max<uint64_t>)(
+            4u * 1024u,
+            (std::min<uint64_t>)(16u * 1024u, current_send_budget_bytes_ / 16u));
         const bool repair_growth = control_window_.old_enqueue + control_window_.superseded >
                 control_window_.selected_old + 1u;
         const bool active_queue_pressure = pressure.pending_writers > 0u ||
                 pressure.pending_old_writers > 0u || control_window_.old_enqueue > 0u;
-        const bool link_pressure = saturated && repair_growth;
+        const bool sustained_backlog_load = active_queue_pressure &&
+                control_window_.selected_bytes >= adaptive_pressure_floor;
+        const bool link_pressure = (saturated && repair_growth) ||
+                (sustained_backlog_load && pressure.queue_pressure_level > 0) ||
+                (sustained_backlog_load && pressure.scheduling_pressure_level > 0) ||
+                (sustained_backlog_load && control_window_.throttled > 0u);
 
         if (link_pressure || (saturated && pressure.old_repair_level >= 2))
         {
@@ -1980,6 +1988,9 @@ private:
         if (!can_send_with_balance(best_overall.size))
         {
             ++control_window_.throttled;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_throttled(best_overall);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             throttled_waiting_for_budget_ = true;
             return;
         }
@@ -2145,6 +2156,10 @@ private:
                << ";send_load_state=" << send_load_state_name(send_load_state_)
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
+               << ";send_balance_after_bytes=" <<
+                (send_balance_bytes_ - static_cast<int64_t>((std::max)(1u, selected_size)))
+               << ";control_window_selected_bytes=" << control_window_.selected_bytes
+               << ";control_window_throttled=" << control_window_.throttled
                << ";age_boost=" << writer->second.age_boost
                << ";old_age_boost=" << writer->second.old_age_boost
                << ";sample_age_ms=" << sample_age_ms
@@ -2187,6 +2202,50 @@ private:
             fastrtps::rtps::GUID_t::unknown(),
             selected_change->sequenceNumber,
             selected_change->serializedPayload.length,
+            detail.str());
+    }
+
+    void trace_throttled(
+            const CandidateView& best_overall)
+    {
+        if (throttled_waiting_for_budget_ || nullptr == best_overall.writer || nullptr == best_overall.change ||
+                nullptr == best_overall.queue)
+        {
+            return;
+        }
+
+        const uint64_t period_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
+        const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
+        const uint64_t debt = send_balance_bytes_ > 0 ? 0u : static_cast<uint64_t>(1 - send_balance_bytes_);
+        const uint64_t wait_us = 0u == period_us ? 0u : (debt * period_us + budget - 1u) / budget;
+        const PressureSnapshot pressure = pressure_snapshot();
+
+        std::ostringstream detail;
+        detail << "scheduler=ADAPTIVE_VALUE_UTILITY"
+               << ";send_load_state=" << send_load_state_name(send_load_state_)
+               << ";current_send_budget_bytes=" << current_send_budget_bytes_
+               << ";send_balance_bytes=" << send_balance_bytes_
+               << ";estimated_wait_us=" << wait_us
+               << ";candidate_value_class=" << value_class_name(best_overall.queue->value_class)
+               << ";candidate_sample_kind=" << (best_overall.sample_is_old ? "old" : "new")
+               << ";candidate_size=" << best_overall.size
+               << ";candidate_utility=" << best_overall.utility
+               << ";candidate_score=" << best_overall.score
+               << ";control_window_selected_bytes=" << control_window_.selected_bytes
+               << ";control_window_throttled=" << control_window_.throttled
+               << ";pressure_level=" << pressure.aggregate_level
+               << ";old_pressure_level=" << pressure.old_repair_level
+               << ";link_pressure_level=" << pressure.link_pressure_level
+               << ";queue_pressure_level=" << pressure.queue_pressure_level
+               << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level;
+
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ASYNC_SCHEDULER_THROTTLED",
+            best_overall.writer->getGuid(),
+            fastrtps::rtps::GUID_t::unknown(),
+            best_overall.change->sequenceNumber,
+            best_overall.size,
             detail.str());
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
