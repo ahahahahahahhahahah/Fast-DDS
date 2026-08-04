@@ -27,6 +27,17 @@ enum class AdaptiveRetransmissionDecision
     FORCE_SEND
 };
 
+struct AdaptiveRetransmissionFeedbackSnapshot
+{
+    uint64_t request_samples = 0;
+    uint64_t feedback_samples = 0;
+    uint64_t outstanding_changes = 0;
+    uint64_t outstanding_bytes = 0;
+    double request_interval_ewma_ms = 0.0;
+    double recovery_feedback_ewma_ms = 0.0;
+    double stable_feedback_ms = 0.0;
+};
+
 class AdaptiveRetransmissionController
 {
 public:
@@ -79,6 +90,9 @@ public:
     void on_reader_removed(
             StatefulWriter* writer,
             const GUID_t& reader_guid);
+
+    AdaptiveRetransmissionFeedbackSnapshot feedback_snapshot(
+            const StatefulWriter* writer) const;
 
 private:
 

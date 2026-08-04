@@ -464,6 +464,49 @@ AdaptiveRetransmissionController::~AdaptiveRetransmissionController()
     delete impl_;
 }
 
+AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedback_snapshot(
+        const StatefulWriter* writer) const
+{
+    AdaptiveRetransmissionFeedbackSnapshot snapshot;
+    if (nullptr == writer)
+    {
+        return snapshot;
+    }
+
+    const GUID_t writer_guid = writer->getGuid();
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (const auto& item : impl_->readers)
+    {
+        if (item.first.writer == writer_guid)
+        {
+            snapshot.request_samples += item.second.request_samples;
+            snapshot.feedback_samples += item.second.feedback_samples;
+            snapshot.request_interval_ewma_ms = std::max(
+                snapshot.request_interval_ewma_ms,
+                item.second.request_interval_ewma_ms);
+            snapshot.recovery_feedback_ewma_ms = std::max(
+                snapshot.recovery_feedback_ewma_ms,
+                item.second.recovery_feedback_ewma_ms);
+        }
+    }
+
+    for (const auto& item : impl_->changes)
+    {
+        if (item.first.path.writer == writer_guid)
+        {
+            ++snapshot.outstanding_changes;
+            snapshot.outstanding_bytes += item.second.estimated_bytes;
+        }
+    }
+
+    auto writer_it = impl_->writers.find(writer_guid);
+    if (writer_it != impl_->writers.end())
+    {
+        snapshot.stable_feedback_ms = writer_it->second.stable_feedback_ms;
+    }
+    return snapshot;
+}
+
 void AdaptiveRetransmissionController::on_requested(
         StatefulWriter* writer,
         const GUID_t& reader_guid,

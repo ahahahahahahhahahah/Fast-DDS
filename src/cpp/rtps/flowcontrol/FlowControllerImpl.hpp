@@ -3,6 +3,9 @@
 
 #include "FlowController.hpp"
 #include "../RetransmissionTrace.hpp"
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+#include "../writer/AdaptiveRetransmissionController.hpp"
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 #include <fastdds/rtps/common/Guid.h>
 #include <fastdds/rtps/writer/StatefulWriter.h>
 #include <fastdds/rtps/writer/RTPSWriter.h>
@@ -1308,6 +1311,13 @@ private:
         uint64_t old_demand = 0;
         uint64_t old_service = 0;
         uint64_t old_excess = 0;
+        uint64_t link_request_samples = 0;
+        uint64_t link_feedback_samples = 0;
+        uint64_t link_outstanding_changes = 0;
+        uint64_t link_outstanding_bytes = 0;
+        double link_request_interval_ewma_ms = 0.0;
+        double link_recovery_feedback_ewma_ms = 0.0;
+        double link_stable_feedback_ms = 0.0;
         int32_t contention_level = 1;
         int32_t old_repair_level = 0;
         int32_t send_load_level = 1;
@@ -1383,7 +1393,9 @@ private:
     static constexpr uint32_t initial_send_budget_bytes = 64u * 1024u;
     static constexpr uint32_t max_send_budget_bytes = 256u * 1024u;
     static constexpr uint32_t recovery_step_bytes = 4u * 1024u;
-    static constexpr uint32_t normal_step_bytes = 1024u;
+    static constexpr uint32_t meaningful_load_floor_bytes = 8u * 1024u;
+    static constexpr uint32_t repair_growth_tolerance = 1u;
+    static constexpr double link_feedback_pressure_ratio = 1.5;
     static bool adaptive_summary_enabled()
     {
         static const bool enabled = []()
@@ -1556,6 +1568,28 @@ private:
             pressure.selected_new += window.selected_utility_new;
             pressure.old_enqueue += window.old_enqueue;
             pressure.superseded += window.replaceable_old_superseded;
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+            const auto* stateful_writer = dynamic_cast<const fastrtps::rtps::StatefulWriter*>(queue.writer);
+            if (nullptr != stateful_writer)
+            {
+                const fastrtps::rtps::detail::AdaptiveRetransmissionFeedbackSnapshot feedback =
+                        fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().feedback_snapshot(
+                            stateful_writer);
+                pressure.link_request_samples += feedback.request_samples;
+                pressure.link_feedback_samples += feedback.feedback_samples;
+                pressure.link_outstanding_changes += feedback.outstanding_changes;
+                pressure.link_outstanding_bytes += feedback.outstanding_bytes;
+                pressure.link_request_interval_ewma_ms = (std::max)(
+                    pressure.link_request_interval_ewma_ms,
+                    feedback.request_interval_ewma_ms);
+                pressure.link_recovery_feedback_ewma_ms = (std::max)(
+                    pressure.link_recovery_feedback_ewma_ms,
+                    feedback.recovery_feedback_ewma_ms);
+                pressure.link_stable_feedback_ms = (std::max)(
+                    pressure.link_stable_feedback_ms,
+                    feedback.stable_feedback_ms);
+            }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
         }
 
         if (pressure.pending_old_writers >= 2u && pressure.pending_new_writers > 0u)
@@ -1608,8 +1642,12 @@ private:
             pressure.old_repair_level = 0;
         }
 
-        pressure.link_pressure_level = pressure.send_load_level >= 3 && pressure.old_repair_level >= 2 ? 2 :
-                (pressure.send_load_level >= 2 && pressure.old_repair_level >= 1 ? 1 : 0);
+        const bool feedback_pressure = pressure.link_feedback_samples >= 3u &&
+                pressure.link_stable_feedback_ms > 0.0 &&
+                pressure.link_recovery_feedback_ewma_ms >
+                link_feedback_pressure_ratio * pressure.link_stable_feedback_ms;
+        pressure.link_pressure_level = feedback_pressure ? 2 :
+                (pressure.link_outstanding_changes > 0u && pressure.old_repair_level >= 2 ? 1 : 0);
         pressure.aggregate_level = (std::max)(pressure.contention_level,
                         (std::max)(1, pressure.old_repair_level));
         return pressure;
@@ -1821,42 +1859,92 @@ private:
     void update_send_budget_from_window()
     {
         const PressureSnapshot pressure = pressure_snapshot();
-        const bool saturated = control_window_.selected_bytes >=
-                (static_cast<uint64_t>(current_send_budget_bytes_) * 7u) / 10u;
-        const uint64_t adaptive_pressure_floor = (std::max<uint64_t>)(
-            4u * 1024u,
-            (std::min<uint64_t>)(16u * 1024u, current_send_budget_bytes_ / 16u));
+        const uint32_t previous_budget = current_send_budget_bytes_;
+        const SendLoadState previous_state = send_load_state_;
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+        static_cast<void>(previous_budget);
+        static_cast<void>(previous_state);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        const bool meaningful_offered_load = control_window_.selected_bytes >= meaningful_load_floor_bytes ||
+                control_window_.throttled > 0u || send_balance_bytes_ < 0;
+        const uint64_t request_delta = pressure.link_request_samples > previous_link_request_samples_ ?
+                pressure.link_request_samples - previous_link_request_samples_ : 0u;
+        const uint64_t feedback_delta = pressure.link_feedback_samples > previous_link_feedback_samples_ ?
+                pressure.link_feedback_samples - previous_link_feedback_samples_ : 0u;
+        const bool feedback_slow = pressure.link_feedback_samples >= 3u &&
+                pressure.link_stable_feedback_ms > 0.0 &&
+                pressure.link_recovery_feedback_ewma_ms >
+                link_feedback_pressure_ratio * pressure.link_stable_feedback_ms;
+        const bool nack_growth = request_delta > feedback_delta + repair_growth_tolerance &&
+                pressure.link_outstanding_changes > 0u;
         const bool repair_growth = control_window_.old_enqueue + control_window_.superseded >
-                control_window_.selected_old + 1u;
-        const bool active_queue_pressure = pressure.pending_writers > 0u ||
-                pressure.pending_old_writers > 0u || control_window_.old_enqueue > 0u;
-        const bool sustained_backlog_load = active_queue_pressure &&
-                control_window_.selected_bytes >= adaptive_pressure_floor;
-        const bool link_pressure = (saturated && repair_growth) ||
-                (sustained_backlog_load && pressure.queue_pressure_level > 0) ||
-                (sustained_backlog_load && pressure.scheduling_pressure_level > 0) ||
-                (sustained_backlog_load && control_window_.throttled > 0u);
+                control_window_.selected_old + repair_growth_tolerance;
+        const bool repair_excess_growth = pressure.old_excess > previous_old_excess_ + repair_growth_tolerance;
+        const bool negative_feedback = meaningful_offered_load &&
+                (feedback_slow || nack_growth || repair_growth || repair_excess_growth);
 
-        if (link_pressure || (saturated && pressure.old_repair_level >= 2))
+        const bool repair_converging = previous_old_excess_ > pressure.old_excess + repair_growth_tolerance ||
+                (previous_link_outstanding_changes_ > pressure.link_outstanding_changes &&
+                feedback_delta > 0u);
+        const bool positive_feedback = meaningful_offered_load && !feedback_slow && !nack_growth &&
+                feedback_delta > 0u && (0u == pressure.old_excess || repair_converging);
+
+        previous_link_request_samples_ = pressure.link_request_samples;
+        previous_link_feedback_samples_ = pressure.link_feedback_samples;
+        previous_link_outstanding_changes_ = pressure.link_outstanding_changes;
+        previous_old_excess_ = pressure.old_excess;
+
+        if (negative_feedback)
         {
             send_load_state_ = SendLoadState::PRESSURE;
             current_send_budget_bytes_ = clamp_budget(
                 static_cast<uint32_t>((static_cast<uint64_t>(current_send_budget_bytes_) * 3u) / 4u));
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_budget_update("negative", previous_budget, previous_state, pressure,
+                    meaningful_offered_load, negative_feedback, positive_feedback, request_delta, feedback_delta);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
 
-        if (active_queue_pressure)
+        if (positive_feedback)
         {
             if (SendLoadState::PRESSURE == send_load_state_)
             {
                 send_load_state_ = SendLoadState::RECOVERY;
             }
-            current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + normal_step_bytes);
+            else if (SendLoadState::RECOVERY == send_load_state_ && 0u == pressure.old_excess)
+            {
+                send_load_state_ = SendLoadState::NORMAL;
+            }
+            current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_budget_update("positive", previous_budget, previous_state, pressure,
+                    meaningful_offered_load, negative_feedback, positive_feedback, request_delta, feedback_delta);
+#endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
 
-        send_load_state_ = SendLoadState::NORMAL;
-        current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        trace_budget_update(
+            meaningful_offered_load ? "hold_ambiguous" : "hold_low_load",
+            previous_budget,
+            previous_state,
+            pressure,
+            meaningful_offered_load,
+            negative_feedback,
+            positive_feedback,
+            request_delta,
+            feedback_delta);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        if (!meaningful_offered_load)
+        {
+            return;
+        }
+
+        if (SendLoadState::PRESSURE == send_load_state_)
+        {
+            send_load_state_ = SendLoadState::RECOVERY;
+        }
     }
 
     static const char* send_load_state_name(
@@ -2018,6 +2106,10 @@ private:
     uint32_t current_send_budget_bytes_ = initial_send_budget_bytes;
     int64_t send_balance_bytes_ = initial_send_budget_bytes;
     uint64_t balance_refill_remainder_ = 0;
+    uint64_t previous_link_request_samples_ = 0;
+    uint64_t previous_link_feedback_samples_ = 0;
+    uint64_t previous_link_outstanding_changes_ = 0;
+    uint64_t previous_old_excess_ = 0;
     std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
     std::chrono::milliseconds control_period_ {10};
 
@@ -2178,6 +2270,13 @@ private:
                << ";old_demand=" << pressure.old_demand
                << ";old_service=" << pressure.old_service
                << ";old_excess=" << pressure.old_excess
+               << ";link_request_samples=" << pressure.link_request_samples
+               << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_outstanding_changes=" << pressure.link_outstanding_changes
+               << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
+               << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
+               << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
+               << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
                << ";link_pressure_level=" << pressure.link_pressure_level
                << ";queue_pressure_level=" << pressure.queue_pressure_level
                << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level
@@ -2237,6 +2336,13 @@ private:
                << ";pressure_level=" << pressure.aggregate_level
                << ";old_pressure_level=" << pressure.old_repair_level
                << ";link_pressure_level=" << pressure.link_pressure_level
+               << ";link_request_samples=" << pressure.link_request_samples
+               << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_outstanding_changes=" << pressure.link_outstanding_changes
+               << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
+               << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
+               << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
+               << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
                << ";queue_pressure_level=" << pressure.queue_pressure_level
                << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level;
 
@@ -2246,6 +2352,60 @@ private:
             fastrtps::rtps::GUID_t::unknown(),
             best_overall.change->sequenceNumber,
             best_overall.size,
+            detail.str());
+    }
+
+    void trace_budget_update(
+            const char* reason,
+            uint32_t previous_budget,
+            SendLoadState previous_state,
+            const PressureSnapshot& pressure,
+            bool meaningful_offered_load,
+            bool negative_feedback,
+            bool positive_feedback,
+            uint64_t request_delta,
+            uint64_t feedback_delta)
+    {
+        std::ostringstream detail;
+        detail << "scheduler=ADAPTIVE_VALUE_UTILITY"
+               << ";reason=" << reason
+               << ";previous_send_load_state=" << send_load_state_name(previous_state)
+               << ";send_load_state=" << send_load_state_name(send_load_state_)
+               << ";previous_send_budget_bytes=" << previous_budget
+               << ";current_send_budget_bytes=" << current_send_budget_bytes_
+               << ";send_balance_bytes=" << send_balance_bytes_
+               << ";meaningful_offered_load=" << meaningful_offered_load
+               << ";negative_feedback=" << negative_feedback
+               << ";positive_feedback=" << positive_feedback
+               << ";request_delta=" << request_delta
+               << ";feedback_delta=" << feedback_delta
+               << ";control_window_selected_bytes=" << control_window_.selected_bytes
+               << ";control_window_selected_old=" << control_window_.selected_old
+               << ";control_window_selected_new=" << control_window_.selected_new
+               << ";control_window_old_enqueue=" << control_window_.old_enqueue
+               << ";control_window_superseded=" << control_window_.superseded
+               << ";control_window_throttled=" << control_window_.throttled
+               << ";old_demand=" << pressure.old_demand
+               << ";old_service=" << pressure.old_service
+               << ";old_excess=" << pressure.old_excess
+               << ";link_request_samples=" << pressure.link_request_samples
+               << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_outstanding_changes=" << pressure.link_outstanding_changes
+               << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
+               << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
+               << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
+               << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
+               << ";link_pressure_level=" << pressure.link_pressure_level
+               << ";old_pressure_level=" << pressure.old_repair_level
+               << ";queue_pressure_level=" << pressure.queue_pressure_level
+               << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level;
+
+        FASTDDS_TRACE_RETRANSMISSION(
+            "ADAPT_ASYNC_BUDGET_UPDATE",
+            fastrtps::rtps::GUID_t::unknown(),
+            fastrtps::rtps::GUID_t::unknown(),
+            fastrtps::rtps::SequenceNumber_t::unknown(),
+            0,
             detail.str());
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
