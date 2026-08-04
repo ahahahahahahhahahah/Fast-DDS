@@ -1065,6 +1065,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             writer_being_processed_ = nullptr;
             change_being_processed_ = nullptr;
             size_being_processed_ = 0;
+            utility_breakdown_being_processed_ = UtilityBreakdown();
             utility_being_processed_ = (std::numeric_limits<int32_t>::min)();
             score_being_processed_ = (std::numeric_limits<int32_t>::min)();
             selected_sample_is_old_being_processed_ = false;
@@ -1119,6 +1120,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             writer_being_processed_ = selected.writer;
             change_being_processed_ = selected.change;
             size_being_processed_ = selected.size;
+            utility_breakdown_being_processed_ = selected.breakdown;
             utility_being_processed_ = selected.utility;
             score_being_processed_ = selected.score;
             selected_sample_is_old_being_processed_ = selected.sample_is_old;
@@ -1210,19 +1212,6 @@ private:
         std::unordered_map<fastrtps::rtps::CacheChange_t*, SampleMeta> sample_meta;
     };
 
-    struct CandidateView
-    {
-        fastrtps::rtps::RTPSWriter* writer = nullptr;
-        fastrtps::rtps::CacheChange_t* change = nullptr;
-        WriterQueue* queue = nullptr;
-        uint32_t size = 0;
-        bool sample_is_old = false;
-        bool has_newer_change = false;
-        const WriterQueue::SampleMeta* meta = nullptr;
-        int32_t utility = (std::numeric_limits<int32_t>::min)();
-        int32_t score = (std::numeric_limits<int32_t>::min)();
-    };
-
     struct PressureSnapshot
     {
         uint64_t pending_writers = 0;
@@ -1233,10 +1222,43 @@ private:
         uint64_t selected_new = 0;
         uint64_t old_enqueue = 0;
         uint64_t superseded = 0;
+        uint64_t old_demand = 0;
+        uint64_t old_service = 0;
+        uint64_t old_excess = 0;
         int32_t contention_level = 1;
         int32_t old_repair_level = 0;
         int32_t send_load_level = 1;
         int32_t aggregate_level = 1;
+    };
+
+    struct UtilityBreakdown
+    {
+        int32_t base = 0;
+        int32_t sample_kind_adjust = 0;
+        int32_t superseded_old_penalty = 0;
+        int32_t writer_age_bonus = 0;
+        int32_t sample_age_bonus = 0;
+        int32_t old_age_bonus = 0;
+        int32_t hard_defer_bonus = 0;
+        int32_t value_horizon_penalty = 0;
+        int32_t cooldown_penalty = 0;
+        int32_t byte_cost_penalty = 0;
+        int32_t recent_service_penalty = 0;
+        int32_t utility = (std::numeric_limits<int32_t>::min)();
+    };
+
+    struct CandidateView
+    {
+        fastrtps::rtps::RTPSWriter* writer = nullptr;
+        fastrtps::rtps::CacheChange_t* change = nullptr;
+        WriterQueue* queue = nullptr;
+        uint32_t size = 0;
+        bool sample_is_old = false;
+        bool has_newer_change = false;
+        const WriterQueue::SampleMeta* meta = nullptr;
+        UtilityBreakdown breakdown;
+        int32_t utility = (std::numeric_limits<int32_t>::min)();
+        int32_t score = (std::numeric_limits<int32_t>::min)();
     };
 
     static constexpr uint32_t max_age_boost = 20;
@@ -1442,14 +1464,15 @@ private:
             pressure.send_load_level = 1;
         }
 
-        const uint64_t old_demand = pressure.old_enqueue + pressure.superseded;
-        const uint64_t old_service = pressure.selected_old;
-        const uint64_t old_excess = old_demand > old_service ? old_demand - old_service : 0u;
-        if (old_excess > pressure.selected_new / 4u + 16u)
+        pressure.old_demand = pressure.old_enqueue + pressure.superseded;
+        pressure.old_service = pressure.selected_old;
+        pressure.old_excess = pressure.old_demand > pressure.old_service ?
+                pressure.old_demand - pressure.old_service : 0u;
+        if (pressure.old_excess > pressure.selected_new / 4u + 16u)
         {
             pressure.old_repair_level = 3;
         }
-        else if (old_excess > 0u || pressure.pending_old_writers > 0u)
+        else if (pressure.old_excess > 0u || pressure.pending_old_writers > 0u)
         {
             pressure.old_repair_level = 2;
         }
@@ -1472,7 +1495,7 @@ private:
         return pressure_snapshot().old_repair_level;
     }
 
-    int32_t compute_utility(
+    UtilityBreakdown compute_utility_breakdown(
             const WriterQueue& writer,
             const WriterQueue::SampleMeta* meta,
             bool sample_is_old,
@@ -1481,30 +1504,31 @@ private:
             const PressureSnapshot& pressure,
             const std::chrono::steady_clock::time_point& now) const
     {
-        int32_t utility = base_utility(writer.value_class);
+        UtilityBreakdown breakdown;
+        breakdown.base = base_utility(writer.value_class);
         const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
         const int64_t old_sample_age_ms = nullptr != meta && sample_is_old && 0 != meta->old_enqueue_count ?
                 elapsed_ms(meta->first_old_seen, now) : sample_age_ms;
 
         if (!sample_is_old)
         {
-            utility += new_sample_bonus(writer.value_class);
+            breakdown.sample_kind_adjust = new_sample_bonus(writer.value_class);
         }
         else
         {
             switch (writer.value_class)
             {
                 case ValueClassRank::IMPORTANT:
-                    utility += old_sample_bonus(writer.value_class);
+                    breakdown.sample_kind_adjust = old_sample_bonus(writer.value_class);
                     break;
                 case ValueClassRank::DEFAULT_VALUE:
-                    utility += old_sample_bonus(writer.value_class);
+                    breakdown.sample_kind_adjust = old_sample_bonus(writer.value_class);
                     break;
                 case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                    utility -= 150 + pressure.old_repair_level * 110;
+                    breakdown.sample_kind_adjust = -(150 + pressure.old_repair_level * 110);
                     if (has_newer_change)
                     {
-                        utility -= 260 + pressure.old_repair_level * 90;
+                        breakdown.superseded_old_penalty = 260 + pressure.old_repair_level * 90;
                     }
                     break;
                 default:
@@ -1512,15 +1536,15 @@ private:
             }
         }
 
-        utility += static_cast<int32_t>(std::min(writer.age_boost, max_age_boost)) * 12;
-        utility += static_cast<int32_t>(std::min<int64_t>(90, sample_age_ms / 6));
+        breakdown.writer_age_bonus = static_cast<int32_t>(std::min(writer.age_boost, max_age_boost)) * 12;
+        breakdown.sample_age_bonus = static_cast<int32_t>(std::min<int64_t>(90, sample_age_ms / 6));
         if (sample_is_old)
         {
-            utility += static_cast<int32_t>(std::min(writer.old_age_boost, max_old_age_boost)) *
+            breakdown.old_age_bonus = static_cast<int32_t>(std::min(writer.old_age_boost, max_old_age_boost)) *
                     (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class ? 8 : 14);
             if (writer.hard_max_defer_ms > 0.0)
             {
-                utility += static_cast<int32_t>(std::min<int64_t>(
+                breakdown.hard_defer_bonus = static_cast<int32_t>(std::min<int64_t>(
                     160,
                     std::max<int64_t>(0,
                     old_sample_age_ms - static_cast<int64_t>(writer.hard_max_defer_ms)) / 2));
@@ -1528,7 +1552,7 @@ private:
             if (writer.value_horizon_ms > 0.0 &&
                     old_sample_age_ms >= static_cast<int64_t>(writer.value_horizon_ms))
             {
-                utility -= static_cast<int32_t>(std::min<int64_t>(
+                breakdown.value_horizon_penalty = static_cast<int32_t>(std::min<int64_t>(
                     has_newer_change ? 320 : 160,
                     (old_sample_age_ms - static_cast<int64_t>(writer.value_horizon_ms)) / 2));
             }
@@ -1537,19 +1561,23 @@ private:
                 const int64_t recent_ms = elapsed_ms(meta->last_seen, now);
                 if (recent_ms < static_cast<int64_t>(writer.defer_cooldown_ms))
                 {
-                    utility -= static_cast<int32_t>((writer.defer_cooldown_ms - recent_ms) / 2.0);
+                    breakdown.cooldown_penalty = static_cast<int32_t>((writer.defer_cooldown_ms - recent_ms) / 2.0);
                 }
             }
         }
 
         if (sample_size > 0)
         {
-            utility -= byte_cost_penalty(sample_size, pressure);
+            breakdown.byte_cost_penalty = byte_cost_penalty(sample_size, pressure);
         }
 
-        utility -= recent_service_penalty(writer, sample_is_old, sample_size, pressure);
+        breakdown.recent_service_penalty = recent_service_penalty(writer, sample_is_old, sample_size, pressure);
+        breakdown.utility = breakdown.base + breakdown.sample_kind_adjust - breakdown.superseded_old_penalty +
+                breakdown.writer_age_bonus + breakdown.sample_age_bonus + breakdown.old_age_bonus +
+                breakdown.hard_defer_bonus - breakdown.value_horizon_penalty - breakdown.cooldown_penalty -
+                breakdown.byte_cost_penalty - breakdown.recent_service_penalty;
 
-        return utility;
+        return breakdown;
     }
 
     int32_t byte_cost_penalty(
@@ -1632,7 +1660,9 @@ private:
         candidate.sample_is_old = sample_is_old;
         candidate.has_newer_change = sample_has_newer_change;
         candidate.meta = meta;
-        candidate.utility = compute_utility(writer, meta, sample_is_old, sample_has_newer_change, size, pressure, now);
+        candidate.breakdown = compute_utility_breakdown(
+            writer, meta, sample_is_old, sample_has_newer_change, size, pressure, now);
+        candidate.utility = candidate.breakdown.utility;
         candidate.score = score_from_utility(candidate.utility, size);
 
         if (nullptr == best.writer ||
@@ -1828,7 +1858,21 @@ private:
                << ";pending_writers=" << pressure.pending_writers
                << ";pending_new_writers=" << pressure.pending_new_writers
                << ";pending_old_writers=" << pressure.pending_old_writers
+               << ";old_demand=" << pressure.old_demand
+               << ";old_service=" << pressure.old_service
+               << ";old_excess=" << pressure.old_excess
                << ";selected_size=" << selected_size
+               << ";utility_base=" << utility_breakdown_being_processed_.base
+               << ";utility_sample_kind_adjust=" << utility_breakdown_being_processed_.sample_kind_adjust
+               << ";utility_superseded_old_penalty=" << utility_breakdown_being_processed_.superseded_old_penalty
+               << ";utility_writer_age_bonus=" << utility_breakdown_being_processed_.writer_age_bonus
+               << ";utility_sample_age_bonus=" << utility_breakdown_being_processed_.sample_age_bonus
+               << ";utility_old_age_bonus=" << utility_breakdown_being_processed_.old_age_bonus
+               << ";utility_hard_defer_bonus=" << utility_breakdown_being_processed_.hard_defer_bonus
+               << ";utility_value_horizon_penalty=" << utility_breakdown_being_processed_.value_horizon_penalty
+               << ";utility_cooldown_penalty=" << utility_breakdown_being_processed_.cooldown_penalty
+               << ";utility_byte_cost_penalty=" << utility_breakdown_being_processed_.byte_cost_penalty
+               << ";utility_recent_service_penalty=" << utility_breakdown_being_processed_.recent_service_penalty
                << ";utility=" << utility_being_processed_
                << ";score=" << score_being_processed_;
 
@@ -2023,6 +2067,8 @@ private:
     fastrtps::rtps::CacheChange_t* change_being_processed_ = nullptr;
 
     uint32_t size_being_processed_ = 0;
+
+    UtilityBreakdown utility_breakdown_being_processed_;
 
     int32_t utility_being_processed_ = (std::numeric_limits<int32_t>::min)();
 
