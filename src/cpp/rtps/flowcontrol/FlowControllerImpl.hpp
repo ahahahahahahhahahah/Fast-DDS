@@ -1195,7 +1195,6 @@ private:
         {
             uint64_t new_enqueue = 0;
             uint64_t old_enqueue = 0;
-            uint64_t replaceable_old_utility_throttled = 0;
             uint64_t replaceable_old_superseded = 0;
             uint64_t selected_utility_new = 0;
             uint64_t selected_utility_old = 0;
@@ -1233,7 +1232,6 @@ private:
         uint64_t selected_old = 0;
         uint64_t selected_new = 0;
         uint64_t old_enqueue = 0;
-        uint64_t throttled = 0;
         uint64_t superseded = 0;
         int32_t contention_level = 1;
         int32_t old_repair_level = 0;
@@ -1415,7 +1413,6 @@ private:
             pressure.selected_old += window.selected_utility_old;
             pressure.selected_new += window.selected_utility_new;
             pressure.old_enqueue += window.old_enqueue;
-            pressure.throttled += window.replaceable_old_utility_throttled;
             pressure.superseded += window.replaceable_old_superseded;
         }
 
@@ -1445,12 +1442,10 @@ private:
             pressure.send_load_level = 1;
         }
 
-        const uint64_t scaled_throttled = pressure.throttled / 64u;
-        const uint64_t old_demand = pressure.old_enqueue + pressure.superseded + scaled_throttled;
+        const uint64_t old_demand = pressure.old_enqueue + pressure.superseded;
         const uint64_t old_service = pressure.selected_old;
         const uint64_t old_excess = old_demand > old_service ? old_demand - old_service : 0u;
-        if (old_excess > pressure.selected_new / 4u + 16u ||
-                scaled_throttled > pressure.selected_new / 4u + 8u)
+        if (old_excess > pressure.selected_new / 4u + 16u)
         {
             pressure.old_repair_level = 3;
         }
@@ -1483,9 +1478,9 @@ private:
             bool sample_is_old,
             bool has_newer_change,
             uint32_t sample_size,
+            const PressureSnapshot& pressure,
             const std::chrono::steady_clock::time_point& now) const
     {
-        const PressureSnapshot pressure = pressure_snapshot();
         int32_t utility = base_utility(writer.value_class);
         const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
         const int64_t old_sample_age_ms = nullptr != meta && sample_is_old && 0 != meta->old_enqueue_count ?
@@ -1609,6 +1604,7 @@ private:
             WriterQueue& writer,
             fastrtps::rtps::CacheChange_t* change,
             bool sample_is_old,
+            const PressureSnapshot& pressure,
             const std::chrono::steady_clock::time_point& now)
     {
         if (nullptr == change)
@@ -1627,11 +1623,6 @@ private:
             record_replaceable_old_superseded(writer);
             mutable_meta->superseded_recorded = true;
         }
-        if (replaceable_old_utility_throttled(writer, sample_is_old, sample_has_newer_change))
-        {
-            record_replaceable_old_utility_throttled(writer);
-            return;
-        }
 
         CandidateView candidate;
         candidate.writer = writer_ptr;
@@ -1641,7 +1632,7 @@ private:
         candidate.sample_is_old = sample_is_old;
         candidate.has_newer_change = sample_has_newer_change;
         candidate.meta = meta;
-        candidate.utility = compute_utility(writer, meta, sample_is_old, sample_has_newer_change, size, now);
+        candidate.utility = compute_utility(writer, meta, sample_is_old, sample_has_newer_change, size, pressure, now);
         candidate.score = score_from_utility(candidate.utility, size);
 
         if (nullptr == best.writer ||
@@ -1663,6 +1654,7 @@ private:
             CandidateView& selected)
     {
         const auto now = std::chrono::steady_clock::now();
+        const PressureSnapshot pressure = pressure_snapshot();
         for (auto& priority : priorities_)
         {
             for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
@@ -1671,43 +1663,10 @@ private:
                 assert(writer != writers_queue_.end());
 
                 consider_candidate(selected, writer_ptr, writer->second,
-                        writer->second.queue.get_next_new_change(), false, now);
+                        writer->second.queue.get_next_new_change(), false, pressure, now);
                 consider_candidate(selected, writer_ptr, writer->second,
-                        writer->second.queue.get_next_old_change(), true, now);
+                        writer->second.queue.get_next_old_change(), true, pressure, now);
             }
-        }
-    }
-
-    bool replaceable_old_utility_throttled(
-            const WriterQueue& writer,
-            bool sample_is_old,
-            bool has_newer_change) const
-    {
-        if (!sample_is_old || ValueClassRank::REPLACEABLE_SNAPSHOT != writer.value_class || !has_newer_change)
-        {
-            return false;
-        }
-
-        const uint64_t selected_new = writer.summary.selected_utility_new;
-        const uint64_t selected_old = writer.summary.selected_utility_old;
-        uint64_t old_allowance = 2u + selected_new / 40u;
-
-        if (nullptr == writer.queue.get_next_new_change())
-        {
-            old_allowance = (std::max)(old_allowance, 2u + writer.summary.selected_utility_new / 12u);
-        }
-
-        return selected_old >= old_allowance && writer.old_age_boost < max_old_age_boost;
-    }
-
-    void record_replaceable_old_utility_throttled(
-            WriterQueue& writer)
-    {
-        ++writer.summary.replaceable_old_utility_throttled;
-        ++writer.feedback_window.replaceable_old_utility_throttled;
-        if (WriterQueue::Summary* window = mutable_window_summary(writer))
-        {
-            ++window->replaceable_old_utility_throttled;
         }
     }
 
@@ -1973,7 +1932,6 @@ private:
     {
         summary.new_enqueue /= 2u;
         summary.old_enqueue /= 2u;
-        summary.replaceable_old_utility_throttled /= 2u;
         summary.replaceable_old_superseded /= 2u;
         summary.selected_utility_new /= 2u;
         summary.selected_utility_old /= 2u;
@@ -2020,7 +1978,6 @@ private:
                << ";old_enqueue=" << queue.summary.old_enqueue
                << ";selected_utility_new=" << queue.summary.selected_utility_new
                << ";selected_utility_old=" << queue.summary.selected_utility_old
-               << ";replaceable_old_utility_throttled=" << queue.summary.replaceable_old_utility_throttled
                << ";replaceable_old_superseded=" << queue.summary.replaceable_old_superseded
                << ";selected_bytes=" << queue.summary.selected_bytes
                << ";selected_new_bytes=" << queue.summary.selected_new_bytes
@@ -2046,7 +2003,6 @@ private:
                    << ";old_enqueue=" << summary.old_enqueue
                    << ";selected_utility_new=" << summary.selected_utility_new
                    << ";selected_utility_old=" << summary.selected_utility_old
-                   << ";replaceable_old_utility_throttled=" << summary.replaceable_old_utility_throttled
                    << ";replaceable_old_superseded=" << summary.replaceable_old_superseded
                    << ";selected_bytes=" << summary.selected_bytes
                    << ";selected_new_bytes=" << summary.selected_new_bytes
