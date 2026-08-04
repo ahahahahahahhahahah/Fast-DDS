@@ -1549,7 +1549,8 @@ private:
                     std::max<int64_t>(0,
                     old_sample_age_ms - static_cast<int64_t>(writer.hard_max_defer_ms)) / 2));
             }
-            if (writer.value_horizon_ms > 0.0 &&
+            if (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class &&
+                    writer.value_horizon_ms > 0.0 &&
                     old_sample_age_ms >= static_cast<int64_t>(writer.value_horizon_ms))
             {
                 breakdown.value_horizon_penalty = static_cast<int32_t>(std::min<int64_t>(
