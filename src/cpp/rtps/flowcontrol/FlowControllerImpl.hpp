@@ -1224,6 +1224,23 @@ private:
         int32_t score = (std::numeric_limits<int32_t>::min)();
     };
 
+    struct PressureSnapshot
+    {
+        uint64_t pending_writers = 0;
+        uint64_t pending_new_writers = 0;
+        uint64_t pending_old_writers = 0;
+        uint64_t selected_bytes = 0;
+        uint64_t selected_old = 0;
+        uint64_t selected_new = 0;
+        uint64_t old_enqueue = 0;
+        uint64_t throttled = 0;
+        uint64_t superseded = 0;
+        int32_t contention_level = 1;
+        int32_t old_repair_level = 0;
+        int32_t send_load_level = 1;
+        int32_t aggregate_level = 1;
+    };
+
     static constexpr uint32_t max_age_boost = 20;
     static constexpr uint32_t max_old_age_boost = 35;
     static constexpr uint32_t feedback_decay_interval = 256;
@@ -1345,27 +1362,119 @@ private:
         }
     }
 
-    int32_t old_pressure_level() const
+    static int32_t new_sample_bonus(
+            ValueClassRank value_class)
     {
-        uint64_t old_pressure = 0;
-        uint64_t new_selected = 0;
+        switch (value_class)
+        {
+            case ValueClassRank::IMPORTANT:
+                return 180;
+            case ValueClassRank::DEFAULT_VALUE:
+                return 130;
+            case ValueClassRank::REPLACEABLE_SNAPSHOT:
+                return 220;
+            default:
+                return 0;
+        }
+    }
+
+    static int32_t old_sample_bonus(
+            ValueClassRank value_class)
+    {
+        switch (value_class)
+        {
+            case ValueClassRank::IMPORTANT:
+                return 120;
+            case ValueClassRank::DEFAULT_VALUE:
+                return 70;
+            default:
+                return 0;
+        }
+    }
+
+    PressureSnapshot pressure_snapshot() const
+    {
+        PressureSnapshot pressure;
         for (const auto& item : writers_queue_)
         {
-            const WriterQueue::Summary& window = item.second.feedback_window;
-            old_pressure += window.old_enqueue + window.selected_utility_old +
-                    window.replaceable_old_utility_throttled + window.replaceable_old_superseded;
-            new_selected += window.selected_utility_new;
+            const WriterQueue& queue = item.second;
+            const WriterQueue::Summary& window = queue.feedback_window;
+            if (queue.queue.has_pending_change())
+            {
+                ++pressure.pending_writers;
+            }
+            if (nullptr != queue.queue.get_next_new_change())
+            {
+                ++pressure.pending_new_writers;
+            }
+            if (nullptr != queue.queue.get_next_old_change())
+            {
+                ++pressure.pending_old_writers;
+            }
+            pressure.selected_bytes += window.selected_bytes;
+            pressure.selected_old += window.selected_utility_old;
+            pressure.selected_new += window.selected_utility_new;
+            pressure.old_enqueue += window.old_enqueue;
+            pressure.throttled += window.replaceable_old_utility_throttled;
+            pressure.superseded += window.replaceable_old_superseded;
         }
 
-        if (old_pressure > new_selected + 4u)
+        if (pressure.pending_old_writers >= 2u && pressure.pending_new_writers > 0u)
         {
-            return 2;
+            pressure.contention_level = 3;
         }
-        if (old_pressure > 0)
+        else if (pressure.pending_old_writers > 0u || pressure.pending_writers >= 3u)
         {
-            return 1;
+            pressure.contention_level = 2;
         }
-        return 0;
+        else
+        {
+            pressure.contention_level = 1;
+        }
+
+        if (pressure.selected_bytes > 512u * 1024u)
+        {
+            pressure.send_load_level = 3;
+        }
+        else if (pressure.selected_bytes > 192u * 1024u)
+        {
+            pressure.send_load_level = 2;
+        }
+        else
+        {
+            pressure.send_load_level = 1;
+        }
+
+        const uint64_t scaled_throttled = pressure.throttled / 64u;
+        const uint64_t old_demand = pressure.old_enqueue + pressure.superseded + scaled_throttled;
+        const uint64_t old_service = pressure.selected_old;
+        const uint64_t old_excess = old_demand > old_service ? old_demand - old_service : 0u;
+        if (old_excess > pressure.selected_new / 4u + 16u ||
+                scaled_throttled > pressure.selected_new / 4u + 8u)
+        {
+            pressure.old_repair_level = 3;
+        }
+        else if (old_excess > 0u || pressure.pending_old_writers > 0u)
+        {
+            pressure.old_repair_level = 2;
+        }
+        else if (pressure.old_enqueue > 0u || pressure.superseded > 0u)
+        {
+            pressure.old_repair_level = 1;
+        }
+        else
+        {
+            pressure.old_repair_level = 0;
+        }
+
+        pressure.aggregate_level = (std::max)(pressure.contention_level,
+                        (std::max)(1, pressure.old_repair_level));
+        return pressure;
+    }
+
+    int32_t old_pressure_level() const
+    {
+        return pressure_snapshot().old_repair_level;
     }
 
     int32_t compute_utility(
@@ -1376,6 +1485,7 @@ private:
             uint32_t sample_size,
             const std::chrono::steady_clock::time_point& now) const
     {
+        const PressureSnapshot pressure = pressure_snapshot();
         int32_t utility = base_utility(writer.value_class);
         const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
         const int64_t old_sample_age_ms = nullptr != meta && sample_is_old && 0 != meta->old_enqueue_count ?
@@ -1383,36 +1493,23 @@ private:
 
         if (!sample_is_old)
         {
-            switch (writer.value_class)
-            {
-                case ValueClassRank::IMPORTANT:
-                    utility += 180;
-                    break;
-                case ValueClassRank::DEFAULT_VALUE:
-                    utility += 130;
-                    break;
-                case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                    utility += 220;
-                    break;
-                default:
-                    break;
-            }
+            utility += new_sample_bonus(writer.value_class);
         }
         else
         {
             switch (writer.value_class)
             {
                 case ValueClassRank::IMPORTANT:
-                    utility += 120;
+                    utility += old_sample_bonus(writer.value_class);
                     break;
                 case ValueClassRank::DEFAULT_VALUE:
-                    utility += 70;
+                    utility += old_sample_bonus(writer.value_class);
                     break;
                 case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                    utility -= 150 + old_pressure_level() * 110;
+                    utility -= 150 + pressure.old_repair_level * 110;
                     if (has_newer_change)
                     {
-                        utility -= 260 + pressure_level() * 90;
+                        utility -= 260 + pressure.old_repair_level * 90;
                     }
                     break;
                 default:
@@ -1452,70 +1549,32 @@ private:
 
         if (sample_size > 0)
         {
-            utility -= byte_cost_penalty(sample_size);
+            utility -= byte_cost_penalty(sample_size, pressure);
         }
 
-        utility -= recent_service_penalty(writer, sample_is_old, sample_size);
+        utility -= recent_service_penalty(writer, sample_is_old, sample_size, pressure);
 
         return utility;
     }
 
     int32_t byte_cost_penalty(
-            uint32_t sample_size) const
+            uint32_t sample_size,
+            const PressureSnapshot& pressure) const
     {
         const uint32_t cost_units = std::max<uint32_t>(1u, (sample_size + 255u) / 256u);
-        return static_cast<int32_t>(std::min<uint32_t>(240u, cost_units * pressure_level()));
+        return static_cast<int32_t>(std::min<uint32_t>(240u, cost_units * pressure.send_load_level));
     }
 
     int32_t pressure_level() const
     {
-        uint64_t pending_writers = 0;
-        uint64_t pending_old_writers = 0;
-        uint64_t pending_new_writers = 0;
-        uint64_t selected_bytes = 0;
-        uint64_t selected_old = 0;
-        uint64_t selected_new = 0;
-        uint64_t throttled = 0;
-        for (const auto& item : writers_queue_)
-        {
-            if (item.second.queue.has_pending_change())
-            {
-                ++pending_writers;
-            }
-            if (nullptr != item.second.queue.get_next_new_change())
-            {
-                ++pending_new_writers;
-            }
-            if (nullptr != item.second.queue.get_next_old_change())
-            {
-                ++pending_old_writers;
-            }
-            selected_bytes += item.second.feedback_window.selected_bytes;
-            selected_old += item.second.feedback_window.selected_utility_old;
-            selected_new += item.second.feedback_window.selected_utility_new;
-            throttled += item.second.feedback_window.replaceable_old_utility_throttled;
-            throttled += item.second.feedback_window.replaceable_old_superseded;
-        }
-
-        if (pending_writers >= 3u ||
-                (pending_new_writers > 0u && pending_old_writers >= 2u) ||
-                selected_old > selected_new + 8u ||
-                throttled > 0u ||
-                selected_bytes > 256u * 1024u)
-        {
-            return 3;
-        }
-        if (pending_writers >= 2u || pending_old_writers > 0u || selected_bytes > 96u * 1024u)
-        {
-            return 2;
-        }
-        return 1;
+        return pressure_snapshot().aggregate_level;
     }
 
     int32_t recent_service_penalty(
             const WriterQueue& writer,
             bool sample_is_old,
-            uint32_t sample_size) const
+            uint32_t sample_size,
+            const PressureSnapshot& pressure) const
     {
         const uint64_t selected = writer.summary.selected_utility_new + writer.summary.selected_utility_old;
         const uint64_t average_bytes = selected == 0u ? 0u : writer.summary.selected_bytes / selected;
@@ -1523,11 +1582,15 @@ private:
 
         if (sample_is_old && ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class)
         {
-            penalty += 40 * pressure_level();
+            penalty += 40 * pressure.old_repair_level;
         }
-        if (sample_size > 1024u && pressure_level() >= 2)
+        if (sample_size > 1024u && pressure.send_load_level >= 2)
         {
             penalty += static_cast<int32_t>(std::min<uint32_t>(120u, sample_size / 512u));
+        }
+        if (pressure.contention_level >= 3 && selected > 0u)
+        {
+            penalty += 12;
         }
         return penalty;
     }
@@ -1786,6 +1849,7 @@ private:
                 0 == meta_it->second.old_enqueue_count ? 0 : elapsed_ms(meta_it->second.first_old_seen, now);
         const bool selected_has_newer_change = selected_sample_is_old &&
                 has_newer_change(writer->second, selected_change);
+        const PressureSnapshot pressure = pressure_snapshot();
         detail << "scheduler=ADAPTIVE_VALUE_UTILITY"
                << ";value_class=" << value_class_name(writer->second.value_class)
                << ";sample_kind=" << (selected_sample_is_old ? "old" : "new")
@@ -1798,8 +1862,13 @@ private:
                << ";hard_max_defer_ms=" << writer->second.hard_max_defer_ms
                << ";defer_cooldown_ms=" << writer->second.defer_cooldown_ms
                << ";value_horizon_ms=" << writer->second.value_horizon_ms
-               << ";pressure_level=" << pressure_level()
-               << ";old_pressure_level=" << old_pressure_level()
+               << ";pressure_level=" << pressure.aggregate_level
+               << ";old_pressure_level=" << pressure.old_repair_level
+               << ";contention_pressure_level=" << pressure.contention_level
+               << ";send_load_pressure_level=" << pressure.send_load_level
+               << ";pending_writers=" << pressure.pending_writers
+               << ";pending_new_writers=" << pressure.pending_new_writers
+               << ";pending_old_writers=" << pressure.pending_old_writers
                << ";selected_size=" << selected_size
                << ";utility=" << utility_being_processed_
                << ";score=" << score_being_processed_;
