@@ -58,6 +58,17 @@ void FlowControllerFactory::register_flow_controller (
         return;
     }
 
+    if (FlowControllerSchedulerPolicy::ADAPTIVE_VALUE_UTILITY == flow_controller_descr.scheduler)
+    {
+        flow_controllers_.insert(decltype(flow_controllers_)::value_type(
+                    flow_controller_descr.name,
+                    std::unique_ptr<FlowController>(
+                        new FlowControllerImpl<FlowControllerAsyncPublishMode,
+                        FlowControllerAdaptiveValueUtilitySchedule>(participant_,
+                        &flow_controller_descr))));
+        return;
+    }
+
     if (0 < flow_controller_descr.max_bytes_per_period)
     {
         switch (flow_controller_descr.scheduler)
@@ -91,14 +102,6 @@ void FlowControllerFactory::register_flow_controller (
                             std::unique_ptr<FlowController>(
                                 new FlowControllerImpl<FlowControllerLimitedAsyncPublishMode,
                                 FlowControllerPriorityWithReservationSchedule>(participant_,
-                                &flow_controller_descr))));
-                break;
-            case FlowControllerSchedulerPolicy::ADAPTIVE_VALUE_UTILITY:
-                flow_controllers_.insert(decltype(flow_controllers_)::value_type(
-                            flow_controller_descr.name,
-                            std::unique_ptr<FlowController>(
-                                new FlowControllerImpl<FlowControllerLimitedAsyncPublishMode,
-                                FlowControllerAdaptiveValueUtilitySchedule>(participant_,
                                 &flow_controller_descr))));
                 break;
             default:

@@ -4,6 +4,7 @@
 #include "FlowController.hpp"
 #include "../RetransmissionTrace.hpp"
 #include <fastdds/rtps/common/Guid.h>
+#include <fastdds/rtps/writer/StatefulWriter.h>
 #include <fastdds/rtps/writer/RTPSWriter.h>
 
 #include <algorithm>
@@ -482,6 +483,11 @@ struct FlowControllerFifoSchedule
     {
     }
 
+    void remove_change(
+            fastrtps::rtps::CacheChange_t*) const
+    {
+    }
+
 private:
 
     //! Scheduler queue. FIFO scheduler only has one queue.
@@ -620,6 +626,11 @@ struct FlowControllerRoundRobinSchedule
     {
     }
 
+    void remove_change(
+            fastrtps::rtps::CacheChange_t*) const
+    {
+    }
+
 private:
 
     iterator find(
@@ -736,6 +747,11 @@ struct FlowControllerHighPrioritySchedule
     }
 
     void trigger_bandwidth_limit_reset() const
+    {
+    }
+
+    void remove_change(
+            fastrtps::rtps::CacheChange_t*) const
     {
     }
 
@@ -945,6 +961,11 @@ struct FlowControllerPriorityWithReservationSchedule
         }
     }
 
+    void remove_change(
+            fastrtps::rtps::CacheChange_t*) const
+    {
+    }
+
 private:
 
     using map_writers = std::unordered_map<fastrtps::rtps::RTPSWriter*, std::tuple<FlowQueue, int32_t, uint32_t,
@@ -972,9 +993,11 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         assert(nullptr != writer);
 
         int32_t priority = 0;
-        uint32_t credit_share_percent = 30;
         ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
-        apply_value_class_defaults(writer, priority, credit_share_percent, value_class);
+        double hard_max_defer_ms = 0.0;
+        double defer_cooldown_ms = 0.0;
+        double value_horizon_ms = 0.0;
+        apply_value_class_defaults(writer, priority, value_class);
 
         int32_t parsed_priority = priority;
         if (parse_int32_property(writer, "fastdds.adaptive_async.priority", -10, 10, parsed_priority) ||
@@ -983,19 +1006,20 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             priority = parsed_priority;
         }
 
-        uint32_t parsed_credit_share_percent = credit_share_percent;
-        if (parse_uint32_property(writer, "fastdds.adaptive_async.credit_weight", 0, 100,
-                parsed_credit_share_percent))
-        {
-            credit_share_percent = parsed_credit_share_percent;
-        }
+        parse_double_property(writer, "fastdds.adaptive_retransmission.hard_max_defer_ms",
+                0.0, 60000.0, hard_max_defer_ms);
+        parse_double_property(writer, "fastdds.adaptive_retransmission.defer_cooldown_ms",
+                0.0, 60000.0, defer_cooldown_ms);
+        parse_double_property(writer, "fastdds.adaptive_retransmission.value_horizon_ms",
+                0.0, 60000.0, value_horizon_ms);
 
         WriterQueue writer_queue;
+        writer_queue.writer = writer;
         writer_queue.priority = priority;
         writer_queue.value_class = value_class;
-        writer_queue.credit_share_percent = std::max(1u, credit_share_percent);
-        writer_queue.credit_refill_bytes = refill_credit_bytes(writer_queue);
-        writer_queue.credit_bytes = static_cast<int64_t>(writer_queue.credit_refill_bytes);
+        writer_queue.hard_max_defer_ms = hard_max_defer_ms;
+        writer_queue.defer_cooldown_ms = defer_cooldown_ms;
+        writer_queue.value_horizon_ms = value_horizon_ms;
 
         auto ret = writers_queue_.emplace(writer, std::move(writer_queue));
         (void)ret;
@@ -1033,19 +1057,16 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             {
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_selection(writer_being_processed_, change_being_processed_, size_being_processed_,
-                        selection_path_being_processed_, selected_sample_is_old_being_processed_);
+                        selected_sample_is_old_being_processed_);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-                if (SelectionPath::UTILITY != selection_path_being_processed_)
-                {
-                    writer->second.credit_bytes -= static_cast<int64_t>(size_being_processed_);
-                }
-                record_successful_selection(writer_being_processed_, selection_path_being_processed_,
+                record_successful_selection(writer_being_processed_,
                         selected_sample_is_old_being_processed_);
             }
             writer_being_processed_ = nullptr;
             change_being_processed_ = nullptr;
             size_being_processed_ = 0;
-            selection_path_being_processed_ = SelectionPath::UTILITY;
+            utility_being_processed_ = (std::numeric_limits<int32_t>::min)();
+            score_being_processed_ = (std::numeric_limits<int32_t>::min)();
             selected_sample_is_old_being_processed_ = false;
         }
     }
@@ -1057,6 +1078,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
         it->second.queue.add_new_sample(change);
+        touch_sample(it->second, change, false);
         ++it->second.summary.new_enqueue;
         ++it->second.feedback_window.new_enqueue;
         it->second.summary.last_new_enqueue_sequence = change->sequenceNumber.to64long();
@@ -1075,6 +1097,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
         it->second.queue.add_old_sample(change);
+        touch_sample(it->second, change, true);
         ++it->second.summary.old_enqueue;
         ++it->second.feedback_window.old_enqueue;
         it->second.summary.last_old_enqueue_sequence = change->sequenceNumber.to64long();
@@ -1096,7 +1119,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             writer_being_processed_ = selected.writer;
             change_being_processed_ = selected.change;
             size_being_processed_ = selected.size;
-            selection_path_being_processed_ = selected.selection_path;
+            utility_being_processed_ = selected.utility;
+            score_being_processed_ = selected.score;
             selected_sample_is_old_being_processed_ = selected.sample_is_old;
         }
 
@@ -1114,17 +1138,27 @@ struct FlowControllerAdaptiveValueUtilitySchedule
     void set_bandwith_limitation(
             uint32_t limit)
     {
-        bandwidth_limit_ = limit;
-        for (auto& writer : writers_queue_)
-        {
-            writer.second.credit_refill_bytes = refill_credit_bytes(writer.second);
-            writer.second.credit_bytes = static_cast<int64_t>(writer.second.credit_refill_bytes);
-        }
+        static_cast<void>(limit);
     }
 
     void trigger_bandwidth_limit_reset()
     {
-        refill_credits();
+    }
+
+    void remove_change(
+            fastrtps::rtps::CacheChange_t* change)
+    {
+        for (auto& item : writers_queue_)
+        {
+            item.second.sample_meta.erase(change);
+        }
+    }
+
+    static int64_t elapsed_ms(
+            const std::chrono::steady_clock::time_point& from,
+            const std::chrono::steady_clock::time_point& to)
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(to - from).count();
     }
 
 private:
@@ -1136,41 +1170,35 @@ private:
         REPLACEABLE_SNAPSHOT = 2
     };
 
-    enum class SelectionPath : int32_t
-    {
-        UTILITY = 0,
-        CREDIT = 1,
-        BORROW = 2
-    };
-
     struct WriterQueue
     {
         FlowQueue queue;
+        fastrtps::rtps::RTPSWriter* writer = nullptr;
         int32_t priority = 0;
         ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
-        uint32_t credit_share_percent = 30;
-        uint32_t credit_refill_bytes = 0;
-        int64_t credit_bytes = 0;
-        uint32_t age_credit = 0;
-        uint32_t old_age_credit = 0;
-        uint32_t selections_in_period = 0;
-        uint32_t borrow_selections_in_period = 0;
+        double hard_max_defer_ms = 0.0;
+        double defer_cooldown_ms = 0.0;
+        double value_horizon_ms = 0.0;
+        uint32_t age_boost = 0;
+        uint32_t old_age_boost = 0;
+        struct SampleMeta
+        {
+            std::chrono::steady_clock::time_point first_seen;
+            std::chrono::steady_clock::time_point first_old_seen;
+            std::chrono::steady_clock::time_point last_seen;
+            bool is_old = false;
+            bool superseded_recorded = false;
+            uint32_t enqueue_count = 0;
+            uint32_t old_enqueue_count = 0;
+        };
         struct Summary
         {
             uint64_t new_enqueue = 0;
             uint64_t old_enqueue = 0;
-            uint64_t selected_credit_new = 0;
-            uint64_t selected_credit_old = 0;
-            uint64_t selected_borrow_new = 0;
-            uint64_t selected_borrow_old = 0;
-            uint64_t borrow_denied_new = 0;
-            uint64_t borrow_denied_old = 0;
-            uint64_t replaceable_old_credit_throttled = 0;
             uint64_t replaceable_old_utility_throttled = 0;
+            uint64_t replaceable_old_superseded = 0;
             uint64_t selected_utility_new = 0;
             uint64_t selected_utility_old = 0;
-            uint64_t refill_pending = 0;
-            uint64_t refill_idle = 0;
             uint64_t selected_bytes = 0;
             uint64_t selected_new_bytes = 0;
             uint64_t selected_old_bytes = 0;
@@ -1180,6 +1208,7 @@ private:
         } summary;
         Summary feedback_window;
         std::map<uint64_t, Summary> window_summary;
+        std::unordered_map<fastrtps::rtps::CacheChange_t*, SampleMeta> sample_meta;
     };
 
     struct CandidateView
@@ -1189,14 +1218,14 @@ private:
         WriterQueue* queue = nullptr;
         uint32_t size = 0;
         bool sample_is_old = false;
-        SelectionPath selection_path = SelectionPath::UTILITY;
+        bool has_newer_change = false;
+        const WriterQueue::SampleMeta* meta = nullptr;
         int32_t utility = (std::numeric_limits<int32_t>::min)();
         int32_t score = (std::numeric_limits<int32_t>::min)();
     };
 
-    static constexpr uint32_t max_age_credit = 20;
-    static constexpr uint32_t max_old_age_credit = 35;
-    static constexpr uint32_t max_credit_carry_periods = 2;
+    static constexpr uint32_t max_age_boost = 20;
+    static constexpr uint32_t max_old_age_boost = 35;
     static constexpr uint32_t feedback_decay_interval = 256;
     static bool adaptive_summary_enabled()
     {
@@ -1254,61 +1283,50 @@ private:
         return &queue.window_summary[current_window_index(window_ms)];
     }
 
-    uint32_t credit_carry_cap_bytes(
-            const WriterQueue& writer) const
+    void touch_sample(
+            WriterQueue& queue,
+            fastrtps::rtps::CacheChange_t* change,
+            bool sample_is_old)
     {
-        if (0 == bandwidth_limit_)
+        const auto now = std::chrono::steady_clock::now();
+        WriterQueue::SampleMeta& meta = queue.sample_meta[change];
+        if (0 == meta.enqueue_count)
         {
-            return (std::numeric_limits<uint32_t>::max)();
+            meta.first_seen = now;
         }
-        return std::max<uint32_t>(refill_credit_bytes(writer), bandwidth_limit_ / 20u) * max_credit_carry_periods;
+        meta.last_seen = now;
+        meta.is_old = meta.is_old || sample_is_old;
+        if (sample_is_old)
+        {
+            if (0 == meta.old_enqueue_count)
+            {
+                meta.first_old_seen = now;
+            }
+            ++meta.old_enqueue_count;
+        }
+        ++meta.enqueue_count;
     }
 
-    void refill_credits()
+    static bool has_newer_change(
+            const WriterQueue& queue,
+            fastrtps::rtps::CacheChange_t* change)
     {
-        for (auto& writer : writers_queue_)
+        if (nullptr == queue.writer || nullptr == change || !queue.writer->isAsync())
         {
-            if (!writer.second.queue.has_pending_change())
-            {
-                ++writer.second.summary.refill_idle;
-                ++writer.second.feedback_window.refill_idle;
-                if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-                {
-                    ++window->refill_idle;
-                }
-                writer.second.credit_refill_bytes = 0;
-                writer.second.credit_bytes = std::min<int64_t>(
-                    writer.second.credit_bytes,
-                    static_cast<int64_t>(credit_carry_cap_bytes(writer.second)));
-                writer.second.selections_in_period = 0;
-                writer.second.borrow_selections_in_period = 0;
-                continue;
-            }
-            ++writer.second.summary.refill_pending;
-            ++writer.second.feedback_window.refill_pending;
-            if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-            {
-                ++window->refill_pending;
-            }
-            writer.second.credit_refill_bytes = refill_credit_bytes(writer.second);
-            writer.second.credit_bytes = std::min<int64_t>(
-                writer.second.credit_bytes + static_cast<int64_t>(writer.second.credit_refill_bytes),
-                static_cast<int64_t>(credit_carry_cap_bytes(writer.second)));
-            writer.second.selections_in_period = 0;
-            writer.second.borrow_selections_in_period = 0;
+            return false;
         }
-    }
 
-    uint32_t refill_credit_bytes(
-            const WriterQueue& writer) const
-    {
-        if (0 == bandwidth_limit_)
+        if (!queue.writer->uses_adaptive_value_flow_controller())
         {
-            return 0;
+            return false;
         }
-        return std::max<uint32_t>(
-            1u,
-            (bandwidth_limit_ * std::min<uint32_t>(100u, std::max(1u, writer.credit_share_percent))) / 100u);
+
+        const auto* stateful_writer = dynamic_cast<const fastrtps::rtps::StatefulWriter*>(queue.writer);
+        if (nullptr == stateful_writer)
+        {
+            return false;
+        }
+        return change->sequenceNumber + 1 < stateful_writer->next_sequence_number();
     }
 
     static int32_t base_utility(
@@ -1334,11 +1352,9 @@ private:
         for (const auto& item : writers_queue_)
         {
             const WriterQueue::Summary& window = item.second.feedback_window;
-            old_pressure += window.old_enqueue + window.borrow_denied_old +
-                    window.selected_credit_old + window.selected_borrow_old +
-                    window.selected_utility_old + window.replaceable_old_credit_throttled +
-                    window.replaceable_old_utility_throttled;
-            new_selected += window.selected_credit_new + window.selected_borrow_new + window.selected_utility_new;
+            old_pressure += window.old_enqueue + window.selected_utility_old +
+                    window.replaceable_old_utility_throttled + window.replaceable_old_superseded;
+            new_selected += window.selected_utility_new;
         }
 
         if (old_pressure > new_selected + 4u)
@@ -1354,10 +1370,16 @@ private:
 
     int32_t compute_utility(
             const WriterQueue& writer,
+            const WriterQueue::SampleMeta* meta,
             bool sample_is_old,
-            uint32_t sample_size) const
+            bool has_newer_change,
+            uint32_t sample_size,
+            const std::chrono::steady_clock::time_point& now) const
     {
         int32_t utility = base_utility(writer.value_class);
+        const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
+        const int64_t old_sample_age_ms = nullptr != meta && sample_is_old && 0 != meta->old_enqueue_count ?
+                elapsed_ms(meta->first_old_seen, now) : sample_age_ms;
 
         if (!sample_is_old)
         {
@@ -1387,18 +1409,45 @@ private:
                     utility += 70;
                     break;
                 case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                    utility -= 180 + old_pressure_level() * 120;
+                    utility -= 150 + old_pressure_level() * 110;
+                    if (has_newer_change)
+                    {
+                        utility -= 260 + pressure_level() * 90;
+                    }
                     break;
                 default:
                     break;
             }
         }
 
-        utility += static_cast<int32_t>(std::min(writer.age_credit, max_age_credit)) * 12;
+        utility += static_cast<int32_t>(std::min(writer.age_boost, max_age_boost)) * 12;
+        utility += static_cast<int32_t>(std::min<int64_t>(90, sample_age_ms / 6));
         if (sample_is_old)
         {
-            utility += static_cast<int32_t>(std::min(writer.old_age_credit, max_old_age_credit)) *
+            utility += static_cast<int32_t>(std::min(writer.old_age_boost, max_old_age_boost)) *
                     (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class ? 8 : 14);
+            if (writer.hard_max_defer_ms > 0.0)
+            {
+                utility += static_cast<int32_t>(std::min<int64_t>(
+                    160,
+                    std::max<int64_t>(0,
+                    old_sample_age_ms - static_cast<int64_t>(writer.hard_max_defer_ms)) / 2));
+            }
+            if (writer.value_horizon_ms > 0.0 &&
+                    old_sample_age_ms >= static_cast<int64_t>(writer.value_horizon_ms))
+            {
+                utility -= static_cast<int32_t>(std::min<int64_t>(
+                    has_newer_change ? 320 : 160,
+                    (old_sample_age_ms - static_cast<int64_t>(writer.value_horizon_ms)) / 2));
+            }
+            if (writer.defer_cooldown_ms > 0.0 && nullptr != meta)
+            {
+                const int64_t recent_ms = elapsed_ms(meta->last_seen, now);
+                if (recent_ms < static_cast<int64_t>(writer.defer_cooldown_ms))
+                {
+                    utility -= static_cast<int32_t>((writer.defer_cooldown_ms - recent_ms) / 2.0);
+                }
+            }
         }
 
         if (sample_size > 0)
@@ -1406,15 +1455,7 @@ private:
             utility -= byte_cost_penalty(sample_size);
         }
 
-        if (0 != bandwidth_limit_ && writer.credit_bytes < static_cast<int64_t>(sample_size))
-        {
-            utility -= sample_is_old ? 80 : 40;
-        }
-
-        if (0 == bandwidth_limit_)
-        {
-            utility -= recent_service_penalty(writer, sample_is_old, sample_size);
-        }
+        utility -= recent_service_penalty(writer, sample_is_old, sample_size);
 
         return utility;
     }
@@ -1428,14 +1469,12 @@ private:
 
     int32_t pressure_level() const
     {
-        if (0 != bandwidth_limit_)
-        {
-            return 1 + old_pressure_level();
-        }
-
         uint64_t pending_writers = 0;
         uint64_t pending_old_writers = 0;
+        uint64_t pending_new_writers = 0;
         uint64_t selected_bytes = 0;
+        uint64_t selected_old = 0;
+        uint64_t selected_new = 0;
         uint64_t throttled = 0;
         for (const auto& item : writers_queue_)
         {
@@ -1443,15 +1482,26 @@ private:
             {
                 ++pending_writers;
             }
+            if (nullptr != item.second.queue.get_next_new_change())
+            {
+                ++pending_new_writers;
+            }
             if (nullptr != item.second.queue.get_next_old_change())
             {
                 ++pending_old_writers;
             }
             selected_bytes += item.second.feedback_window.selected_bytes;
+            selected_old += item.second.feedback_window.selected_utility_old;
+            selected_new += item.second.feedback_window.selected_utility_new;
             throttled += item.second.feedback_window.replaceable_old_utility_throttled;
+            throttled += item.second.feedback_window.replaceable_old_superseded;
         }
 
-        if (pending_writers >= 3u || pending_old_writers >= 2u || throttled > 0u || selected_bytes > 256u * 1024u)
+        if (pending_writers >= 3u ||
+                (pending_new_writers > 0u && pending_old_writers >= 2u) ||
+                selected_old > selected_new + 8u ||
+                throttled > 0u ||
+                selected_bytes > 256u * 1024u)
         {
             return 3;
         }
@@ -1467,9 +1517,7 @@ private:
             bool sample_is_old,
             uint32_t sample_size) const
     {
-        const uint64_t selected = writer.summary.selected_utility_new + writer.summary.selected_utility_old +
-                writer.summary.selected_credit_new + writer.summary.selected_credit_old +
-                writer.summary.selected_borrow_new + writer.summary.selected_borrow_old;
+        const uint64_t selected = writer.summary.selected_utility_new + writer.summary.selected_utility_old;
         const uint64_t average_bytes = selected == 0u ? 0u : writer.summary.selected_bytes / selected;
         int32_t penalty = static_cast<int32_t>(std::min<uint64_t>(180u, average_bytes / 512u));
 
@@ -1497,7 +1545,8 @@ private:
             fastrtps::rtps::RTPSWriter* writer_ptr,
             WriterQueue& writer,
             fastrtps::rtps::CacheChange_t* change,
-            bool sample_is_old)
+            bool sample_is_old,
+            const std::chrono::steady_clock::time_point& now)
     {
         if (nullptr == change)
         {
@@ -1505,24 +1554,17 @@ private:
         }
 
         const uint32_t size = size_to_check(change);
-        SelectionPath selection_path = SelectionPath::UTILITY;
-        if (0 != bandwidth_limit_)
+        auto meta_it = writer.sample_meta.find(change);
+        WriterQueue::SampleMeta* mutable_meta = meta_it == writer.sample_meta.end() ? nullptr : &meta_it->second;
+        const WriterQueue::SampleMeta* meta = mutable_meta;
+        const bool sample_has_newer_change = sample_is_old && has_newer_change(writer, change);
+        if (sample_is_old && ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class && sample_has_newer_change &&
+                nullptr != mutable_meta && !mutable_meta->superseded_recorded)
         {
-            const bool selected_by_credit = writer.credit_bytes >= static_cast<int64_t>(size);
-            if (selected_by_credit && replaceable_old_credit_throttled(writer, sample_is_old))
-            {
-                record_replaceable_old_credit_throttled(writer);
-                return;
-            }
-
-            if (!selected_by_credit && !borrow_allowed(writer, sample_is_old, size))
-            {
-                record_borrow_denied(writer, sample_is_old);
-                return;
-            }
-            selection_path = selected_by_credit ? SelectionPath::CREDIT : SelectionPath::BORROW;
+            record_replaceable_old_superseded(writer);
+            mutable_meta->superseded_recorded = true;
         }
-        else if (replaceable_old_utility_throttled(writer, sample_is_old))
+        if (replaceable_old_utility_throttled(writer, sample_is_old, sample_has_newer_change))
         {
             record_replaceable_old_utility_throttled(writer);
             return;
@@ -1534,8 +1576,9 @@ private:
         candidate.queue = &writer;
         candidate.size = size;
         candidate.sample_is_old = sample_is_old;
-        candidate.selection_path = selection_path;
-        candidate.utility = compute_utility(writer, sample_is_old, size);
+        candidate.has_newer_change = sample_has_newer_change;
+        candidate.meta = meta;
+        candidate.utility = compute_utility(writer, meta, sample_is_old, sample_has_newer_change, size, now);
         candidate.score = score_from_utility(candidate.utility, size);
 
         if (nullptr == best.writer ||
@@ -1556,6 +1599,7 @@ private:
     void select_utility_candidate(
             CandidateView& selected)
     {
+        const auto now = std::chrono::steady_clock::now();
         for (auto& priority : priorities_)
         {
             for (fastrtps::rtps::RTPSWriter* writer_ptr : priority.second)
@@ -1564,117 +1608,33 @@ private:
                 assert(writer != writers_queue_.end());
 
                 consider_candidate(selected, writer_ptr, writer->second,
-                        writer->second.queue.get_next_new_change(), false);
+                        writer->second.queue.get_next_new_change(), false, now);
                 consider_candidate(selected, writer_ptr, writer->second,
-                        writer->second.queue.get_next_old_change(), true);
+                        writer->second.queue.get_next_old_change(), true, now);
             }
         }
-    }
-
-    bool borrow_allowed(
-            const WriterQueue& writer,
-            bool sample_is_old,
-            uint32_t sample_size) const
-    {
-        if (0 == bandwidth_limit_)
-        {
-            return true;
-        }
-        if (sample_size > credit_cap_bytes())
-        {
-            return true;
-        }
-        if (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class)
-        {
-            if (sample_is_old)
-            {
-                return false;
-            }
-        }
-        return writer.credit_bytes + static_cast<int64_t>(borrow_limit_bytes(
-            writer, sample_is_old, sample_size)) >= static_cast<int64_t>(sample_size);
-    }
-
-    bool replaceable_old_credit_throttled(
-            const WriterQueue& writer,
-            bool sample_is_old) const
-    {
-        if (0 == bandwidth_limit_ || !sample_is_old ||
-                ValueClassRank::REPLACEABLE_SNAPSHOT != writer.value_class)
-        {
-            return false;
-        }
-
-        const uint64_t selected_new = writer.summary.selected_credit_new + writer.summary.selected_borrow_new;
-        const uint64_t selected_old = writer.summary.selected_credit_old + writer.summary.selected_borrow_old;
-        uint64_t old_allowance = 2u + selected_new / 32u;
-
-        // During recovery, allow a slow tail repair even when no fresh snapshot is queued.
-        if (nullptr == writer.queue.get_next_new_change())
-        {
-            old_allowance = (std::max)(old_allowance, 2u + writer.summary.refill_pending / 8u);
-        }
-
-        return selected_old >= old_allowance;
     }
 
     bool replaceable_old_utility_throttled(
             const WriterQueue& writer,
-            bool sample_is_old) const
+            bool sample_is_old,
+            bool has_newer_change) const
     {
-        if (!sample_is_old || ValueClassRank::REPLACEABLE_SNAPSHOT != writer.value_class)
+        if (!sample_is_old || ValueClassRank::REPLACEABLE_SNAPSHOT != writer.value_class || !has_newer_change)
         {
             return false;
         }
 
-        const uint64_t selected_new = writer.summary.selected_utility_new + writer.summary.selected_credit_new +
-                writer.summary.selected_borrow_new;
-        const uint64_t selected_old = writer.summary.selected_utility_old + writer.summary.selected_credit_old +
-                writer.summary.selected_borrow_old;
+        const uint64_t selected_new = writer.summary.selected_utility_new;
+        const uint64_t selected_old = writer.summary.selected_utility_old;
         uint64_t old_allowance = 2u + selected_new / 40u;
 
         if (nullptr == writer.queue.get_next_new_change())
         {
-            old_allowance = (std::max)(old_allowance, 2u +
-                            (writer.summary.selected_utility_new + writer.summary.refill_pending) / 12u);
+            old_allowance = (std::max)(old_allowance, 2u + writer.summary.selected_utility_new / 12u);
         }
 
-        return selected_old >= old_allowance && writer.old_age_credit < max_old_age_credit;
-    }
-
-    void record_borrow_denied(
-            WriterQueue& writer,
-            bool sample_is_old)
-    {
-        if (sample_is_old)
-        {
-            ++writer.summary.borrow_denied_old;
-            ++writer.feedback_window.borrow_denied_old;
-            if (WriterQueue::Summary* window = mutable_window_summary(writer))
-            {
-                ++window->borrow_denied_old;
-            }
-        }
-        else
-        {
-            ++writer.summary.borrow_denied_new;
-            ++writer.feedback_window.borrow_denied_new;
-            if (WriterQueue::Summary* window = mutable_window_summary(writer))
-            {
-                ++window->borrow_denied_new;
-            }
-        }
-    }
-
-    void record_replaceable_old_credit_throttled(
-            WriterQueue& writer)
-    {
-        ++writer.summary.replaceable_old_credit_throttled;
-        ++writer.feedback_window.replaceable_old_credit_throttled;
-        if (WriterQueue::Summary* window = mutable_window_summary(writer))
-        {
-            ++window->replaceable_old_credit_throttled;
-        }
+        return selected_old >= old_allowance && writer.old_age_boost < max_old_age_boost;
     }
 
     void record_replaceable_old_utility_throttled(
@@ -1685,6 +1645,17 @@ private:
         if (WriterQueue::Summary* window = mutable_window_summary(writer))
         {
             ++window->replaceable_old_utility_throttled;
+        }
+    }
+
+    void record_replaceable_old_superseded(
+            WriterQueue& writer)
+    {
+        ++writer.summary.replaceable_old_superseded;
+        ++writer.feedback_window.replaceable_old_superseded;
+        if (WriterQueue::Summary* window = mutable_window_summary(writer))
+        {
+            ++window->replaceable_old_superseded;
         }
     }
 
@@ -1720,12 +1691,12 @@ private:
         return false;
     }
 
-    static bool parse_uint32_property(
+    static bool parse_double_property(
             fastrtps::rtps::RTPSWriter* writer,
             const char* name,
-            uint32_t min,
-            uint32_t max,
-            uint32_t& result)
+            double min,
+            double max,
+            double& result)
     {
         auto property = find_property(writer, name);
         if (nullptr == property)
@@ -1734,10 +1705,10 @@ private:
         }
 
         char* ptr = nullptr;
-        const unsigned long parsed = strtoul(property->c_str(), &ptr, 10);
+        const double parsed = strtod(property->c_str(), &ptr);
         if (property->c_str() != ptr && min <= parsed && parsed <= max)
         {
-            result = static_cast<uint32_t>(parsed);
+            result = parsed;
             return true;
         }
 
@@ -1748,7 +1719,6 @@ private:
     static void apply_value_class_defaults(
             fastrtps::rtps::RTPSWriter* writer,
             int32_t& priority,
-            uint32_t& credit_share_percent,
             ValueClassRank& value_class)
     {
         auto property = find_property(writer, "fastdds.adaptive_retransmission.value_class");
@@ -1760,13 +1730,11 @@ private:
         if ("important" == *property)
         {
             priority = -10;
-            credit_share_percent = 50;
             value_class = ValueClassRank::IMPORTANT;
         }
         else if ("replaceable_snapshot" == *property)
         {
             priority = 10;
-            credit_share_percent = 20;
             value_class = ValueClassRank::REPLACEABLE_SNAPSHOT;
         }
     }
@@ -1785,21 +1753,6 @@ private:
         }
     }
 
-    static const char* selection_path_name(
-            SelectionPath selection_path)
-    {
-        switch (selection_path)
-        {
-            case SelectionPath::CREDIT:
-                return "credit";
-            case SelectionPath::BORROW:
-                return "borrow";
-            case SelectionPath::UTILITY:
-            default:
-                return "utility";
-        }
-    }
-
     static uint32_t size_to_check(
             fastrtps::rtps::CacheChange_t* change)
     {
@@ -1811,44 +1764,11 @@ private:
         return size;
     }
 
-    uint32_t credit_cap_bytes() const
-    {
-        return 0 == bandwidth_limit_ ? (std::numeric_limits<uint32_t>::max)() : bandwidth_limit_;
-    }
-
-    uint32_t borrow_limit_bytes(
-            const WriterQueue& writer,
-            bool sample_is_old,
-            uint32_t sample_size) const
-    {
-        if (0 == bandwidth_limit_)
-        {
-            return (std::numeric_limits<uint32_t>::max)();
-        }
-        if (sample_size > credit_cap_bytes())
-        {
-            return sample_size;
-        }
-
-        switch (writer.value_class)
-        {
-            case ValueClassRank::IMPORTANT:
-                return credit_cap_bytes();
-            case ValueClassRank::DEFAULT_VALUE:
-                return std::max<uint32_t>(sample_size, credit_cap_bytes() / 2u);
-            case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                return sample_is_old ? 0u : std::max<uint32_t>(sample_size, credit_cap_bytes() / 3u);
-            default:
-                return 0u;
-        }
-    }
-
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     void trace_selection(
             fastrtps::rtps::RTPSWriter* selected_writer,
             fastrtps::rtps::CacheChange_t* selected_change,
             uint32_t selected_size,
-            SelectionPath selection_path,
             bool selected_sample_is_old)
     {
         auto writer = writers_queue_.find(selected_writer);
@@ -1858,24 +1778,31 @@ private:
         }
 
         std::ostringstream detail;
+        const auto now = std::chrono::steady_clock::now();
+        const auto meta_it = writer->second.sample_meta.find(selected_change);
+        const int64_t sample_age_ms = meta_it == writer->second.sample_meta.end() ? 0 :
+                elapsed_ms(meta_it->second.first_seen, now);
+        const int64_t old_sample_age_ms = meta_it == writer->second.sample_meta.end() ||
+                0 == meta_it->second.old_enqueue_count ? 0 : elapsed_ms(meta_it->second.first_old_seen, now);
+        const bool selected_has_newer_change = selected_sample_is_old &&
+                has_newer_change(writer->second, selected_change);
         detail << "scheduler=ADAPTIVE_VALUE_UTILITY"
-               << ";selection=" << selection_path_name(selection_path)
                << ";value_class=" << value_class_name(writer->second.value_class)
                << ";sample_kind=" << (selected_sample_is_old ? "old" : "new")
                << ";priority=" << writer->second.priority
-               << ";credit_share_percent=" << writer->second.credit_share_percent
-               << ";credit_refill_bytes=" << writer->second.credit_refill_bytes
-               << ";credit_bytes_before=" << writer->second.credit_bytes
-               << ";age_credit=" << writer->second.age_credit
-               << ";old_age_credit=" << writer->second.old_age_credit
-               << ";period_selections=" << writer->second.selections_in_period
-               << ";period_borrow_selections=" << writer->second.borrow_selections_in_period
+               << ";age_boost=" << writer->second.age_boost
+               << ";old_age_boost=" << writer->second.old_age_boost
+               << ";sample_age_ms=" << sample_age_ms
+               << ";old_sample_age_ms=" << old_sample_age_ms
+               << ";has_newer_change=" << selected_has_newer_change
+               << ";hard_max_defer_ms=" << writer->second.hard_max_defer_ms
+               << ";defer_cooldown_ms=" << writer->second.defer_cooldown_ms
+               << ";value_horizon_ms=" << writer->second.value_horizon_ms
                << ";pressure_level=" << pressure_level()
-               << ";borrow_limit_bytes=" << borrow_limit_bytes(
-                   writer->second, selected_sample_is_old, selected_size)
-               << ";borrow_allowed=" << borrow_allowed(writer->second, selected_sample_is_old, selected_size)
+               << ";old_pressure_level=" << old_pressure_level()
                << ";selected_size=" << selected_size
-               << ";bandwidth_limit=" << bandwidth_limit_;
+               << ";utility=" << utility_being_processed_
+               << ";score=" << score_being_processed_;
 
         FASTDDS_TRACE_RETRANSMISSION(
             "ADAPT_ASYNC_SCHEDULER_SELECTED",
@@ -1887,82 +1814,8 @@ private:
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
-    void record_selection_path(
-            WriterQueue& writer,
-            SelectionPath selection_path,
-            bool selected_sample_is_old)
-    {
-        switch (selection_path)
-        {
-            case SelectionPath::CREDIT:
-                if (selected_sample_is_old)
-                {
-                    ++writer.summary.selected_credit_old;
-                    ++writer.feedback_window.selected_credit_old;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_credit_old;
-                    }
-                }
-                else
-                {
-                    ++writer.summary.selected_credit_new;
-                    ++writer.feedback_window.selected_credit_new;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_credit_new;
-                    }
-                }
-                break;
-
-            case SelectionPath::BORROW:
-                if (selected_sample_is_old)
-                {
-                    ++writer.summary.selected_borrow_old;
-                    ++writer.feedback_window.selected_borrow_old;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_borrow_old;
-                    }
-                }
-                else
-                {
-                    ++writer.summary.selected_borrow_new;
-                    ++writer.feedback_window.selected_borrow_new;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_borrow_new;
-                    }
-                }
-                break;
-
-            case SelectionPath::UTILITY:
-            default:
-                if (selected_sample_is_old)
-                {
-                    ++writer.summary.selected_utility_old;
-                    ++writer.feedback_window.selected_utility_old;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_utility_old;
-                    }
-                }
-                else
-                {
-                    ++writer.summary.selected_utility_new;
-                    ++writer.feedback_window.selected_utility_new;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer))
-                    {
-                        ++window->selected_utility_new;
-                    }
-                }
-                break;
-        }
-    }
-
     void record_successful_selection(
             fastrtps::rtps::RTPSWriter* selected_writer,
-            SelectionPath selection_path,
             bool selected_sample_is_old)
     {
         static_cast<void>(selected_sample_is_old);
@@ -1971,7 +1824,24 @@ private:
         {
             if (writer.first == selected_writer)
             {
-                record_selection_path(writer.second, selection_path, selected_sample_is_old);
+                if (selected_sample_is_old)
+                {
+                    ++writer.second.summary.selected_utility_old;
+                    ++writer.second.feedback_window.selected_utility_old;
+                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                    {
+                        ++window->selected_utility_old;
+                    }
+                }
+                else
+                {
+                    ++writer.second.summary.selected_utility_new;
+                    ++writer.second.feedback_window.selected_utility_new;
+                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
+                    {
+                        ++window->selected_utility_new;
+                    }
+                }
                 writer.second.summary.selected_bytes += size_being_processed_;
                 writer.second.feedback_window.selected_bytes += size_being_processed_;
                 if (selected_sample_is_old)
@@ -2007,31 +1877,22 @@ private:
                         window->last_selected_sequence = change_being_processed_->sequenceNumber.to64long();
                     }
                 }
-                writer.second.age_credit = 0;
+                writer.second.age_boost = 0;
                 if (selected_sample_is_old)
                 {
-                    writer.second.old_age_credit = 0;
+                    writer.second.old_age_boost = 0;
                 }
                 else if (nullptr != writer.second.queue.get_next_old_change())
                 {
-                    writer.second.old_age_credit = std::min(max_old_age_credit, writer.second.old_age_credit + 1);
-                }
-                writer.second.selections_in_period = std::min(
-                    (std::numeric_limits<uint32_t>::max)(),
-                    writer.second.selections_in_period + 1);
-                if (SelectionPath::BORROW == selection_path)
-                {
-                    writer.second.borrow_selections_in_period = std::min(
-                        (std::numeric_limits<uint32_t>::max)(),
-                        writer.second.borrow_selections_in_period + 1);
+                    writer.second.old_age_boost = std::min(max_old_age_boost, writer.second.old_age_boost + 1);
                 }
             }
             else if (nullptr != writer.second.queue.get_next_change())
             {
-                writer.second.age_credit = std::min(max_age_credit, writer.second.age_credit + 1);
+                writer.second.age_boost = std::min(max_age_boost, writer.second.age_boost + 1);
                 if (nullptr != writer.second.queue.get_next_old_change())
                 {
-                    writer.second.old_age_credit = std::min(max_old_age_credit, writer.second.old_age_credit + 1);
+                    writer.second.old_age_boost = std::min(max_old_age_boost, writer.second.old_age_boost + 1);
                 }
             }
         }
@@ -2043,18 +1904,10 @@ private:
     {
         summary.new_enqueue /= 2u;
         summary.old_enqueue /= 2u;
-        summary.selected_credit_new /= 2u;
-        summary.selected_credit_old /= 2u;
-        summary.selected_borrow_new /= 2u;
-        summary.selected_borrow_old /= 2u;
-        summary.borrow_denied_new /= 2u;
-        summary.borrow_denied_old /= 2u;
-        summary.replaceable_old_credit_throttled /= 2u;
         summary.replaceable_old_utility_throttled /= 2u;
+        summary.replaceable_old_superseded /= 2u;
         summary.selected_utility_new /= 2u;
         summary.selected_utility_old /= 2u;
-        summary.refill_pending /= 2u;
-        summary.refill_idle /= 2u;
         summary.selected_bytes /= 2u;
         summary.selected_new_bytes /= 2u;
         summary.selected_old_bytes /= 2u;
@@ -2094,31 +1947,19 @@ private:
                << ";writer_guid=" << writer->getGuid()
                << ";value_class=" << value_class_name(queue.value_class)
                << ";priority=" << queue.priority
-               << ";bandwidth_limit=" << bandwidth_limit_
-               << ";credit_share_percent=" << queue.credit_share_percent
-               << ";credit_refill_bytes=" << queue.credit_refill_bytes
                << ";new_enqueue=" << queue.summary.new_enqueue
                << ";old_enqueue=" << queue.summary.old_enqueue
-               << ";selected_credit_new=" << queue.summary.selected_credit_new
-               << ";selected_credit_old=" << queue.summary.selected_credit_old
-               << ";selected_borrow_new=" << queue.summary.selected_borrow_new
-               << ";selected_borrow_old=" << queue.summary.selected_borrow_old
                << ";selected_utility_new=" << queue.summary.selected_utility_new
                << ";selected_utility_old=" << queue.summary.selected_utility_old
-               << ";borrow_denied_new=" << queue.summary.borrow_denied_new
-               << ";borrow_denied_old=" << queue.summary.borrow_denied_old
-               << ";replaceable_old_credit_throttled=" << queue.summary.replaceable_old_credit_throttled
                << ";replaceable_old_utility_throttled=" << queue.summary.replaceable_old_utility_throttled
-               << ";refill_pending=" << queue.summary.refill_pending
-               << ";refill_idle=" << queue.summary.refill_idle
+               << ";replaceable_old_superseded=" << queue.summary.replaceable_old_superseded
                << ";selected_bytes=" << queue.summary.selected_bytes
                << ";selected_new_bytes=" << queue.summary.selected_new_bytes
                << ";selected_old_bytes=" << queue.summary.selected_old_bytes
                << ";last_new_enqueue_sequence=" << queue.summary.last_new_enqueue_sequence
                << ";last_old_enqueue_sequence=" << queue.summary.last_old_enqueue_sequence
                << ";last_selected_sequence=" << queue.summary.last_selected_sequence
-               << ";final_credit_bytes=" << queue.credit_bytes
-               << ";old_age_credit=" << queue.old_age_credit
+               << ";old_age_boost=" << queue.old_age_boost
                << '\n';
 
         const uint64_t window_ms = adaptive_summary_window_ms();
@@ -2129,26 +1970,15 @@ private:
                    << ";writer_guid=" << writer->getGuid()
                    << ";value_class=" << value_class_name(queue.value_class)
                    << ";priority=" << queue.priority
-                   << ";bandwidth_limit=" << bandwidth_limit_
-                   << ";credit_share_percent=" << queue.credit_share_percent
-                   << ";credit_refill_bytes=" << queue.credit_refill_bytes
                    << ";window_index=" << item.first
                    << ";window_start_ms=" << item.first * window_ms
                    << ";window_end_ms=" << (item.first + 1) * window_ms
                    << ";new_enqueue=" << summary.new_enqueue
                    << ";old_enqueue=" << summary.old_enqueue
-                   << ";selected_credit_new=" << summary.selected_credit_new
-                   << ";selected_credit_old=" << summary.selected_credit_old
-                   << ";selected_borrow_new=" << summary.selected_borrow_new
-                   << ";selected_borrow_old=" << summary.selected_borrow_old
                    << ";selected_utility_new=" << summary.selected_utility_new
                    << ";selected_utility_old=" << summary.selected_utility_old
-                   << ";borrow_denied_new=" << summary.borrow_denied_new
-                   << ";borrow_denied_old=" << summary.borrow_denied_old
-                   << ";replaceable_old_credit_throttled=" << summary.replaceable_old_credit_throttled
                    << ";replaceable_old_utility_throttled=" << summary.replaceable_old_utility_throttled
-                   << ";refill_pending=" << summary.refill_pending
-                   << ";refill_idle=" << summary.refill_idle
+                   << ";replaceable_old_superseded=" << summary.replaceable_old_superseded
                    << ";selected_bytes=" << summary.selected_bytes
                    << ";selected_new_bytes=" << summary.selected_new_bytes
                    << ";selected_old_bytes=" << summary.selected_old_bytes
@@ -2163,15 +1993,15 @@ private:
 
     std::map<int32_t, std::vector<fastrtps::rtps::RTPSWriter*>> priorities_;
 
-    uint32_t bandwidth_limit_ = 0;
-
     fastrtps::rtps::RTPSWriter* writer_being_processed_ = nullptr;
 
     fastrtps::rtps::CacheChange_t* change_being_processed_ = nullptr;
 
     uint32_t size_being_processed_ = 0;
 
-    SelectionPath selection_path_being_processed_ = SelectionPath::UTILITY;
+    int32_t utility_being_processed_ = (std::numeric_limits<int32_t>::min)();
+
+    int32_t score_being_processed_ = (std::numeric_limits<int32_t>::min)();
 
     bool selected_sample_is_old_being_processed_ = false;
 
@@ -2522,6 +2352,7 @@ private:
             }
             --async_mode.writers_interested_in_remove;
         }
+        sched.remove_change(change);
     }
 
     /*! This function is used when PublishMode = FlowControllerPureSyncPublishMode.

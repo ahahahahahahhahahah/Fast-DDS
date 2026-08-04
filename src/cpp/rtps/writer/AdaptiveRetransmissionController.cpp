@@ -101,14 +101,8 @@ struct ChangeState
     steady_clock::time_point last_interest;
     steady_clock::time_point defer_cooldown_until;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-    bool async_plan_trace_initialized = false;
-    AdaptiveRetransmissionDecision async_plan_trace_decision =
-            AdaptiveRetransmissionDecision::SEND_NOW;
-    int async_plan_trace_reason = -1;
-    int async_plan_trace_force_class = -1;
-    bool async_plan_trace_would_gap = false;
-    bool async_admission_trace_initialized = false;
-    AdaptiveRetransmissionDecision async_admission_trace_decision =
+    bool admission_trace_initialized = false;
+    AdaptiveRetransmissionDecision admission_trace_decision =
             AdaptiveRetransmissionDecision::SEND_NOW;
 #endif // FASTDDS_RETRANSMISSION_TRACE
 };
@@ -133,15 +127,6 @@ enum class ForceClass
     SOFT,
     NORMAL,
     STRONG
-};
-
-enum class AsyncPlanReason
-{
-    LIGHTWEIGHT_ADMIT,
-    DEFER_COOLDOWN,
-    MAX_DEFER_REACHED,
-    REPLACEABLE_SUPERSEDED_OLD_GATE,
-    SOFT_MAX_DEFER_ADMIT
 };
 
 struct WriterState
@@ -216,16 +201,10 @@ bool sync_admission_enabled(
     return property_is_enabled(writer) && !writer.isAsync();
 }
 
-bool async_admission_enabled(
-        StatefulWriter& writer)
-{
-    return property_is_enabled(writer) && writer.isAsync() && writer.uses_adaptive_value_flow_controller();
-}
-
 bool admission_enabled(
         StatefulWriter& writer)
 {
-    return sync_admission_enabled(writer) || async_admission_enabled(writer);
+    return sync_admission_enabled(writer);
 }
 
 bool async_observe_enabled(
@@ -238,16 +217,12 @@ bool async_observe_enabled(
 bool async_tracking_enabled(
         StatefulWriter& writer)
 {
-    return async_admission_enabled(writer) || async_observe_enabled(writer);
+    return async_observe_enabled(writer);
 }
 
 const char* controller_mode_name(
         StatefulWriter& writer)
 {
-    if (async_admission_enabled(writer))
-    {
-        return "ASYNC_ADMISSION";
-    }
     if (async_observe_enabled(writer))
     {
         return "ASYNC_OBSERVE";
@@ -375,24 +350,6 @@ const char* force_class_name(
             return "soft";
         default:
             return "none";
-    }
-}
-
-const char* async_plan_reason_name(
-        AsyncPlanReason reason)
-{
-    switch (reason)
-    {
-        case AsyncPlanReason::DEFER_COOLDOWN:
-            return "DEFER_COOLDOWN";
-        case AsyncPlanReason::MAX_DEFER_REACHED:
-            return "MAX_DEFER_REACHED";
-        case AsyncPlanReason::REPLACEABLE_SUPERSEDED_OLD_GATE:
-            return "REPLACEABLE_SUPERSEDED_OLD_GATE";
-        case AsyncPlanReason::SOFT_MAX_DEFER_ADMIT:
-            return "SOFT_MAX_DEFER_ADMIT";
-        default:
-            return "LIGHTWEIGHT_ADMIT";
     }
 }
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -741,158 +698,6 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
     double min_cooldown_remaining_ms = 0.0;
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
-    if (async_admission_enabled(*writer))
-    {
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
-            const auto now = steady_clock::now();
-            const double hard_max_defer = hard_max_defer_or(*writer);
-            const double defer_cooldown_ms = defer_cooldown_or(*writer);
-
-            for (const AdmissionCandidate& candidate : candidates)
-            {
-                ChangeState& observed = impl_->changes[candidate.key];
-                const ForceClass candidate_force_class = classify_force(candidate, hard_max_defer);
-                const bool force_due = ForceClass::NORMAL == candidate_force_class ||
-                        ForceClass::STRONG == candidate_force_class;
-                const bool cooldown_active = ForceClass::NONE == candidate_force_class &&
-                        defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class) &&
-                        observed.defer_cooldown_until != steady_clock::time_point() &&
-                        now < observed.defer_cooldown_until;
-                const bool superseded_replaceable = candidate.replaceable && candidate.has_newer_change;
-
-                AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::SEND_NOW;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                AsyncPlanReason plan_reason = AsyncPlanReason::LIGHTWEIGHT_ADMIT;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                if (cooldown_active)
-                {
-                    decision = AdaptiveRetransmissionDecision::DEFER;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    plan_reason = AsyncPlanReason::DEFER_COOLDOWN;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                    ++cooldown_skipped_changes;
-                    cooldown_skipped_bytes += candidate.estimated_bytes;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    const double remaining_ms = std::chrono::duration<double, std::milli>(
-                        observed.defer_cooldown_until - now).count();
-                    if (0.0 == min_cooldown_remaining_ms || remaining_ms < min_cooldown_remaining_ms)
-                    {
-                        min_cooldown_remaining_ms = remaining_ms;
-                    }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-                else if (force_due)
-                {
-                    decision = AdaptiveRetransmissionDecision::FORCE_SEND;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    plan_reason = AsyncPlanReason::MAX_DEFER_REACHED;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-                else if (superseded_replaceable && ForceClass::SOFT != candidate_force_class)
-                {
-                    decision = AdaptiveRetransmissionDecision::DEFER;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    plan_reason = AsyncPlanReason::REPLACEABLE_SUPERSEDED_OLD_GATE;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-                else if (ForceClass::SOFT == candidate_force_class)
-                {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    plan_reason = AsyncPlanReason::SOFT_MAX_DEFER_ADMIT;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-
-                impl_->cycle_plan[candidate.key] = decision;
-                if (AdaptiveRetransmissionDecision::DEFER != decision)
-                {
-                    observed.last_interest = now;
-                    observed.defer_cooldown_until = steady_clock::time_point();
-                }
-                else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
-                {
-                    observed.defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
-                }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                const bool would_gap = candidate.replaceable && candidate.has_newer_change &&
-                        candidate.value_horizon_ms > 0.0 &&
-                        candidate.request_age_ms >= candidate.value_horizon_ms;
-                const bool emit_plan_trace = !observed.async_plan_trace_initialized ||
-                        observed.async_plan_trace_decision != decision ||
-                        observed.async_plan_trace_reason != static_cast<int>(plan_reason) ||
-                        observed.async_plan_trace_force_class != static_cast<int>(candidate_force_class) ||
-                        observed.async_plan_trace_would_gap != would_gap;
-                if (emit_plan_trace)
-                {
-                    std::ostringstream detail;
-                    detail << "policy=ASYNC_LIGHTWEIGHT_OLD_SAMPLE_GATE"
-                           << ";decision=" << (AdaptiveRetransmissionDecision::DEFER == decision ? "DEFER" :
-                            (AdaptiveRetransmissionDecision::FORCE_SEND == decision ? "FORCE_SEND" : "SEND_NOW"))
-                           << ";reason=" << async_plan_reason_name(plan_reason)
-                           << ";trace_transition=1"
-                           << ";request_age_ms=" << candidate.request_age_ms
-                           << ";estimated_bytes=" << candidate.estimated_bytes
-                           << ";cooldown_skipped_changes=" << cooldown_skipped_changes
-                           << ";earliest_requested=" << candidate.earliest_requested
-                           << ";has_newer_change=" << candidate.has_newer_change
-                           << ";important=" << candidate.important
-                           << ";replaceable=" << candidate.replaceable
-                           << ";value_class=" << value_class_name(candidate.value_class)
-                           << ";candidate_force_class=" << force_class_name(candidate_force_class)
-                           << ";value_horizon_ms=" << candidate.value_horizon_ms
-                           << ";would_gap=" << would_gap
-                           << ";hard_max_defer_ms=" << hard_max_defer
-                           << ";defer_cooldown_ms=" << defer_cooldown_ms;
-                    plan_traces.push_back(
-                        PlanTrace
-                        {
-                            candidate.key.path.reader,
-                            candidate.key.sequence,
-                            candidate.estimated_bytes,
-                            detail.str()
-                        });
-                    observed.async_plan_trace_initialized = true;
-                    observed.async_plan_trace_decision = decision;
-                    observed.async_plan_trace_reason = static_cast<int>(plan_reason);
-                    observed.async_plan_trace_force_class = static_cast<int>(candidate_force_class);
-                    observed.async_plan_trace_would_gap = would_gap;
-                }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-        }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        for (const PlanTrace& trace : plan_traces)
-        {
-            FASTDDS_TRACE_RETRANSMISSION(
-                "ADAPT_V2_PLAN_DECISION",
-                writer->getGuid(),
-                trace.reader,
-                trace.sequence,
-                trace.estimated_bytes,
-                trace.detail);
-        }
-        if (cooldown_skipped_changes > 0)
-        {
-            std::ostringstream detail;
-            detail << "skipped_changes=" << cooldown_skipped_changes
-                   << ";skipped_bytes=" << cooldown_skipped_bytes
-                   << ";min_remaining_ms=" << min_cooldown_remaining_ms
-                   << ";policy=ASYNC_LIGHTWEIGHT_OLD_SAMPLE_GATE";
-            FASTDDS_TRACE_RETRANSMISSION(
-                "ADAPT_V2_COOLDOWN_SKIP",
-                writer->getGuid(),
-                GUID_t::unknown(),
-                SequenceNumber_t::unknown(),
-                0,
-                detail.str());
-        }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        return;
-    }
-
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
@@ -1188,12 +993,12 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             ChangeState& observed = impl_->changes[key];
-            emit_trace = !observed.async_admission_trace_initialized ||
-                    observed.async_admission_trace_decision != planned_decision;
+            emit_trace = !observed.admission_trace_initialized ||
+                    observed.admission_trace_decision != planned_decision;
             if (emit_trace)
             {
-                observed.async_admission_trace_initialized = true;
-                observed.async_admission_trace_decision = planned_decision;
+                observed.admission_trace_initialized = true;
+                observed.admission_trace_decision = planned_decision;
             }
         }
         if (emit_trace)
@@ -1212,144 +1017,6 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
         }
 #endif // FASTDDS_RETRANSMISSION_TRACE
         return planned_decision;
-    }
-
-    if (async_admission_enabled(*writer))
-    {
-        const auto now = steady_clock::now();
-        const ReaderKey reader_key {writer->getGuid(), reader_guid};
-        const ChangeKey change_key {reader_key, change.sequenceNumber};
-        AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::SEND_NOW;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        std::string trace_detail;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            ChangeState& observed = impl_->changes[change_key];
-            if (0 == observed.requests)
-            {
-                observed.first_request = now;
-            }
-            if (0 == observed.estimated_bytes)
-            {
-                observed.estimated_bytes = change.serializedPayload.length;
-            }
-
-            AdmissionCandidate candidate;
-            candidate.key = change_key;
-            candidate.estimated_bytes = observed.estimated_bytes;
-            candidate.request_age_ms = std::chrono::duration<double, std::milli>(
-                now - observed.first_request).count();
-            candidate.requests = observed.requests;
-            candidate.has_newer_change = change.sequenceNumber + 1 < writer->next_sequence_number();
-            classify_value(*writer, candidate);
-
-            const double hard_max_defer = hard_max_defer_or(*writer);
-            const double defer_cooldown_ms = defer_cooldown_or(*writer);
-            const ForceClass candidate_force_class = classify_force(candidate, hard_max_defer);
-            const bool force_due = ForceClass::NORMAL == candidate_force_class ||
-                    ForceClass::STRONG == candidate_force_class;
-            const bool cooldown_active = ForceClass::NONE == candidate_force_class &&
-                    defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class) &&
-                    observed.defer_cooldown_until != steady_clock::time_point() &&
-                    now < observed.defer_cooldown_until;
-            const bool superseded_replaceable = candidate.replaceable && candidate.has_newer_change;
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            const char* action = "SEND_NOW";
-            const char* reason = "LIGHTWEIGHT_ADMIT";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            if (cooldown_active)
-            {
-                decision = AdaptiveRetransmissionDecision::DEFER;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                action = "DEFER";
-                reason = "DEFER_COOLDOWN";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-            else if (force_due)
-            {
-                decision = AdaptiveRetransmissionDecision::FORCE_SEND;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                action = "FORCE_SEND";
-                reason = "MAX_DEFER_REACHED";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-            else if (superseded_replaceable && ForceClass::SOFT != candidate_force_class)
-            {
-                decision = AdaptiveRetransmissionDecision::DEFER;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                action = "DEFER";
-                reason = "REPLACEABLE_SUPERSEDED_OLD_GATE";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            else if (ForceClass::SOFT == candidate_force_class)
-            {
-                reason = "SOFT_MAX_DEFER_ADMIT";
-            }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-
-            if (AdaptiveRetransmissionDecision::DEFER != decision)
-            {
-                observed.last_interest = now;
-                observed.defer_cooldown_until = steady_clock::time_point();
-            }
-            else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
-            {
-                observed.defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
-            }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            std::ostringstream detail;
-            detail << "mode=" << controller_mode_name(*writer)
-                   << ";policy=ASYNC_LIGHTWEIGHT_OLD_SAMPLE_GATE"
-                   << ";state=UNPLANNED"
-                   << ";decision=" << action
-                   << ";reason=" << reason
-                   << ";requests=" << observed.requests
-                   << ";age_ms=" << candidate.request_age_ms
-                   << ";estimated_bytes=" << observed.estimated_bytes
-                   << ";has_newer_change=" << candidate.has_newer_change
-                   << ";important=" << candidate.important
-                   << ";replaceable=" << candidate.replaceable
-                   << ";value_class=" << value_class_name(candidate.value_class)
-                   << ";candidate_force_class=" << force_class_name(candidate_force_class)
-                   << ";value_horizon_ms=" << candidate.value_horizon_ms
-                   << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
-                            candidate.value_horizon_ms > 0.0 &&
-                            candidate.request_age_ms >= candidate.value_horizon_ms)
-                   << ";hard_max_defer_ms=" << hard_max_defer
-                   << ";defer_cooldown_ms=" << defer_cooldown_ms;
-            trace_detail = detail.str();
-            if (!observed.async_admission_trace_initialized ||
-                    observed.async_admission_trace_decision != decision)
-            {
-                observed.async_admission_trace_initialized = true;
-                observed.async_admission_trace_decision = decision;
-                trace_detail += ";trace_transition=1";
-            }
-            else
-            {
-                trace_detail.clear();
-            }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        if (!trace_detail.empty())
-        {
-            FASTDDS_TRACE_RETRANSMISSION(
-                "ADAPT_ADMISSION_DECISION",
-                writer->getGuid(),
-                reader_guid,
-                change.sequenceNumber,
-                change.serializedPayload.length,
-                trace_detail);
-        }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-
-        return decision;
     }
 
     const auto now = steady_clock::now();
