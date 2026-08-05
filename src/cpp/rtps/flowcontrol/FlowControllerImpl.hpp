@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <limits>
 
 namespace eprosima {
 namespace fastdds {
@@ -494,6 +495,11 @@ struct FlowControllerFifoSchedule
     {
     }
 
+    void configure(
+            const FlowControllerDescriptor*) const
+    {
+    }
+
     void trigger_bandwidth_limit_reset() const
     {
     }
@@ -647,6 +653,11 @@ struct FlowControllerRoundRobinSchedule
     {
     }
 
+    void configure(
+            const FlowControllerDescriptor*) const
+    {
+    }
+
     void trigger_bandwidth_limit_reset() const
     {
     }
@@ -778,6 +789,11 @@ struct FlowControllerHighPrioritySchedule
 
     void set_bandwith_limitation(
             uint32_t) const
+    {
+    }
+
+    void configure(
+            const FlowControllerDescriptor*) const
     {
     }
 
@@ -998,6 +1014,11 @@ struct FlowControllerPriorityWithReservationSchedule
         bandwidth_limit_ = limit;
     }
 
+    void configure(
+            const FlowControllerDescriptor*) const
+    {
+    }
+
     void trigger_bandwidth_limit_reset()
     {
         for (auto& writer : writers_queue_)
@@ -1042,6 +1063,61 @@ private:
 //! Sample-level adaptive value utility scheduling
 struct FlowControllerAdaptiveValueUtilitySchedule
 {
+    void configure(
+            const FlowControllerDescriptor* descriptor)
+    {
+        budget_configured_ = false;
+        if (nullptr == descriptor)
+        {
+            return;
+        }
+
+        const bool adaptive_budget_configured = descriptor->adaptive_initial_bytes_per_period > 0u ||
+                descriptor->adaptive_min_bytes_per_period > 0u ||
+                descriptor->adaptive_max_bytes_per_period > 0u;
+        if (!adaptive_budget_configured)
+        {
+            logError(RTPS_WRITER,
+                    "ADAPTIVE_VALUE_UTILITY flow controller has no adaptive budget configuration. "
+                    "Set adaptive_min_bytes_per_period, adaptive_initial_bytes_per_period, "
+                    "and adaptive_max_bytes_per_period");
+            return;
+        }
+
+        if (0u == descriptor->adaptive_min_bytes_per_period ||
+                0u == descriptor->adaptive_initial_bytes_per_period ||
+                0u == descriptor->adaptive_max_bytes_per_period ||
+                descriptor->adaptive_min_bytes_per_period > descriptor->adaptive_initial_bytes_per_period ||
+                descriptor->adaptive_initial_bytes_per_period > descriptor->adaptive_max_bytes_per_period)
+        {
+            logError(RTPS_WRITER,
+                    "Invalid ADAPTIVE_VALUE_UTILITY budget range. Expected 0 < min <= initial <= max. "
+                    "Scheduler will not send until the flow controller is configured correctly");
+            return;
+        }
+
+        min_send_budget_bytes_ = descriptor->adaptive_min_bytes_per_period;
+        initial_send_budget_bytes_ = descriptor->adaptive_initial_bytes_per_period;
+        max_send_budget_bytes_ = descriptor->adaptive_max_bytes_per_period;
+
+        const uint32_t recovery_steps = (std::max)(1u, descriptor->adaptive_recovery_steps);
+        recovery_step_bytes_ = (std::max)(1u,
+                        static_cast<uint32_t>((static_cast<uint64_t>(max_send_budget_bytes_ - min_send_budget_bytes_) +
+                        recovery_steps - 1u) / recovery_steps));
+        active_send_load_floor_bytes_ = min_send_budget_bytes_;
+        recovery_probe_interval_windows_ = (std::max)(1u, descriptor->adaptive_recovery_probe_windows);
+        max_oversized_sample_budget_ratio_ = (std::max)(1u,
+                        descriptor->adaptive_oversized_sample_budget_ratio);
+        link_feedback_pressure_ratio_ = (std::max)(101u,
+                        descriptor->adaptive_feedback_slow_ratio_percent) / 100.0;
+        decrease_percent_ = (std::min)(99u, (std::max)(1u, descriptor->adaptive_decrease_percent));
+        control_period_ = std::chrono::milliseconds((std::max<uint64_t>)(1u, descriptor->period_ms));
+
+        current_send_budget_bytes_ = initial_send_budget_bytes_;
+        send_balance_bytes_ = initial_send_budget_bytes_;
+        budget_configured_ = true;
+    }
+
     void register_writer(
             fastrtps::rtps::RTPSWriter* writer)
     {
@@ -1163,6 +1239,12 @@ struct FlowControllerAdaptiveValueUtilitySchedule
 
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
     {
+        if (!budget_configured_)
+        {
+            throttled_waiting_for_budget_ = false;
+            return nullptr;
+        }
+
         refill_send_budget(std::chrono::steady_clock::now());
 
         CandidateView selected;
@@ -1389,16 +1471,7 @@ private:
     static constexpr uint32_t max_age_boost = 20;
     static constexpr uint32_t max_old_age_boost = 35;
     static constexpr uint32_t feedback_decay_interval = 256;
-    static constexpr uint32_t min_send_budget_bytes = 8u * 1024u;
-    static constexpr uint32_t initial_send_budget_bytes = 64u * 1024u;
-    static constexpr uint32_t max_send_budget_bytes = 256u * 1024u;
-    static constexpr uint32_t recovery_step_bytes = 4u * 1024u;
-    static constexpr uint32_t active_send_load_floor_bytes = 8u * 1024u;
-    static constexpr uint32_t recovery_probe_interval_windows = 10u;
-    static constexpr uint32_t max_oversized_sample_budget_ratio = 2u;
     static constexpr uint32_t max_recent_service_penalty = 240u;
-    static constexpr uint32_t repair_growth_tolerance_bytes = 1024u;
-    static constexpr double link_feedback_pressure_ratio = 1.5;
     static constexpr uint32_t default_important_hard_defer_ms = 40u;
     static constexpr uint32_t default_default_hard_defer_ms = 80u;
     static constexpr uint32_t default_replaceable_hard_defer_ms = 200u;
@@ -1640,7 +1713,7 @@ private:
         }
 
         const bool feedback_pressure = pressure.link_feedback_samples >= 3u &&
-                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio;
+                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio_;
         pressure.link_pressure_level = feedback_pressure ? 2 :
                 (pressure.link_outstanding_changes > 0u && pressure.old_repair_level >= 2 ? 1 : 0);
         pressure.aggregate_level = (std::max)(pressure.contention_level,
@@ -1758,10 +1831,10 @@ private:
         return pressure_snapshot().aggregate_level;
     }
 
-    static uint32_t clamp_budget(
-            uint32_t value)
+    uint32_t clamp_budget(
+            uint32_t value) const
     {
-        return (std::max)(min_send_budget_bytes, (std::min)(max_send_budget_bytes, value));
+        return (std::max)(min_send_budget_bytes_, (std::min)(max_send_budget_bytes_, value));
     }
 
     int64_t max_positive_send_balance() const
@@ -1772,7 +1845,12 @@ private:
     uint64_t max_network_admissible_sample_bytes() const
     {
         return static_cast<uint64_t>(std::max<uint32_t>(
-                   1u, current_send_budget_bytes_)) * max_oversized_sample_budget_ratio;
+                   1u, current_send_budget_bytes_)) * max_oversized_sample_budget_ratio_;
+    }
+
+    uint64_t min_link_growth_tolerance_bytes() const
+    {
+        return (std::max<uint64_t>)(1024u, static_cast<uint64_t>(min_send_budget_bytes_) / 8u);
     }
 
     bool network_admissible(
@@ -1811,8 +1889,8 @@ private:
         {
             send_budget_initialized_ = true;
             last_send_budget_refill_ = now;
-            current_send_budget_bytes_ = initial_send_budget_bytes;
-            send_balance_bytes_ = initial_send_budget_bytes;
+            current_send_budget_bytes_ = initial_send_budget_bytes_;
+            send_balance_bytes_ = initial_send_budget_bytes_;
             return;
         }
 
@@ -1874,7 +1952,7 @@ private:
         static_cast<void>(previous_budget);
         static_cast<void>(previous_state);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes;
+        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes_;
         const bool queued_demand = pressure.pending_writers > 0u ||
                 control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
                 pressure.link_outstanding_changes > 0u;
@@ -1889,9 +1967,9 @@ private:
         const bool link_feedback_activity = request_delta > 0u || feedback_delta > 0u;
         const bool feedback_slow = link_feedback_activity &&
                 pressure.link_feedback_samples >= 3u &&
-                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio;
+                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio_;
         const uint64_t repair_tolerance_bytes = (std::max<uint64_t>)(
-            repair_growth_tolerance_bytes,
+            min_link_growth_tolerance_bytes(),
             static_cast<uint64_t>(current_send_budget_bytes_) / 16u);
         const bool nack_growth = request_bytes_delta > feedback_bytes_delta + repair_tolerance_bytes &&
                 pressure.link_outstanding_changes > 0u;
@@ -1900,7 +1978,7 @@ private:
         const bool positive_feedback = !link_negative_signal && active_send_load &&
                 !nack_growth && feedback_bytes_delta > 0u;
         const bool recovery_probe_eligible = !link_negative_signal && queued_demand &&
-                current_send_budget_bytes_ < initial_send_budget_bytes;
+                current_send_budget_bytes_ < initial_send_budget_bytes_;
 
         previous_link_request_samples_ = pressure.link_request_samples;
         previous_link_feedback_samples_ = pressure.link_feedback_samples;
@@ -1912,7 +1990,7 @@ private:
             recovery_probe_windows_ = 0u;
             send_load_state_ = SendLoadState::PRESSURE;
             current_send_budget_bytes_ = clamp_budget(
-                static_cast<uint32_t>((static_cast<uint64_t>(current_send_budget_bytes_) * 3u) / 4u));
+                static_cast<uint32_t>((static_cast<uint64_t>(current_send_budget_bytes_) * decrease_percent_) / 100u));
             send_balance_bytes_ = (std::min)(
                 send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -1934,7 +2012,7 @@ private:
             {
                 send_load_state_ = SendLoadState::NORMAL;
             }
-            current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes);
+            current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("positive", previous_budget, previous_state, pressure,
                     active_send_load, queued_demand, negative_feedback, positive_feedback, false,
@@ -1946,14 +2024,14 @@ private:
         if (recovery_probe_eligible)
         {
             ++recovery_probe_windows_;
-            if (recovery_probe_windows_ >= recovery_probe_interval_windows)
+            if (recovery_probe_windows_ >= recovery_probe_interval_windows_)
             {
                 recovery_probe_windows_ = 0u;
                 send_load_state_ = SendLoadState::RECOVERY;
                 // Ambiguous feedback may recover the conservative starting point only.
                 current_send_budget_bytes_ = (std::min)(
-                    initial_send_budget_bytes,
-                    clamp_budget(current_send_budget_bytes_ + recovery_step_bytes));
+                    initial_send_budget_bytes_,
+                    clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_budget_update("probe_recovery", previous_budget, previous_state, pressure,
                         active_send_load, queued_demand, negative_feedback, positive_feedback, true,
@@ -2165,10 +2243,20 @@ private:
     ControlWindow control_window_;
     SendLoadState send_load_state_ = SendLoadState::NORMAL;
     bool send_budget_initialized_ = false;
+    bool budget_configured_ = false;
     bool throttled_waiting_for_budget_ = false;
     uint32_t recovery_probe_windows_ = 0u;
-    uint32_t current_send_budget_bytes_ = initial_send_budget_bytes;
-    int64_t send_balance_bytes_ = initial_send_budget_bytes;
+    uint32_t min_send_budget_bytes_ = 8u * 1024u;
+    uint32_t initial_send_budget_bytes_ = 64u * 1024u;
+    uint32_t max_send_budget_bytes_ = 256u * 1024u;
+    uint32_t current_send_budget_bytes_ = initial_send_budget_bytes_;
+    uint32_t recovery_step_bytes_ = 16u * 1024u;
+    uint32_t active_send_load_floor_bytes_ = min_send_budget_bytes_;
+    uint32_t recovery_probe_interval_windows_ = 10u;
+    uint32_t max_oversized_sample_budget_ratio_ = 2u;
+    uint32_t decrease_percent_ = 75u;
+    double link_feedback_pressure_ratio_ = 1.5;
+    int64_t send_balance_bytes_ = initial_send_budget_bytes_;
     uint64_t balance_refill_remainder_ = 0;
     uint64_t previous_link_request_samples_ = 0;
     uint64_t previous_link_feedback_samples_ = 0;
@@ -2469,7 +2557,7 @@ private:
                << ";nack_growth=" << nack_growth
                << ";recovery_probe=" << recovery_probe
                << ";recovery_probe_windows=" << recovery_probe_windows_
-               << ";recovery_probe_interval_windows=" << recovery_probe_interval_windows
+               << ";recovery_probe_interval_windows=" << recovery_probe_interval_windows_
                << ";request_delta=" << request_delta
                << ";feedback_delta=" << feedback_delta
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
@@ -2672,6 +2760,7 @@ public:
         {
             sched.set_bandwith_limitation(limitation);
         }
+        sched.configure(descriptor);
     }
 
     virtual ~FlowControllerImpl() noexcept

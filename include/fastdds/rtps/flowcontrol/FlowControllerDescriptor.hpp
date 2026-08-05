@@ -51,6 +51,34 @@ struct FlowControllerDescriptor
     //! Period of time on which the flow controller is allowed to send max_bytes_per_period.
     //! Default value: 100ms.
     uint64_t period_ms = 100;
+
+    //! Initial adaptive value scheduler budget in bytes per period.
+    //! Required for ADAPTIVE_VALUE_UTILITY flow controllers.
+    uint32_t adaptive_initial_bytes_per_period = 0;
+
+    //! Minimum adaptive value scheduler budget in bytes per period.
+    //! Required for ADAPTIVE_VALUE_UTILITY flow controllers.
+    uint32_t adaptive_min_bytes_per_period = 0;
+
+    //! Maximum adaptive value scheduler budget in bytes per period.
+    //! Required for ADAPTIVE_VALUE_UTILITY flow controllers.
+    uint32_t adaptive_max_bytes_per_period = 0;
+
+    //! Number of additive recovery steps from the configured minimum to maximum.
+    //! The actual recovery step is derived from this range.
+    uint32_t adaptive_recovery_steps = 16;
+
+    //! Number of control windows between ambiguous-feedback recovery probes.
+    uint32_t adaptive_recovery_probe_windows = 10;
+
+    //! Slow-feedback ratio in percent. 150 means 1.5x the stable baseline.
+    uint32_t adaptive_feedback_slow_ratio_percent = 150;
+
+    //! Multiplicative decrease factor in percent. 75 means budget *= 0.75.
+    uint32_t adaptive_decrease_percent = 75;
+
+    //! Maximum sample-size to current-budget ratio for an oversized send.
+    uint32_t adaptive_oversized_sample_budget_ratio = 2;
 };
 
 } // namespace rtps

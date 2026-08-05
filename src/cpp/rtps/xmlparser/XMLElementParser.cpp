@@ -787,6 +787,14 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
                     <xs:element name="scheduler" type="flowControllerSchedulerPolicy" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="max_bytes_per_period" type="int32" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="period_ms" type="uint64" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_initial_bytes_per_period" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_min_bytes_per_period" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_max_bytes_per_period" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_recovery_steps" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_recovery_probe_windows" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_feedback_slow_ratio_percent" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_decrease_percent" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_oversized_sample_budget_ratio" type="uint32" minOccurs="0" maxOccurs="1"/>
                 </xs:all>
             </xs:complexType>
             <xs:simpleType name="flowControllerSchedulerPolicy">
@@ -874,7 +882,73 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
             else if (strcmp(name, PERIOD_MS) == 0)
             {
                 // period_ms - uint64Type
-                if (XMLP_ret::XML_OK != getXMLUint(p_aux1, (uint16_t*)&flow_controller_descriptor->period_ms, ident))
+                unsigned int period_ms = 0u;
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1, &period_ms, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+                flow_controller_descriptor->period_ms = period_ms;
+            }
+            else if (strcmp(name, ADAPTIVE_INITIAL_BYTES_PER_PERIOD) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_initial_bytes_per_period, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_MIN_BYTES_PER_PERIOD) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_min_bytes_per_period, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_MAX_BYTES_PER_PERIOD) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_max_bytes_per_period, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_RECOVERY_STEPS) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_recovery_steps, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_RECOVERY_PROBE_WINDOWS) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_recovery_probe_windows, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_FEEDBACK_SLOW_RATIO_PERCENT) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_feedback_slow_ratio_percent, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_DECREASE_PERCENT) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_decrease_percent, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_OVERSIZED_SAMPLE_BUDGET_RATIO) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_oversized_sample_budget_ratio, ident))
                 {
                     return XMLP_ret::XML_ERROR;
                 }
