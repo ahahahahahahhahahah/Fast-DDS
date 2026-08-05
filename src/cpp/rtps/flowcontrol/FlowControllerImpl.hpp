@@ -1104,12 +1104,13 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         recovery_step_bytes_ = (std::max)(1u,
                         static_cast<uint32_t>((static_cast<uint64_t>(max_send_budget_bytes_ - min_send_budget_bytes_) +
                         recovery_steps - 1u) / recovery_steps));
-        active_send_load_floor_bytes_ = min_send_budget_bytes_;
         recovery_probe_interval_windows_ = (std::max)(1u, descriptor->adaptive_recovery_probe_windows);
         max_oversized_sample_budget_ratio_ = (std::max)(1u,
                         descriptor->adaptive_oversized_sample_budget_ratio);
         link_feedback_pressure_ratio_ = (std::max)(101u,
                         descriptor->adaptive_feedback_slow_ratio_percent) / 100.0;
+        feedback_active_load_percent_ = (std::min)(100u,
+                        (std::max)(1u, descriptor->adaptive_feedback_active_load_percent));
         decrease_percent_ = (std::min)(99u, (std::max)(1u, descriptor->adaptive_decrease_percent));
         control_period_ = std::chrono::milliseconds((std::max<uint64_t>)(1u, descriptor->period_ms));
 
@@ -1853,6 +1854,13 @@ private:
         return (std::max<uint64_t>)(1024u, static_cast<uint64_t>(min_send_budget_bytes_) / 8u);
     }
 
+    uint64_t active_send_load_floor_bytes() const
+    {
+        return (std::max<uint64_t>)(1u,
+                       (static_cast<uint64_t>(current_send_budget_bytes_) * feedback_active_load_percent_ + 99u) /
+                       100u);
+    }
+
     bool network_admissible(
             uint32_t sample_size) const
     {
@@ -1952,7 +1960,7 @@ private:
         static_cast<void>(previous_budget);
         static_cast<void>(previous_state);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes_;
+        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes();
         const bool queued_demand = pressure.pending_writers > 0u ||
                 control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
                 pressure.link_outstanding_changes > 0u;
@@ -2251,9 +2259,9 @@ private:
     uint32_t max_send_budget_bytes_ = 256u * 1024u;
     uint32_t current_send_budget_bytes_ = initial_send_budget_bytes_;
     uint32_t recovery_step_bytes_ = 16u * 1024u;
-    uint32_t active_send_load_floor_bytes_ = min_send_budget_bytes_;
     uint32_t recovery_probe_interval_windows_ = 10u;
     uint32_t max_oversized_sample_budget_ratio_ = 2u;
+    uint32_t feedback_active_load_percent_ = 50u;
     uint32_t decrease_percent_ = 75u;
     double link_feedback_pressure_ratio_ = 1.5;
     int64_t send_balance_bytes_ = initial_send_budget_bytes_;
@@ -2548,6 +2556,8 @@ private:
                << ";previous_send_budget_bytes=" << previous_budget
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
+               << ";feedback_active_load_percent=" << feedback_active_load_percent_
+               << ";active_send_load_floor_bytes=" << active_send_load_floor_bytes()
                << ";active_send_load=" << active_send_load
                << ";queued_demand=" << queued_demand
                << ";negative_feedback=" << negative_feedback

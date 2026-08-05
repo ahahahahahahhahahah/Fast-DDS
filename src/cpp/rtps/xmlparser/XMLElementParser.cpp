@@ -793,6 +793,7 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
                     <xs:element name="adaptive_recovery_steps" type="uint32" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="adaptive_recovery_probe_windows" type="uint32" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="adaptive_feedback_slow_ratio_percent" type="uint32" minOccurs="0" maxOccurs="1"/>
+                    <xs:element name="adaptive_feedback_active_load_percent" type="uint32" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="adaptive_decrease_percent" type="uint32" minOccurs="0" maxOccurs="1"/>
                     <xs:element name="adaptive_oversized_sample_budget_ratio" type="uint32" minOccurs="0" maxOccurs="1"/>
                 </xs:all>
@@ -933,6 +934,14 @@ XMLP_ret XMLParser::getXMLFlowControllerDescriptorList(
             {
                 if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
                         &flow_controller_descriptor->adaptive_feedback_slow_ratio_percent, ident))
+                {
+                    return XMLP_ret::XML_ERROR;
+                }
+            }
+            else if (strcmp(name, ADAPTIVE_FEEDBACK_ACTIVE_LOAD_PERCENT) == 0)
+            {
+                if (XMLP_ret::XML_OK != getXMLUint(p_aux1,
+                        &flow_controller_descriptor->adaptive_feedback_active_load_percent, ident))
                 {
                     return XMLP_ret::XML_ERROR;
                 }

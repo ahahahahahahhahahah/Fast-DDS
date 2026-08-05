@@ -255,6 +255,7 @@ const char* ADAPTIVE_MAX_BYTES_PER_PERIOD = "adaptive_max_bytes_per_period";
 const char* ADAPTIVE_RECOVERY_STEPS = "adaptive_recovery_steps";
 const char* ADAPTIVE_RECOVERY_PROBE_WINDOWS = "adaptive_recovery_probe_windows";
 const char* ADAPTIVE_FEEDBACK_SLOW_RATIO_PERCENT = "adaptive_feedback_slow_ratio_percent";
+const char* ADAPTIVE_FEEDBACK_ACTIVE_LOAD_PERCENT = "adaptive_feedback_active_load_percent";
 const char* ADAPTIVE_DECREASE_PERCENT = "adaptive_decrease_percent";
 const char* ADAPTIVE_OVERSIZED_SAMPLE_BUDGET_RATIO = "adaptive_oversized_sample_budget_ratio";
 const char* FLOW_CONTROLLER_NAME = "flow_controller_name";

@@ -18,6 +18,7 @@
                         <adaptive_recovery_steps>14</adaptive_recovery_steps>
                         <adaptive_recovery_probe_windows>10</adaptive_recovery_probe_windows>
                         <adaptive_feedback_slow_ratio_percent>150</adaptive_feedback_slow_ratio_percent>
+                        <adaptive_feedback_active_load_percent>50</adaptive_feedback_active_load_percent>
                         <adaptive_decrease_percent>75</adaptive_decrease_percent>
                         <adaptive_oversized_sample_budget_ratio>2</adaptive_oversized_sample_budget_ratio>
                     </flow_controller_descriptor>
