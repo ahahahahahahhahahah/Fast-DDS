@@ -1438,6 +1438,7 @@ private:
     WriterQueue::Summary* mutable_window_summary(
             WriterQueue& queue)
     {
+        static_cast<void>(queue);
         if (!adaptive_summary_enabled())
         {
             return nullptr;
@@ -1449,7 +1450,10 @@ private:
             return nullptr;
         }
 
-        return &queue.window_summary[current_window_index(window_ms)];
+        // Per-window summaries were only a diagnostic aid. Updating this map from
+        // both publish and async-send paths is not safe without a wider scheduler
+        // lock, so keep the aggregate summary only and rely on trace for windows.
+        return nullptr;
     }
 
     void touch_sample(
