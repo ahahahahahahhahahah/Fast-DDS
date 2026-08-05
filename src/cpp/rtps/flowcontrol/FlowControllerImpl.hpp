@@ -1109,6 +1109,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
                         descriptor->adaptive_oversized_sample_budget_ratio);
         link_feedback_pressure_ratio_ = (std::max)(101u,
                         descriptor->adaptive_feedback_slow_ratio_percent) / 100.0;
+        feedback_slow_window_threshold_ = (std::max)(1u, descriptor->adaptive_feedback_slow_windows);
         feedback_active_load_percent_ = (std::min)(100u,
                         (std::max)(1u, descriptor->adaptive_feedback_active_load_percent));
         decrease_percent_ = (std::min)(99u, (std::max)(1u, descriptor->adaptive_decrease_percent));
@@ -1985,13 +1986,22 @@ private:
             static_cast<uint64_t>(current_send_budget_bytes_) / 16u);
         const bool nack_growth = request_bytes_delta > feedback_bytes_delta + repair_tolerance_bytes &&
                 pressure.link_outstanding_changes > 0u;
-        const bool link_negative_signal = feedback_slow || nack_growth;
+        if (feedback_slow)
+        {
+            feedback_slow_windows_ = std::min(feedback_slow_window_threshold_, feedback_slow_windows_ + 1u);
+        }
+        else
+        {
+            feedback_slow_windows_ = 0u;
+        }
+        const bool sustained_feedback_slow = feedback_slow_windows_ >= feedback_slow_window_threshold_;
+        const bool link_negative_signal = nack_growth || sustained_feedback_slow;
         const bool negative_feedback_activity = control_window_.selected_bytes > 0u || link_feedback_activity ||
                 request_bytes_delta > 0u;
         const bool negative_feedback = negative_feedback_activity && link_negative_signal;
-        const bool positive_feedback = !link_negative_signal && recovery_active_send_load &&
-                !nack_growth && feedback_bytes_delta > 0u;
-        const bool recovery_probe_eligible = !link_negative_signal && queued_demand &&
+        const bool positive_feedback = !nack_growth && !feedback_slow && recovery_active_send_load &&
+                feedback_bytes_delta > 0u;
+        const bool recovery_probe_eligible = !nack_growth && !feedback_slow && queued_demand &&
                 current_send_budget_bytes_ < initial_send_budget_bytes_;
 
         previous_link_request_samples_ = pressure.link_request_samples;
@@ -2271,6 +2281,8 @@ private:
     uint32_t recovery_step_bytes_ = 16u * 1024u;
     uint32_t recovery_probe_interval_windows_ = 10u;
     uint32_t max_oversized_sample_budget_ratio_ = 2u;
+    uint32_t feedback_slow_windows_ = 0u;
+    uint32_t feedback_slow_window_threshold_ = 2u;
     uint32_t feedback_active_load_percent_ = 50u;
     uint32_t decrease_percent_ = 75u;
     double link_feedback_pressure_ratio_ = 1.5;
@@ -2576,6 +2588,8 @@ private:
                << ";positive_feedback=" << positive_feedback
                << ";link_negative_signal=" << link_negative_signal
                << ";feedback_slow=" << feedback_slow
+               << ";feedback_slow_windows=" << feedback_slow_windows_
+               << ";feedback_slow_window_threshold=" << feedback_slow_window_threshold_
                << ";nack_growth=" << nack_growth
                << ";recovery_probe=" << recovery_probe
                << ";recovery_probe_windows=" << recovery_probe_windows_

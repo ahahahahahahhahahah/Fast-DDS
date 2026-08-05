@@ -74,7 +74,10 @@ struct FlowControllerDescriptor
     //! Slow-feedback ratio in percent. 150 means 1.5x the stable baseline.
     uint32_t adaptive_feedback_slow_ratio_percent = 150;
 
-    //! Minimum current-budget utilization in percent before link feedback can decrease the budget.
+    //! Consecutive slow-feedback windows required before decreasing budget.
+    uint32_t adaptive_feedback_slow_windows = 2;
+
+    //! Minimum current-budget utilization in percent before positive feedback can increase the budget.
     uint32_t adaptive_feedback_active_load_percent = 50;
 
     //! Multiplicative decrease factor in percent. 75 means budget *= 0.75.
