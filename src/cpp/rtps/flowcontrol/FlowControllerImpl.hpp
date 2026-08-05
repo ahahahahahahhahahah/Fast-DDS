@@ -1823,8 +1823,12 @@ private:
             uint32_t sample_size,
             const PressureSnapshot& pressure) const
     {
-        const uint32_t cost_units = std::max<uint32_t>(1u, (sample_size + 255u) / 256u);
-        return static_cast<int32_t>(std::min<uint32_t>(240u, cost_units * pressure.send_load_level));
+        const uint64_t budget = (std::max<uint64_t>)(1u, current_send_budget_bytes_);
+        const uint32_t budget_percent = static_cast<uint32_t>(
+            (static_cast<uint64_t>(sample_size) * 100u + budget - 1u) / budget);
+        return static_cast<int32_t>(std::min<uint32_t>(
+            240u,
+            (std::max)(1u, budget_percent) * static_cast<uint32_t>(pressure.send_load_level)));
     }
 
     int32_t pressure_level() const
@@ -1960,7 +1964,7 @@ private:
         static_cast<void>(previous_budget);
         static_cast<void>(previous_state);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes();
+        const bool recovery_active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes();
         const bool queued_demand = pressure.pending_writers > 0u ||
                 control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
                 pressure.link_outstanding_changes > 0u;
@@ -1982,8 +1986,10 @@ private:
         const bool nack_growth = request_bytes_delta > feedback_bytes_delta + repair_tolerance_bytes &&
                 pressure.link_outstanding_changes > 0u;
         const bool link_negative_signal = feedback_slow || nack_growth;
-        const bool negative_feedback = active_send_load && link_negative_signal;
-        const bool positive_feedback = !link_negative_signal && active_send_load &&
+        const bool negative_feedback_activity = control_window_.selected_bytes > 0u || link_feedback_activity ||
+                request_bytes_delta > 0u;
+        const bool negative_feedback = negative_feedback_activity && link_negative_signal;
+        const bool positive_feedback = !link_negative_signal && recovery_active_send_load &&
                 !nack_growth && feedback_bytes_delta > 0u;
         const bool recovery_probe_eligible = !link_negative_signal && queued_demand &&
                 current_send_budget_bytes_ < initial_send_budget_bytes_;
@@ -2003,7 +2009,8 @@ private:
                 send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("negative", previous_budget, previous_state, pressure,
-                    active_send_load, queued_demand, negative_feedback, positive_feedback, false,
+                    recovery_active_send_load, negative_feedback_activity, queued_demand,
+                    negative_feedback, positive_feedback, false,
                     request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
@@ -2023,7 +2030,8 @@ private:
             current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("positive", previous_budget, previous_state, pressure,
-                    active_send_load, queued_demand, negative_feedback, positive_feedback, false,
+                    recovery_active_send_load, negative_feedback_activity, queued_demand,
+                    negative_feedback, positive_feedback, false,
                     request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
@@ -2042,7 +2050,8 @@ private:
                     clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_budget_update("probe_recovery", previous_budget, previous_state, pressure,
-                        active_send_load, queued_demand, negative_feedback, positive_feedback, true,
+                        recovery_active_send_load, negative_feedback_activity, queued_demand,
+                        negative_feedback, positive_feedback, true,
                         request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
                 return;
@@ -2055,11 +2064,12 @@ private:
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         trace_budget_update(
-            active_send_load ? "hold_ambiguous" : (queued_demand ? "hold_backlogged" : "hold_low_load"),
+            recovery_active_send_load ? "hold_ambiguous" : (queued_demand ? "hold_backlogged" : "hold_low_load"),
             previous_budget,
             previous_state,
             pressure,
-            active_send_load,
+            recovery_active_send_load,
+            negative_feedback_activity,
             queued_demand,
             negative_feedback,
             positive_feedback,
@@ -2537,7 +2547,8 @@ private:
             uint32_t previous_budget,
             SendLoadState previous_state,
             const PressureSnapshot& pressure,
-            bool active_send_load,
+            bool recovery_active_send_load,
+            bool negative_feedback_activity,
             bool queued_demand,
             bool negative_feedback,
             bool positive_feedback,
@@ -2558,7 +2569,8 @@ private:
                << ";send_balance_bytes=" << send_balance_bytes_
                << ";feedback_active_load_percent=" << feedback_active_load_percent_
                << ";active_send_load_floor_bytes=" << active_send_load_floor_bytes()
-               << ";active_send_load=" << active_send_load
+               << ";recovery_active_send_load=" << recovery_active_send_load
+               << ";negative_feedback_activity=" << negative_feedback_activity
                << ";queued_demand=" << queued_demand
                << ";negative_feedback=" << negative_feedback
                << ";positive_feedback=" << positive_feedback
