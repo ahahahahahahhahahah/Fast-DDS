@@ -1200,7 +1200,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
 
     bool requires_periodic_wakeup() const
     {
-        return true;
+        return throttled_waiting_for_budget_;
     }
 
     std::chrono::microseconds periodic_wait_duration() const
@@ -1210,7 +1210,9 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             return std::chrono::microseconds::zero();
         }
 
-        if (send_balance_bytes_ > 0)
+        const int64_t required_balance = throttled_waiting_for_budget_ ?
+                required_send_balance(waiting_sample_size_bytes_) : 1;
+        if (send_balance_bytes_ >= required_balance)
         {
             return std::chrono::microseconds::zero();
         }
@@ -1218,8 +1220,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         const uint64_t period_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
         const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t debt = static_cast<uint64_t>(1 - send_balance_bytes_);
-        const uint64_t wait_us = (debt * period_us + budget - 1u) / budget;
+        const uint64_t required_credit = static_cast<uint64_t>(required_balance - send_balance_bytes_);
+        const uint64_t wait_us = (required_credit * period_us + budget - 1u) / budget;
         return std::chrono::microseconds(static_cast<int64_t>(wait_us));
     }
 
@@ -1382,7 +1384,8 @@ private:
     static constexpr uint32_t initial_send_budget_bytes = 64u * 1024u;
     static constexpr uint32_t max_send_budget_bytes = 256u * 1024u;
     static constexpr uint32_t recovery_step_bytes = 4u * 1024u;
-    static constexpr uint32_t meaningful_load_floor_bytes = 8u * 1024u;
+    static constexpr uint32_t active_send_load_floor_bytes = 8u * 1024u;
+    static constexpr uint32_t recovery_probe_interval_windows = 10u;
     static constexpr uint32_t repair_growth_tolerance = 1u;
     static constexpr double link_feedback_pressure_ratio = 1.5;
     static bool adaptive_summary_enabled()
@@ -1711,11 +1714,17 @@ private:
         return static_cast<int64_t>(current_send_budget_bytes_);
     }
 
+    int64_t required_send_balance(
+            uint32_t sample_size) const
+    {
+        const uint32_t charge = (std::max)(1u, sample_size);
+        return static_cast<int64_t>((std::min)(charge, (std::max)(1u, current_send_budget_bytes_)));
+    }
+
     bool can_send_with_balance(
             uint32_t sample_size) const
     {
-        static_cast<void>(sample_size);
-        return send_balance_bytes_ > 0;
+        return send_balance_bytes_ >= required_send_balance(sample_size);
     }
 
     void record_send_budget_success(
@@ -1808,8 +1817,11 @@ private:
         static_cast<void>(previous_budget);
         static_cast<void>(previous_state);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-        const bool meaningful_offered_load = control_window_.selected_bytes >= meaningful_load_floor_bytes ||
+        const bool active_send_load = control_window_.selected_bytes >= active_send_load_floor_bytes ||
                 control_window_.throttled > 0u || send_balance_bytes_ < 0;
+        const bool queued_demand = pressure.pending_writers > 0u ||
+                control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
+                pressure.link_outstanding_changes > 0u;
         const uint64_t request_delta = pressure.link_request_samples > previous_link_request_samples_ ?
                 pressure.link_request_samples - previous_link_request_samples_ : 0u;
         const uint64_t feedback_delta = pressure.link_feedback_samples > previous_link_feedback_samples_ ?
@@ -1823,34 +1835,36 @@ private:
         const bool repair_growth = control_window_.old_enqueue + control_window_.superseded >
                 control_window_.selected_old + repair_growth_tolerance;
         const bool repair_excess_growth = pressure.old_excess > previous_old_excess_ + repair_growth_tolerance;
-        const bool negative_feedback = meaningful_offered_load &&
-                (feedback_slow || nack_growth || repair_growth || repair_excess_growth);
-
-        const bool repair_converging = previous_old_excess_ > pressure.old_excess + repair_growth_tolerance ||
-                (previous_link_outstanding_changes_ > pressure.link_outstanding_changes &&
-                feedback_delta > 0u);
-        const bool positive_feedback = !negative_feedback && meaningful_offered_load && !feedback_slow &&
-                !nack_growth && feedback_delta > 0u && (0u == pressure.old_excess || repair_converging);
+        const bool negative_signal = feedback_slow || nack_growth || repair_growth || repair_excess_growth;
+        const bool negative_feedback = active_send_load && negative_signal;
+        const bool positive_feedback = !negative_feedback && active_send_load && !feedback_slow &&
+                !nack_growth && feedback_delta > 0u;
+        const bool recovery_probe_eligible = !negative_signal && queued_demand &&
+                current_send_budget_bytes_ < initial_send_budget_bytes;
 
         previous_link_request_samples_ = pressure.link_request_samples;
         previous_link_feedback_samples_ = pressure.link_feedback_samples;
-        previous_link_outstanding_changes_ = pressure.link_outstanding_changes;
         previous_old_excess_ = pressure.old_excess;
 
         if (negative_feedback)
         {
+            recovery_probe_windows_ = 0u;
             send_load_state_ = SendLoadState::PRESSURE;
             current_send_budget_bytes_ = clamp_budget(
                 static_cast<uint32_t>((static_cast<uint64_t>(current_send_budget_bytes_) * 3u) / 4u));
+            send_balance_bytes_ = (std::min)(
+                send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("negative", previous_budget, previous_state, pressure,
-                    meaningful_offered_load, negative_feedback, positive_feedback, request_delta, feedback_delta);
+                    active_send_load, queued_demand, negative_feedback, positive_feedback, false,
+                    request_delta, feedback_delta);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
 
         if (positive_feedback)
         {
+            recovery_probe_windows_ = 0u;
             if (SendLoadState::PRESSURE == send_load_state_)
             {
                 send_load_state_ = SendLoadState::RECOVERY;
@@ -1862,32 +1876,50 @@ private:
             current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + recovery_step_bytes);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("positive", previous_budget, previous_state, pressure,
-                    meaningful_offered_load, negative_feedback, positive_feedback, request_delta, feedback_delta);
+                    active_send_load, queued_demand, negative_feedback, positive_feedback, false,
+                    request_delta, feedback_delta);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
+        }
+
+        if (recovery_probe_eligible)
+        {
+            ++recovery_probe_windows_;
+            if (recovery_probe_windows_ >= recovery_probe_interval_windows)
+            {
+                recovery_probe_windows_ = 0u;
+                send_load_state_ = SendLoadState::RECOVERY;
+                // Ambiguous feedback may recover the conservative starting point only.
+                current_send_budget_bytes_ = (std::min)(
+                    initial_send_budget_bytes,
+                    clamp_budget(current_send_budget_bytes_ + recovery_step_bytes));
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                trace_budget_update("probe_recovery", previous_budget, previous_state, pressure,
+                        active_send_load, queued_demand, negative_feedback, positive_feedback, true,
+                        request_delta, feedback_delta);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                return;
+            }
+        }
+        else
+        {
+            recovery_probe_windows_ = 0u;
         }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         trace_budget_update(
-            meaningful_offered_load ? "hold_ambiguous" : "hold_low_load",
+            active_send_load ? "hold_ambiguous" : (queued_demand ? "hold_backlogged" : "hold_low_load"),
             previous_budget,
             previous_state,
             pressure,
-            meaningful_offered_load,
+            active_send_load,
+            queued_demand,
             negative_feedback,
             positive_feedback,
+            false,
             request_delta,
             feedback_delta);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-        if (!meaningful_offered_load)
-        {
-            return;
-        }
-
-        if (SendLoadState::PRESSURE == send_load_state_)
-        {
-            send_load_state_ = SendLoadState::RECOVERY;
-        }
     }
 
     static const char* send_load_state_name(
@@ -2013,12 +2045,15 @@ private:
 
         if (nullptr == best_overall.writer)
         {
+            throttled_waiting_for_budget_ = false;
+            waiting_sample_size_bytes_ = 0u;
             return;
         }
 
         if (!can_send_with_balance(best_overall.size))
         {
             ++control_window_.throttled;
+            waiting_sample_size_bytes_ = best_overall.size;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_throttled(best_overall);
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -2027,6 +2062,7 @@ private:
         }
 
         throttled_waiting_for_budget_ = false;
+        waiting_sample_size_bytes_ = 0u;
         selected = best_overall;
     }
 
@@ -2042,12 +2078,13 @@ private:
     SendLoadState send_load_state_ = SendLoadState::NORMAL;
     bool send_budget_initialized_ = false;
     bool throttled_waiting_for_budget_ = false;
+    uint32_t waiting_sample_size_bytes_ = 0u;
+    uint32_t recovery_probe_windows_ = 0u;
     uint32_t current_send_budget_bytes_ = initial_send_budget_bytes;
     int64_t send_balance_bytes_ = initial_send_budget_bytes;
     uint64_t balance_refill_remainder_ = 0;
     uint64_t previous_link_request_samples_ = 0;
     uint64_t previous_link_feedback_samples_ = 0;
-    uint64_t previous_link_outstanding_changes_ = 0;
     uint64_t previous_old_excess_ = 0;
     std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
     std::chrono::milliseconds control_period_ {10};
@@ -2187,6 +2224,8 @@ private:
                << ";send_load_state=" << send_load_state_name(send_load_state_)
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
+               << ";required_send_balance_bytes=" << required_send_balance(selected_size)
+               << ";oversized_sample=" << (selected_size > current_send_budget_bytes_)
                << ";send_balance_after_bytes=" <<
                 (send_balance_bytes_ - static_cast<int64_t>((std::max)(1u, selected_size)))
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
@@ -2255,8 +2294,11 @@ private:
         const uint64_t period_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
         const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t debt = send_balance_bytes_ > 0 ? 0u : static_cast<uint64_t>(1 - send_balance_bytes_);
-        const uint64_t wait_us = 0u == period_us ? 0u : (debt * period_us + budget - 1u) / budget;
+        const int64_t required_balance = required_send_balance(best_overall.size);
+        const uint64_t required_credit = send_balance_bytes_ >= required_balance ? 0u :
+                static_cast<uint64_t>(required_balance - send_balance_bytes_);
+        const uint64_t wait_us = 0u == period_us ? 0u :
+                (required_credit * period_us + budget - 1u) / budget;
         const PressureSnapshot pressure = pressure_snapshot();
 
         std::ostringstream detail;
@@ -2264,6 +2306,8 @@ private:
                << ";send_load_state=" << send_load_state_name(send_load_state_)
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
+               << ";required_send_balance_bytes=" << required_balance
+               << ";oversized_sample=" << (best_overall.size > current_send_budget_bytes_)
                << ";estimated_wait_us=" << wait_us
                << ";candidate_value_class=" << value_class_name(best_overall.queue->value_class)
                << ";candidate_sample_kind=" << (best_overall.sample_is_old ? "old" : "new")
@@ -2299,9 +2343,11 @@ private:
             uint32_t previous_budget,
             SendLoadState previous_state,
             const PressureSnapshot& pressure,
-            bool meaningful_offered_load,
+            bool active_send_load,
+            bool queued_demand,
             bool negative_feedback,
             bool positive_feedback,
+            bool recovery_probe,
             uint64_t request_delta,
             uint64_t feedback_delta)
     {
@@ -2313,9 +2359,13 @@ private:
                << ";previous_send_budget_bytes=" << previous_budget
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
-               << ";meaningful_offered_load=" << meaningful_offered_load
+               << ";active_send_load=" << active_send_load
+               << ";queued_demand=" << queued_demand
                << ";negative_feedback=" << negative_feedback
                << ";positive_feedback=" << positive_feedback
+               << ";recovery_probe=" << recovery_probe
+               << ";recovery_probe_windows=" << recovery_probe_windows_
+               << ";recovery_probe_interval_windows=" << recovery_probe_interval_windows
                << ";request_delta=" << request_delta
                << ";feedback_delta=" << feedback_delta
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
