@@ -1210,9 +1210,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             return std::chrono::microseconds::zero();
         }
 
-        const int64_t required_balance = throttled_waiting_for_budget_ ?
-                required_send_balance(waiting_sample_size_bytes_) : 1;
-        if (send_balance_bytes_ >= required_balance)
+        if (send_balance_bytes_ > 0)
         {
             return std::chrono::microseconds::zero();
         }
@@ -1220,8 +1218,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         const uint64_t period_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
         const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t required_credit = static_cast<uint64_t>(required_balance - send_balance_bytes_);
-        const uint64_t wait_us = (required_credit * period_us + budget - 1u) / budget;
+        const uint64_t debt = static_cast<uint64_t>(1 - send_balance_bytes_);
+        const uint64_t wait_us = (debt * period_us + budget - 1u) / budget;
         return std::chrono::microseconds(static_cast<int64_t>(wait_us));
     }
 
@@ -1714,17 +1712,11 @@ private:
         return static_cast<int64_t>(current_send_budget_bytes_);
     }
 
-    int64_t required_send_balance(
-            uint32_t sample_size) const
-    {
-        const uint32_t charge = (std::max)(1u, sample_size);
-        return static_cast<int64_t>((std::min)(charge, (std::max)(1u, current_send_budget_bytes_)));
-    }
-
     bool can_send_with_balance(
             uint32_t sample_size) const
     {
-        return send_balance_bytes_ >= required_send_balance(sample_size);
+        static_cast<void>(sample_size);
+        return send_balance_bytes_ > 0;
     }
 
     void record_send_budget_success(
@@ -2046,14 +2038,12 @@ private:
         if (nullptr == best_overall.writer)
         {
             throttled_waiting_for_budget_ = false;
-            waiting_sample_size_bytes_ = 0u;
             return;
         }
 
         if (!can_send_with_balance(best_overall.size))
         {
             ++control_window_.throttled;
-            waiting_sample_size_bytes_ = best_overall.size;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_throttled(best_overall);
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -2062,7 +2052,6 @@ private:
         }
 
         throttled_waiting_for_budget_ = false;
-        waiting_sample_size_bytes_ = 0u;
         selected = best_overall;
     }
 
@@ -2078,7 +2067,6 @@ private:
     SendLoadState send_load_state_ = SendLoadState::NORMAL;
     bool send_budget_initialized_ = false;
     bool throttled_waiting_for_budget_ = false;
-    uint32_t waiting_sample_size_bytes_ = 0u;
     uint32_t recovery_probe_windows_ = 0u;
     uint32_t current_send_budget_bytes_ = initial_send_budget_bytes;
     int64_t send_balance_bytes_ = initial_send_budget_bytes;
@@ -2224,7 +2212,6 @@ private:
                << ";send_load_state=" << send_load_state_name(send_load_state_)
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
-               << ";required_send_balance_bytes=" << required_send_balance(selected_size)
                << ";oversized_sample=" << (selected_size > current_send_budget_bytes_)
                << ";send_balance_after_bytes=" <<
                 (send_balance_bytes_ - static_cast<int64_t>((std::max)(1u, selected_size)))
@@ -2294,9 +2281,8 @@ private:
         const uint64_t period_us = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
         const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const int64_t required_balance = required_send_balance(best_overall.size);
-        const uint64_t required_credit = send_balance_bytes_ >= required_balance ? 0u :
-                static_cast<uint64_t>(required_balance - send_balance_bytes_);
+        const uint64_t required_credit = send_balance_bytes_ > 0 ? 0u :
+                static_cast<uint64_t>(1 - send_balance_bytes_);
         const uint64_t wait_us = 0u == period_us ? 0u :
                 (required_credit * period_us + budget - 1u) / budget;
         const PressureSnapshot pressure = pressure_snapshot();
@@ -2306,7 +2292,6 @@ private:
                << ";send_load_state=" << send_load_state_name(send_load_state_)
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
-               << ";required_send_balance_bytes=" << required_balance
                << ";oversized_sample=" << (best_overall.size > current_send_budget_bytes_)
                << ";estimated_wait_us=" << wait_us
                << ";candidate_value_class=" << value_class_name(best_overall.queue->value_class)
