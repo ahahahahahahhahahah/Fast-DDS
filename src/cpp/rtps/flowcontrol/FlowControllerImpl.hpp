@@ -1141,11 +1141,6 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         ++control_window_.new_enqueue;
         it->second.summary.last_new_enqueue_sequence = change->sequenceNumber.to64long();
         it->second.feedback_window.last_new_enqueue_sequence = change->sequenceNumber.to64long();
-        if (WriterQueue::Summary* window = mutable_window_summary(it->second))
-        {
-            ++window->new_enqueue;
-            window->last_new_enqueue_sequence = change->sequenceNumber.to64long();
-        }
     }
 
     void add_old_sample(
@@ -1161,11 +1156,6 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         ++control_window_.old_enqueue;
         it->second.summary.last_old_enqueue_sequence = change->sequenceNumber.to64long();
         it->second.feedback_window.last_old_enqueue_sequence = change->sequenceNumber.to64long();
-        if (WriterQueue::Summary* window = mutable_window_summary(it->second))
-        {
-            ++window->old_enqueue;
-            window->last_old_enqueue_sequence = change->sequenceNumber.to64long();
-        }
     }
 
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
@@ -1294,7 +1284,6 @@ private:
             uint64_t last_selected_sequence = 0;
         } summary;
         Summary feedback_window;
-        std::map<uint64_t, Summary> window_summary;
         std::unordered_map<fastrtps::rtps::CacheChange_t*, SampleMeta> sample_meta;
     };
 
@@ -1404,56 +1393,6 @@ private:
                     return nullptr != path && '\0' != path[0];
                 }();
         return enabled;
-    }
-
-    static uint64_t adaptive_summary_window_ms()
-    {
-        static const uint64_t window_ms = []()
-                {
-                    const char* value = std::getenv("FASTDDS_ADAPTIVE_ASYNC_SUMMARY_WINDOW_MS");
-                    if (nullptr == value || '\0' == value[0])
-                    {
-                        return uint64_t{0};
-                    }
-
-                    char* end = nullptr;
-                    const unsigned long parsed = strtoul(value, &end, 10);
-                    if (value == end)
-                    {
-                        return uint64_t{0};
-                    }
-                    return static_cast<uint64_t>(parsed);
-                }();
-        return window_ms;
-    }
-
-    uint64_t current_window_index(
-            uint64_t window_ms) const
-    {
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - summary_start_time_).count();
-        return static_cast<uint64_t>(elapsed) / window_ms;
-    }
-
-    WriterQueue::Summary* mutable_window_summary(
-            WriterQueue& queue)
-    {
-        static_cast<void>(queue);
-        if (!adaptive_summary_enabled())
-        {
-            return nullptr;
-        }
-
-        const uint64_t window_ms = adaptive_summary_window_ms();
-        if (0 == window_ms)
-        {
-            return nullptr;
-        }
-
-        // Per-window summaries were only a diagnostic aid. Updating this map from
-        // both publish and async-send paths is not safe without a wider scheduler
-        // lock, so keep the aggregate summary only and rely on trace for windows.
-        return nullptr;
     }
 
     void touch_sample(
@@ -2097,10 +2036,6 @@ private:
         ++writer.summary.replaceable_old_superseded;
         ++writer.feedback_window.replaceable_old_superseded;
         ++control_window_.superseded;
-        if (WriterQueue::Summary* window = mutable_window_summary(writer))
-        {
-            ++window->replaceable_old_superseded;
-        }
     }
 
     ControlWindow control_window_;
@@ -2428,19 +2363,11 @@ private:
                 {
                     ++writer.second.summary.selected_utility_old;
                     ++writer.second.feedback_window.selected_utility_old;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-                    {
-                        ++window->selected_utility_old;
-                    }
                 }
                 else
                 {
                     ++writer.second.summary.selected_utility_new;
                     ++writer.second.feedback_window.selected_utility_new;
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-                    {
-                        ++window->selected_utility_new;
-                    }
                 }
                 writer.second.summary.selected_bytes += size_being_processed_;
                 writer.second.feedback_window.selected_bytes += size_being_processed_;
@@ -2454,28 +2381,12 @@ private:
                     writer.second.summary.selected_new_bytes += size_being_processed_;
                     writer.second.feedback_window.selected_new_bytes += size_being_processed_;
                 }
-                if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-                {
-                    window->selected_bytes += size_being_processed_;
-                    if (selected_sample_is_old)
-                    {
-                        window->selected_old_bytes += size_being_processed_;
-                    }
-                    else
-                    {
-                        window->selected_new_bytes += size_being_processed_;
-                    }
-                }
                 if (nullptr != change_being_processed_)
                 {
                     writer.second.summary.last_selected_sequence =
                             change_being_processed_->sequenceNumber.to64long();
                     writer.second.feedback_window.last_selected_sequence =
                             change_being_processed_->sequenceNumber.to64long();
-                    if (WriterQueue::Summary* window = mutable_window_summary(writer.second))
-                    {
-                        window->last_selected_sequence = change_being_processed_->sequenceNumber.to64long();
-                    }
                 }
                 writer.second.age_boost = 0;
                 if (selected_sample_is_old)
@@ -2559,31 +2470,6 @@ private:
                << ";last_selected_sequence=" << queue.summary.last_selected_sequence
                << ";old_age_boost=" << queue.old_age_boost
                << '\n';
-
-        const uint64_t window_ms = adaptive_summary_window_ms();
-        for (const auto& item : queue.window_summary)
-        {
-            const WriterQueue::Summary& summary = item.second;
-            output << "component=ADAPTIVE_VALUE_UTILITY_SCHEDULER_WINDOW"
-                   << ";writer_guid=" << writer->getGuid()
-                   << ";value_class=" << value_class_name(queue.value_class)
-                   << ";priority=" << queue.priority
-                   << ";window_index=" << item.first
-                   << ";window_start_ms=" << item.first * window_ms
-                   << ";window_end_ms=" << (item.first + 1) * window_ms
-                   << ";new_enqueue=" << summary.new_enqueue
-                   << ";old_enqueue=" << summary.old_enqueue
-                   << ";selected_utility_new=" << summary.selected_utility_new
-                   << ";selected_utility_old=" << summary.selected_utility_old
-                   << ";replaceable_old_superseded=" << summary.replaceable_old_superseded
-                   << ";selected_bytes=" << summary.selected_bytes
-                   << ";selected_new_bytes=" << summary.selected_new_bytes
-                   << ";selected_old_bytes=" << summary.selected_old_bytes
-                   << ";last_new_enqueue_sequence=" << summary.last_new_enqueue_sequence
-                   << ";last_old_enqueue_sequence=" << summary.last_old_enqueue_sequence
-                   << ";last_selected_sequence=" << summary.last_selected_sequence
-                   << '\n';
-        }
     }
 
     std::unordered_map<fastrtps::rtps::RTPSWriter*, WriterQueue> writers_queue_;
@@ -2605,8 +2491,6 @@ private:
     bool selected_sample_is_old_being_processed_ = false;
 
     uint32_t feedback_decay_counter_ = 0;
-
-    std::chrono::steady_clock::time_point summary_start_time_ = std::chrono::steady_clock::now();
 
 };
 
@@ -2949,9 +2833,14 @@ private:
                 change->writer_info.previous = nullptr;
                 change->writer_info.next = nullptr;
             }
+            sched.remove_change(change);
             --async_mode.writers_interested_in_remove;
         }
-        sched.remove_change(change);
+        else
+        {
+            std::unique_lock<std::mutex> interested_lock(async_mode.changes_interested_mutex);
+            sched.remove_change(change);
+        }
     }
 
     /*! This function is used when PublishMode = FlowControllerPureSyncPublishMode.
@@ -3073,7 +2962,10 @@ private:
                 locator_selector.unlock();
                 current_writer->getMutex().unlock();
 
-                sched.work_done();
+                {
+                    std::unique_lock<std::mutex> in_lock(async_mode.changes_interested_mutex);
+                    sched.work_done();
+                }
 
                 if (0 != async_mode.writers_interested_in_remove)
                 {
@@ -3085,9 +2977,8 @@ private:
                 {
                     std::unique_lock<std::mutex> in_lock(async_mode.changes_interested_mutex);
                     sched.add_interested_changes_to_queue_nts();
+                    change_to_process = sched.get_next_change_nts();
                 }
-
-                change_to_process = sched.get_next_change_nts();
             }
 
             async_mode.group.sender(nullptr, nullptr);
