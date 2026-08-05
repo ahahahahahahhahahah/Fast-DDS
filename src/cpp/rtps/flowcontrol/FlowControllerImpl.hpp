@@ -1829,8 +1829,8 @@ private:
         const bool repair_converging = previous_old_excess_ > pressure.old_excess + repair_growth_tolerance ||
                 (previous_link_outstanding_changes_ > pressure.link_outstanding_changes &&
                 feedback_delta > 0u);
-        const bool positive_feedback = meaningful_offered_load && !feedback_slow && !nack_growth &&
-                feedback_delta > 0u && (0u == pressure.old_excess || repair_converging);
+        const bool positive_feedback = !negative_feedback && meaningful_offered_load && !feedback_slow &&
+                !nack_growth && feedback_delta > 0u && (0u == pressure.old_excess || repair_converging);
 
         previous_link_request_samples_ = pressure.link_request_samples;
         previous_link_feedback_samples_ = pressure.link_feedback_samples;
