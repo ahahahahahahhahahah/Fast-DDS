@@ -31,11 +31,14 @@ struct AdaptiveRetransmissionFeedbackSnapshot
 {
     uint64_t request_samples = 0;
     uint64_t feedback_samples = 0;
+    uint64_t request_bytes = 0;
+    uint64_t feedback_bytes = 0;
     uint64_t outstanding_changes = 0;
     uint64_t outstanding_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
+    double feedback_slow_ratio = 0.0;
 };
 
 class AdaptiveRetransmissionController

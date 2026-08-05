@@ -84,6 +84,8 @@ struct ReaderState
 {
     uint32_t request_samples = 0;
     uint32_t feedback_samples = 0;
+    uint64_t request_bytes = 0;
+    uint64_t feedback_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     steady_clock::time_point last_request;
@@ -134,6 +136,7 @@ struct WriterState
     uint64_t byte_budget = max_bytes_per_cycle;
     uint64_t previous_candidate_bytes = 0;
     double stable_feedback_ms = 0.0;
+    uint32_t stable_feedback_warmup_samples = 0;
     RecoveryState recovery_state = RecoveryState::NORMAL;
     uint32_t pressure_cycles = 0;
     uint32_t improving_cycles = 0;
@@ -475,18 +478,29 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
 
     const GUID_t writer_guid = writer->getGuid();
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto writer_it = impl_->writers.find(writer_guid);
+    const double stable_feedback_ms = writer_it == impl_->writers.end() ?
+            0.0 : writer_it->second.stable_feedback_ms;
     for (const auto& item : impl_->readers)
     {
         if (item.first.writer == writer_guid)
         {
             snapshot.request_samples += item.second.request_samples;
             snapshot.feedback_samples += item.second.feedback_samples;
+            snapshot.request_bytes += item.second.request_bytes;
+            snapshot.feedback_bytes += item.second.feedback_bytes;
             snapshot.request_interval_ewma_ms = std::max(
                 snapshot.request_interval_ewma_ms,
                 item.second.request_interval_ewma_ms);
             snapshot.recovery_feedback_ewma_ms = std::max(
                 snapshot.recovery_feedback_ewma_ms,
                 item.second.recovery_feedback_ewma_ms);
+            if (stable_feedback_ms > 0.0)
+            {
+                snapshot.feedback_slow_ratio = std::max(
+                    snapshot.feedback_slow_ratio,
+                    item.second.recovery_feedback_ewma_ms / stable_feedback_ms);
+            }
         }
     }
 
@@ -499,7 +513,6 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
         }
     }
 
-    auto writer_it = impl_->writers.find(writer_guid);
     if (writer_it != impl_->writers.end())
     {
         snapshot.stable_feedback_ms = writer_it->second.stable_feedback_ms;
@@ -541,6 +554,7 @@ void AdaptiveRetransmissionController::on_requested(
             reader.request_interval_ewma_ms = update_ewma(reader.request_interval_ewma_ms, interval_ms);
         }
         ++reader.request_samples;
+        reader.request_bytes += estimated_bytes;
         reader.last_request = now;
 
         ChangeState& observed = impl_->changes[change_key];
@@ -1204,6 +1218,23 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                     ReaderState& reader = reader_it->second;
                     reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
                     ++reader.feedback_samples;
+                    reader.feedback_bytes += it->second.estimated_bytes;
+
+                    if (async_tracking)
+                    {
+                        WriterState& writer_state = impl_->writers[writer->getGuid()];
+                        if (0.0 == writer_state.stable_feedback_ms)
+                        {
+                            writer_state.stable_feedback_ms = feedback_ms;
+                            writer_state.stable_feedback_warmup_samples = 1;
+                        }
+                        else if (writer_state.stable_feedback_warmup_samples < warmup_feedback_samples)
+                        {
+                            writer_state.stable_feedback_ms = update_ewma(
+                                writer_state.stable_feedback_ms, feedback_ms);
+                            ++writer_state.stable_feedback_warmup_samples;
+                        }
+                    }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                     ack_traces.push_back(
                         AckTrace

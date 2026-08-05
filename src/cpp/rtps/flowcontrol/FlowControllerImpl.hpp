@@ -1053,6 +1053,9 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         double defer_cooldown_ms = 0.0;
         double value_horizon_ms = 0.0;
         apply_value_class_defaults(writer, priority, value_class);
+        hard_max_defer_ms = default_hard_defer_ms(value_class);
+        defer_cooldown_ms = default_defer_cooldown_ms(value_class);
+        value_horizon_ms = default_value_horizon_ms(value_class);
 
         int32_t parsed_priority = priority;
         if (parse_int32_property(writer, "fastdds.adaptive_async.priority", -10, 10, parsed_priority) ||
@@ -1305,11 +1308,14 @@ private:
         uint64_t old_excess = 0;
         uint64_t link_request_samples = 0;
         uint64_t link_feedback_samples = 0;
+        uint64_t link_request_bytes = 0;
+        uint64_t link_feedback_bytes = 0;
         uint64_t link_outstanding_changes = 0;
         uint64_t link_outstanding_bytes = 0;
         double link_request_interval_ewma_ms = 0.0;
         double link_recovery_feedback_ewma_ms = 0.0;
         double link_stable_feedback_ms = 0.0;
+        double link_feedback_slow_ratio = 0.0;
         int32_t contention_level = 1;
         int32_t old_repair_level = 0;
         int32_t send_load_level = 1;
@@ -1372,6 +1378,8 @@ private:
         uint32_t size = 0;
         bool sample_is_old = false;
         bool has_newer_change = false;
+        int64_t old_sample_age_ms = 0;
+        bool fairness_due = false;
         const WriterQueue::SampleMeta* meta = nullptr;
         UtilityBreakdown breakdown;
         int32_t utility = (std::numeric_limits<int32_t>::min)();
@@ -1389,8 +1397,13 @@ private:
     static constexpr uint32_t recovery_probe_interval_windows = 10u;
     static constexpr uint32_t max_oversized_sample_budget_ratio = 2u;
     static constexpr uint32_t max_recent_service_penalty = 240u;
-    static constexpr uint32_t repair_growth_tolerance = 1u;
+    static constexpr uint32_t repair_growth_tolerance_bytes = 1024u;
     static constexpr double link_feedback_pressure_ratio = 1.5;
+    static constexpr uint32_t default_important_hard_defer_ms = 40u;
+    static constexpr uint32_t default_default_hard_defer_ms = 80u;
+    static constexpr uint32_t default_replaceable_hard_defer_ms = 200u;
+    static constexpr uint32_t default_replaceable_value_horizon_ms = 120u;
+    static constexpr uint32_t default_replaceable_defer_cooldown_ms = 40u;
     static bool adaptive_summary_enabled()
     {
         static const bool enabled = []()
@@ -1493,6 +1506,34 @@ private:
         }
     }
 
+    static double default_hard_defer_ms(
+            ValueClassRank value_class)
+    {
+        switch (value_class)
+        {
+            case ValueClassRank::IMPORTANT:
+                return default_important_hard_defer_ms;
+            case ValueClassRank::REPLACEABLE_SNAPSHOT:
+                return default_replaceable_hard_defer_ms;
+            default:
+                return default_default_hard_defer_ms;
+        }
+    }
+
+    static double default_value_horizon_ms(
+            ValueClassRank value_class)
+    {
+        return ValueClassRank::REPLACEABLE_SNAPSHOT == value_class ?
+               default_replaceable_value_horizon_ms : 0.0;
+    }
+
+    static double default_defer_cooldown_ms(
+            ValueClassRank value_class)
+    {
+        return ValueClassRank::REPLACEABLE_SNAPSHOT == value_class ?
+               default_replaceable_defer_cooldown_ms : 0.0;
+    }
+
     PressureSnapshot pressure_snapshot() const
     {
         PressureSnapshot pressure;
@@ -1526,6 +1567,8 @@ private:
                             stateful_writer);
                 pressure.link_request_samples += feedback.request_samples;
                 pressure.link_feedback_samples += feedback.feedback_samples;
+                pressure.link_request_bytes += feedback.request_bytes;
+                pressure.link_feedback_bytes += feedback.feedback_bytes;
                 pressure.link_outstanding_changes += feedback.outstanding_changes;
                 pressure.link_outstanding_bytes += feedback.outstanding_bytes;
                 pressure.link_request_interval_ewma_ms = (std::max)(
@@ -1537,6 +1580,9 @@ private:
                 pressure.link_stable_feedback_ms = (std::max)(
                     pressure.link_stable_feedback_ms,
                     feedback.stable_feedback_ms);
+                pressure.link_feedback_slow_ratio = (std::max)(
+                    pressure.link_feedback_slow_ratio,
+                    feedback.feedback_slow_ratio);
             }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
         }
@@ -1567,7 +1613,9 @@ private:
             pressure.send_load_level = 1;
         }
 
-        pressure.old_demand = pressure.old_enqueue + pressure.superseded;
+        // superseded is a diagnostic subset of old work, not an additional
+        // queue demand. Counting it again creates self-reinforcing pressure.
+        pressure.old_demand = pressure.old_enqueue;
         pressure.old_service = pressure.selected_old;
         pressure.old_excess = pressure.old_demand > pressure.old_service ?
                 pressure.old_demand - pressure.old_service : 0u;
@@ -1592,9 +1640,7 @@ private:
         }
 
         const bool feedback_pressure = pressure.link_feedback_samples >= 3u &&
-                pressure.link_stable_feedback_ms > 0.0 &&
-                pressure.link_recovery_feedback_ewma_ms >
-                link_feedback_pressure_ratio * pressure.link_stable_feedback_ms;
+                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio;
         pressure.link_pressure_level = feedback_pressure ? 2 :
                 (pressure.link_outstanding_changes > 0u && pressure.old_repair_level >= 2 ? 1 : 0);
         pressure.aggregate_level = (std::max)(pressure.contention_level,
@@ -1690,7 +1736,7 @@ private:
             breakdown.byte_cost_penalty = byte_cost_penalty(sample_size, pressure);
         }
 
-        breakdown.recent_service_penalty = recent_service_penalty(writer, sample_is_old, sample_size, pressure);
+        breakdown.recent_service_penalty = recent_service_penalty(writer, pressure);
         breakdown.utility = breakdown.base + breakdown.sample_kind_adjust - breakdown.superseded_old_penalty +
                 breakdown.writer_age_bonus + breakdown.sample_age_bonus + breakdown.old_age_bonus +
                 breakdown.hard_defer_bonus - breakdown.value_horizon_penalty - breakdown.cooldown_penalty -
@@ -1836,23 +1882,30 @@ private:
                 pressure.link_request_samples - previous_link_request_samples_ : 0u;
         const uint64_t feedback_delta = pressure.link_feedback_samples > previous_link_feedback_samples_ ?
                 pressure.link_feedback_samples - previous_link_feedback_samples_ : 0u;
+        const uint64_t request_bytes_delta = pressure.link_request_bytes > previous_link_request_bytes_ ?
+                pressure.link_request_bytes - previous_link_request_bytes_ : 0u;
+        const uint64_t feedback_bytes_delta = pressure.link_feedback_bytes > previous_link_feedback_bytes_ ?
+                pressure.link_feedback_bytes - previous_link_feedback_bytes_ : 0u;
         const bool link_feedback_activity = request_delta > 0u || feedback_delta > 0u;
         const bool feedback_slow = link_feedback_activity &&
                 pressure.link_feedback_samples >= 3u &&
-                pressure.link_stable_feedback_ms > 0.0 &&
-                pressure.link_recovery_feedback_ewma_ms >
-                link_feedback_pressure_ratio * pressure.link_stable_feedback_ms;
-        const bool nack_growth = request_delta > feedback_delta + repair_growth_tolerance &&
+                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio;
+        const uint64_t repair_tolerance_bytes = (std::max<uint64_t>)(
+            repair_growth_tolerance_bytes,
+            static_cast<uint64_t>(current_send_budget_bytes_) / 16u);
+        const bool nack_growth = request_bytes_delta > feedback_bytes_delta + repair_tolerance_bytes &&
                 pressure.link_outstanding_changes > 0u;
         const bool link_negative_signal = feedback_slow || nack_growth;
         const bool negative_feedback = active_send_load && link_negative_signal;
         const bool positive_feedback = !link_negative_signal && active_send_load &&
-                !nack_growth && feedback_delta > 0u;
+                !nack_growth && feedback_bytes_delta > 0u;
         const bool recovery_probe_eligible = !link_negative_signal && queued_demand &&
                 current_send_budget_bytes_ < initial_send_budget_bytes;
 
         previous_link_request_samples_ = pressure.link_request_samples;
         previous_link_feedback_samples_ = pressure.link_feedback_samples;
+        previous_link_request_bytes_ = pressure.link_request_bytes;
+        previous_link_feedback_bytes_ = pressure.link_feedback_bytes;
 
         if (negative_feedback)
         {
@@ -1949,8 +2002,6 @@ private:
 
     int32_t recent_service_penalty(
             const WriterQueue& writer,
-            bool sample_is_old,
-            uint32_t sample_size,
             const PressureSnapshot& pressure) const
     {
         const uint64_t selected = writer.feedback_window.selected_utility_new +
@@ -1964,14 +2015,6 @@ private:
                 pressure.selected_bytes));
         }
 
-        if (sample_is_old && ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class)
-        {
-            penalty += 40 * pressure.old_repair_level;
-        }
-        if (sample_size > 1024u && pressure.send_load_level >= 2)
-        {
-            penalty += static_cast<int32_t>(std::min<uint32_t>(120u, sample_size / 512u));
-        }
         if (pressure.contention_level >= 3 && selected > 0u)
         {
             penalty += 12;
@@ -1980,11 +2023,9 @@ private:
     }
 
     static int32_t score_from_utility(
-            int32_t utility,
-            uint32_t sample_size)
+            int32_t utility)
     {
-        const uint32_t cost_units = std::max<uint32_t>(1u, (sample_size + 255u) / 256u);
-        return utility - static_cast<int32_t>(std::min<uint32_t>(120u, cost_units));
+        return utility;
     }
 
     void consider_candidate(
@@ -2021,25 +2062,39 @@ private:
         candidate.size = size;
         candidate.sample_is_old = sample_is_old;
         candidate.has_newer_change = sample_has_newer_change;
+        const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
+        candidate.old_sample_age_ms = sample_is_old && nullptr != meta &&
+                0 != meta->old_enqueue_count ?
+                elapsed_ms(meta->first_old_seen, now) : sample_age_ms;
+        candidate.fairness_due = sample_is_old && writer.hard_max_defer_ms > 0.0 &&
+                candidate.old_sample_age_ms >= static_cast<int64_t>(writer.hard_max_defer_ms);
         candidate.meta = meta;
         candidate.breakdown = compute_utility_breakdown(
             writer, meta, sample_is_old, sample_has_newer_change, size, pressure, now);
         candidate.utility = candidate.breakdown.utility;
-        candidate.score = score_from_utility(candidate.utility, size);
+        candidate.score = score_from_utility(candidate.utility);
 
         if (require_network_admission && !can_send_with_balance(size))
         {
             return;
         }
 
+        const bool candidate_due = candidate.fairness_due;
+        const bool best_due = nullptr != best.writer && best.fairness_due;
         if (nullptr == best.writer ||
-                candidate.score > best.score ||
-                (candidate.score == best.score && candidate.utility > best.utility) ||
-                (candidate.score == best.score && candidate.utility == best.utility &&
+                (candidate_due && !best_due) ||
+                (candidate_due && best_due && candidate.old_sample_age_ms > best.old_sample_age_ms) ||
+                (!candidate_due && !best_due && candidate.score > best.score) ||
+                (candidate.fairness_due == best.fairness_due &&
+                candidate.score == best.score && candidate.utility > best.utility) ||
+                (candidate.fairness_due == best.fairness_due &&
+                candidate.score == best.score && candidate.utility == best.utility &&
                 writer.value_class < best.queue->value_class) ||
-                (candidate.score == best.score && candidate.utility == best.utility &&
+                (candidate.fairness_due == best.fairness_due &&
+                candidate.score == best.score && candidate.utility == best.utility &&
                 writer.value_class == best.queue->value_class && !candidate.sample_is_old && best.sample_is_old) ||
-                (candidate.score == best.score && candidate.utility == best.utility &&
+                (candidate.fairness_due == best.fairness_due &&
+                candidate.score == best.score && candidate.utility == best.utility &&
                 writer.value_class == best.queue->value_class &&
                 candidate.sample_is_old == best.sample_is_old && writer.priority < best.queue->priority))
         {
@@ -2117,6 +2172,8 @@ private:
     uint64_t balance_refill_remainder_ = 0;
     uint64_t previous_link_request_samples_ = 0;
     uint64_t previous_link_feedback_samples_ = 0;
+    uint64_t previous_link_request_bytes_ = 0;
+    uint64_t previous_link_feedback_bytes_ = 0;
     std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
     std::chrono::milliseconds control_period_ {10};
 
@@ -2265,6 +2322,9 @@ private:
                << ";old_age_boost=" << writer->second.old_age_boost
                << ";sample_age_ms=" << sample_age_ms
                << ";old_sample_age_ms=" << old_sample_age_ms
+               << ";fairness_due=" << (selected_sample_is_old_being_processed_ &&
+                writer->second.hard_max_defer_ms > 0.0 &&
+                old_sample_age_ms >= static_cast<int64_t>(writer->second.hard_max_defer_ms))
                << ";has_newer_change=" << selected_has_newer_change
                << ";hard_max_defer_ms=" << writer->second.hard_max_defer_ms
                << ";defer_cooldown_ms=" << writer->second.defer_cooldown_ms
@@ -2281,11 +2341,14 @@ private:
                << ";old_excess=" << pressure.old_excess
                << ";link_request_samples=" << pressure.link_request_samples
                << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_request_bytes=" << pressure.link_request_bytes
+               << ";link_feedback_bytes=" << pressure.link_feedback_bytes
                << ";link_outstanding_changes=" << pressure.link_outstanding_changes
                << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
                << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
                << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
                << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
+               << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
                << ";link_pressure_level=" << pressure.link_pressure_level
                << ";queue_pressure_level=" << pressure.queue_pressure_level
                << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level
@@ -2342,6 +2405,7 @@ private:
                << ";estimated_wait_us=" << wait_us
                << ";candidate_value_class=" << value_class_name(best_overall.queue->value_class)
                << ";candidate_sample_kind=" << (best_overall.sample_is_old ? "old" : "new")
+               << ";candidate_fairness_due=" << best_overall.fairness_due
                << ";candidate_size=" << best_overall.size
                << ";candidate_utility=" << best_overall.utility
                << ";candidate_score=" << best_overall.score
@@ -2352,11 +2416,14 @@ private:
                << ";link_pressure_level=" << pressure.link_pressure_level
                << ";link_request_samples=" << pressure.link_request_samples
                << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_request_bytes=" << pressure.link_request_bytes
+               << ";link_feedback_bytes=" << pressure.link_feedback_bytes
                << ";link_outstanding_changes=" << pressure.link_outstanding_changes
                << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
                << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
                << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
                << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
+               << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
                << ";queue_pressure_level=" << pressure.queue_pressure_level
                << ";scheduling_pressure_level=" << pressure.scheduling_pressure_level;
 
@@ -2416,11 +2483,14 @@ private:
                << ";old_excess=" << pressure.old_excess
                << ";link_request_samples=" << pressure.link_request_samples
                << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_request_bytes=" << pressure.link_request_bytes
+               << ";link_feedback_bytes=" << pressure.link_feedback_bytes
                << ";link_outstanding_changes=" << pressure.link_outstanding_changes
                << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
                << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
                << ";link_recovery_feedback_ewma_ms=" << pressure.link_recovery_feedback_ewma_ms
                << ";link_stable_feedback_ms=" << pressure.link_stable_feedback_ms
+               << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
                << ";link_pressure_level=" << pressure.link_pressure_level
                << ";old_pressure_level=" << pressure.old_repair_level
                << ";queue_pressure_level=" << pressure.queue_pressure_level
