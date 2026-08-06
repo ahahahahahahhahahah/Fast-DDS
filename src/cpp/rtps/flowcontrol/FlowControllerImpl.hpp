@@ -1675,11 +1675,12 @@ private:
             pressure.contention_level = 1;
         }
 
-        if (pressure.selected_bytes > 512u * 1024u)
+        const uint64_t current_budget = (std::max<uint64_t>)(1u, current_send_budget_bytes_);
+        if (control_window_.selected_bytes >= current_budget)
         {
             pressure.send_load_level = 3;
         }
-        else if (pressure.selected_bytes > 192u * 1024u)
+        else if (control_window_.selected_bytes * 2u >= current_budget)
         {
             pressure.send_load_level = 2;
         }
