@@ -243,15 +243,20 @@ bool async_observe_enabled(
            boolean_property_is_enabled(writer, async_observe_property);
 }
 
-bool async_tracking_enabled(
+bool async_feedback_accounting_enabled(
         StatefulWriter& writer)
 {
-    return async_observe_enabled(writer);
+    return !writer.getGuid().is_builtin() && writer.isAsync() &&
+           (writer.uses_adaptive_value_flow_controller() || async_observe_enabled(writer));
 }
 
 const char* controller_mode_name(
         StatefulWriter& writer)
 {
+    if (writer.isAsync() && writer.uses_adaptive_value_flow_controller())
+    {
+        return "ASYNC_ADAPTIVE_VALUE";
+    }
     if (async_observe_enabled(writer))
     {
         return "ASYNC_OBSERVE";
@@ -558,8 +563,8 @@ void AdaptiveRetransmissionController::on_requested(
         return;
     }
 
-    const bool async_tracking = async_tracking_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_tracking)
+    const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
+    if (!admission_enabled(*writer) && !async_feedback_accounting)
     {
         return;
     }
@@ -621,7 +626,7 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
         const CacheChange_t& change,
         bool queued)
 {
-    if (nullptr == writer || !async_tracking_enabled(*writer))
+    if (nullptr == writer || !async_feedback_accounting_enabled(*writer))
     {
         return;
     }
@@ -1210,8 +1215,8 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         return;
     }
 
-    const bool async_tracking = async_tracking_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_tracking)
+    const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
+    if (!admission_enabled(*writer) && !async_feedback_accounting)
     {
         return;
     }
@@ -1246,7 +1251,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                     ++reader.feedback_samples;
                     reader.feedback_bytes += it->second.estimated_bytes;
 
-                    if (async_tracking)
+                    if (async_feedback_accounting)
                     {
                         WriterState& writer_state = impl_->writers[writer->getGuid()];
                         writer_state.stable_feedback_ms = update_lower_envelope_feedback_baseline(
@@ -1302,8 +1307,8 @@ void AdaptiveRetransmissionController::on_change_removed(
         return;
     }
 
-    const bool async_tracking = async_tracking_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_tracking)
+    const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
+    if (!admission_enabled(*writer) && !async_feedback_accounting)
     {
         return;
     }
@@ -1348,8 +1353,8 @@ void AdaptiveRetransmissionController::on_reader_removed(
         return;
     }
 
-    const bool async_tracking = async_tracking_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_tracking)
+    const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
+    if (!admission_enabled(*writer) && !async_feedback_accounting)
     {
         return;
     }
