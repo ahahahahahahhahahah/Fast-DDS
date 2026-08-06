@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
@@ -1067,6 +1068,15 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             const FlowControllerDescriptor* descriptor)
     {
         budget_configured_ = false;
+        send_budget_initialized_ = false;
+        throttled_waiting_for_budget_ = false;
+        recovery_probe_windows_ = 0u;
+        feedback_slow_windows_ = 0u;
+        send_load_state_ = SendLoadState::NORMAL;
+        next_scheduler_wakeup_ = std::chrono::steady_clock::now();
+        pacing_wakeup_due_ = false;
+        pacing_wakeup_sample_size_ = 0u;
+        control_window_.reset();
         if (nullptr == descriptor)
         {
             return;
@@ -1104,16 +1114,19 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         recovery_step_bytes_ = (std::max)(1u,
                         static_cast<uint32_t>((static_cast<uint64_t>(max_send_budget_bytes_ - min_send_budget_bytes_) +
                         recovery_steps - 1u) / recovery_steps));
-        recovery_probe_interval_windows_ = (std::max)(1u, descriptor->adaptive_recovery_probe_windows);
         max_oversized_sample_budget_ratio_ = (std::max)(1u,
                         descriptor->adaptive_oversized_sample_budget_ratio);
         link_feedback_pressure_ratio_ = (std::max)(101u,
                         descriptor->adaptive_feedback_slow_ratio_percent) / 100.0;
         feedback_slow_window_threshold_ = (std::max)(1u, descriptor->adaptive_feedback_slow_windows);
+        recovery_probe_interval_windows_ = (std::max)(
+            feedback_slow_window_threshold_,
+            descriptor->adaptive_recovery_probe_windows);
         feedback_active_load_percent_ = (std::min)(100u,
                         (std::max)(1u, descriptor->adaptive_feedback_active_load_percent));
         decrease_percent_ = (std::min)(99u, (std::max)(1u, descriptor->adaptive_decrease_percent));
         control_period_ = std::chrono::milliseconds((std::max<uint64_t>)(1u, descriptor->period_ms));
+        feedback_decay_interval_windows_ = recovery_probe_interval_windows_;
 
         current_send_budget_bytes_ = initial_send_budget_bytes_;
         send_balance_bytes_ = initial_send_budget_bytes_;
@@ -1168,6 +1181,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         writer_queue.hard_max_defer_ms = hard_max_defer_ms;
         writer_queue.defer_cooldown_ms = defer_cooldown_ms;
         writer_queue.value_horizon_ms = value_horizon_ms;
+        initialize_writer_feedback_baseline(writer_queue);
 
         auto ret = writers_queue_.emplace(writer, std::move(writer_queue));
         (void)ret;
@@ -1227,8 +1241,9 @@ struct FlowControllerAdaptiveValueUtilitySchedule
     {
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
+        const auto now = std::chrono::steady_clock::now();
         it->second.queue.add_new_sample(change);
-        touch_sample(it->second, change, false);
+        touch_sample(it->second, change, false, now);
         ++it->second.summary.new_enqueue;
         ++it->second.feedback_window.new_enqueue;
         ++control_window_.new_enqueue;
@@ -1242,8 +1257,9 @@ struct FlowControllerAdaptiveValueUtilitySchedule
     {
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
+        const auto now = std::chrono::steady_clock::now();
         it->second.queue.add_old_sample(change);
-        touch_sample(it->second, change, true);
+        touch_sample(it->second, change, true, now);
         ++it->second.summary.old_enqueue;
         ++it->second.feedback_window.old_enqueue;
         ++control_window_.old_enqueue;
@@ -1259,7 +1275,9 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             return nullptr;
         }
 
-        refill_send_budget(std::chrono::steady_clock::now());
+        const auto now = std::chrono::steady_clock::now();
+        pacing_wakeup_due_ = throttled_waiting_for_budget_ && now >= next_scheduler_wakeup_;
+        refill_send_budget(now);
 
         CandidateView selected;
         select_utility_candidate(selected);
@@ -1309,20 +1327,13 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             return std::chrono::microseconds::zero();
         }
 
-        if (send_balance_bytes_ > 0)
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_scheduler_wakeup_)
         {
-            // A positive balance can still be blocked by the network
-            // admissibility bound for an oversized sample. Revisit after one
-            // control period so budget probing can make progress.
-            return control_period_;
+            return std::chrono::microseconds::zero();
         }
 
-        const uint64_t period_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
-        const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t debt = static_cast<uint64_t>(1 - send_balance_bytes_);
-        const uint64_t wait_us = (debt * period_us + budget - 1u) / budget;
-        return std::chrono::microseconds(static_cast<int64_t>(wait_us));
+        return std::chrono::duration_cast<std::chrono::microseconds>(next_scheduler_wakeup_ - now);
     }
 
     void remove_change(
@@ -1361,8 +1372,6 @@ private:
         double hard_max_defer_ms = 0.0;
         double defer_cooldown_ms = 0.0;
         double value_horizon_ms = 0.0;
-        uint32_t age_boost = 0;
-        uint32_t old_age_boost = 0;
         struct SampleMeta
         {
             std::chrono::steady_clock::time_point first_seen;
@@ -1388,6 +1397,10 @@ private:
             uint64_t last_selected_sequence = 0;
         } summary;
         Summary feedback_window;
+        uint64_t previous_link_request_samples = 0;
+        uint64_t previous_link_feedback_samples = 0;
+        uint64_t previous_link_request_bytes = 0;
+        uint64_t previous_link_feedback_bytes = 0;
         std::unordered_map<fastrtps::rtps::CacheChange_t*, SampleMeta> sample_meta;
     };
 
@@ -1452,12 +1465,86 @@ private:
         }
     };
 
+    static void initialize_writer_feedback_baseline(
+            WriterQueue& queue)
+    {
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        const auto* stateful_writer = dynamic_cast<const fastrtps::rtps::StatefulWriter*>(queue.writer);
+        if (nullptr == stateful_writer)
+        {
+            return;
+        }
+
+        const fastrtps::rtps::detail::AdaptiveRetransmissionFeedbackSnapshot feedback =
+                fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().feedback_snapshot(
+                    stateful_writer);
+        queue.previous_link_request_samples = feedback.request_samples;
+        queue.previous_link_feedback_samples = feedback.feedback_samples;
+        queue.previous_link_request_bytes = feedback.request_bytes;
+        queue.previous_link_feedback_bytes = feedback.feedback_bytes;
+#else
+        static_cast<void>(queue);
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+    }
+
+    struct LinkFeedbackWindow
+    {
+        uint64_t request_samples_delta = 0;
+        uint64_t feedback_samples_delta = 0;
+        uint64_t request_bytes_delta = 0;
+        uint64_t feedback_bytes_delta = 0;
+        double active_feedback_slow_ratio = 0.0;
+    };
+
+    LinkFeedbackWindow capture_link_feedback_window()
+    {
+        LinkFeedbackWindow window;
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        for (auto& item : writers_queue_)
+        {
+            WriterQueue& queue = item.second;
+            const auto* stateful_writer = dynamic_cast<const fastrtps::rtps::StatefulWriter*>(queue.writer);
+            if (nullptr == stateful_writer)
+            {
+                continue;
+            }
+
+            const fastrtps::rtps::detail::AdaptiveRetransmissionFeedbackSnapshot feedback =
+                    fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().feedback_snapshot(
+                        stateful_writer);
+            const uint64_t request_samples_delta = feedback.request_samples > queue.previous_link_request_samples ?
+                    feedback.request_samples - queue.previous_link_request_samples : 0u;
+            const uint64_t feedback_samples_delta = feedback.feedback_samples > queue.previous_link_feedback_samples ?
+                    feedback.feedback_samples - queue.previous_link_feedback_samples : 0u;
+            const uint64_t request_bytes_delta = feedback.request_bytes > queue.previous_link_request_bytes ?
+                    feedback.request_bytes - queue.previous_link_request_bytes : 0u;
+            const uint64_t feedback_bytes_delta = feedback.feedback_bytes > queue.previous_link_feedback_bytes ?
+                    feedback.feedback_bytes - queue.previous_link_feedback_bytes : 0u;
+            window.request_samples_delta += request_samples_delta;
+            window.feedback_samples_delta += feedback_samples_delta;
+            window.request_bytes_delta += request_bytes_delta;
+            window.feedback_bytes_delta += feedback_bytes_delta;
+            if (feedback_samples_delta > 0u || feedback_bytes_delta > 0u)
+            {
+                window.active_feedback_slow_ratio = (std::max)(
+                    window.active_feedback_slow_ratio,
+                    feedback.feedback_slow_ratio);
+            }
+
+            queue.previous_link_request_samples = feedback.request_samples;
+            queue.previous_link_feedback_samples = feedback.feedback_samples;
+            queue.previous_link_request_bytes = feedback.request_bytes;
+            queue.previous_link_feedback_bytes = feedback.feedback_bytes;
+        }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+        return window;
+    }
+
     struct UtilityBreakdown
     {
         int32_t base = 0;
         int32_t sample_kind_adjust = 0;
         int32_t superseded_old_penalty = 0;
-        int32_t writer_age_bonus = 0;
         int32_t sample_age_bonus = 0;
         int32_t old_age_bonus = 0;
         int32_t hard_defer_bonus = 0;
@@ -1484,10 +1571,6 @@ private:
         int32_t score = (std::numeric_limits<int32_t>::min)();
     };
 
-    static constexpr uint32_t max_age_boost = 20;
-    static constexpr uint32_t max_old_age_boost = 35;
-    static constexpr uint32_t feedback_decay_interval = 256;
-    static constexpr uint32_t max_recent_service_penalty = 240u;
     static constexpr uint32_t default_important_hard_defer_ms = 40u;
     static constexpr uint32_t default_default_hard_defer_ms = 80u;
     static constexpr uint32_t default_replaceable_hard_defer_ms = 200u;
@@ -1506,9 +1589,9 @@ private:
     void touch_sample(
             WriterQueue& queue,
             fastrtps::rtps::CacheChange_t* change,
-            bool sample_is_old)
+            bool sample_is_old,
+            const std::chrono::steady_clock::time_point& now)
     {
-        const auto now = std::chrono::steady_clock::now();
         WriterQueue::SampleMeta& meta = queue.sample_meta[change];
         if (0 == meta.enqueue_count)
         {
@@ -1565,17 +1648,45 @@ private:
         }
     }
 
+    static int32_t adjacent_value_gap_floor()
+    {
+        return (std::min)(
+            base_utility(ValueClassRank::IMPORTANT) - base_utility(ValueClassRank::DEFAULT_VALUE),
+            base_utility(ValueClassRank::DEFAULT_VALUE) - base_utility(ValueClassRank::REPLACEABLE_SNAPSHOT));
+    }
+
+    static int32_t max_sample_age_bonus()
+    {
+        return (std::max)(40, adjacent_value_gap_floor() / 3);
+    }
+
+    static uint32_t max_recent_service_penalty()
+    {
+        return static_cast<uint32_t>((std::max)(80, (adjacent_value_gap_floor() * 4) / 5));
+    }
+
+    static int32_t old_defer_bonus_cap(
+            bool has_newer_change)
+    {
+        const int32_t gap_floor = adjacent_value_gap_floor();
+        return has_newer_change ? gap_floor : gap_floor / 2;
+    }
+
     static int32_t new_sample_bonus(
             ValueClassRank value_class)
     {
+        const int32_t important_gap = base_utility(ValueClassRank::IMPORTANT) -
+                base_utility(ValueClassRank::DEFAULT_VALUE);
+        const int32_t default_gap = base_utility(ValueClassRank::DEFAULT_VALUE) -
+                base_utility(ValueClassRank::REPLACEABLE_SNAPSHOT);
         switch (value_class)
         {
             case ValueClassRank::IMPORTANT:
-                return 180;
+                return important_gap / 2;
             case ValueClassRank::DEFAULT_VALUE:
-                return 130;
+                return default_gap / 2;
             case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                return 220;
+                return (base_utility(ValueClassRank::REPLACEABLE_SNAPSHOT) * 5) / 6;
             default:
                 return 0;
         }
@@ -1587,12 +1698,66 @@ private:
         switch (value_class)
         {
             case ValueClassRank::IMPORTANT:
-                return 120;
+                return (new_sample_bonus(value_class) * 2) / 3;
             case ValueClassRank::DEFAULT_VALUE:
-                return 70;
+                return (new_sample_bonus(value_class) * 2) / 3;
             default:
                 return 0;
         }
+    }
+
+    static int32_t baseline_new_utility(
+            ValueClassRank value_class)
+    {
+        return base_utility(value_class) + new_sample_bonus(value_class);
+    }
+
+    static int32_t baseline_old_utility(
+            ValueClassRank value_class)
+    {
+        return base_utility(value_class) + old_sample_bonus(value_class);
+    }
+
+    static uint32_t recent_service_penalty_cap(
+            ValueClassRank value_class)
+    {
+        switch (value_class)
+        {
+            case ValueClassRank::IMPORTANT:
+                return static_cast<uint32_t>((std::min<int32_t>)(
+                    max_recent_service_penalty(),
+                    (std::max)(0, baseline_old_utility(ValueClassRank::IMPORTANT) -
+                    baseline_new_utility(ValueClassRank::DEFAULT_VALUE))));
+            case ValueClassRank::DEFAULT_VALUE:
+                return static_cast<uint32_t>((std::min<int32_t>)(
+                    max_recent_service_penalty(),
+                    (std::max)(0, baseline_old_utility(ValueClassRank::DEFAULT_VALUE) -
+                    baseline_new_utility(ValueClassRank::REPLACEABLE_SNAPSHOT))));
+            default:
+                return max_recent_service_penalty();
+        }
+    }
+
+    static int32_t replaceable_old_stale_penalty(
+            const PressureSnapshot& pressure)
+    {
+        const int32_t freshness_unit = new_sample_bonus(ValueClassRank::REPLACEABLE_SNAPSHOT);
+        const int32_t base_stale_penalty = (freshness_unit * 2) / 3;
+        const int32_t pressure_penalty = (freshness_unit * pressure.old_repair_level) / 2;
+        return base_stale_penalty + pressure_penalty;
+    }
+
+    static int32_t replaceable_old_adjust(
+            const PressureSnapshot& pressure)
+    {
+        return -replaceable_old_stale_penalty(pressure);
+    }
+
+    static int32_t replaceable_superseded_penalty(
+            const PressureSnapshot& pressure)
+    {
+        const int32_t state_value_unit = base_utility(ValueClassRank::REPLACEABLE_SNAPSHOT);
+        return state_value_unit + (state_value_unit * pressure.old_repair_level) / 3;
     }
 
     static double default_hard_defer_ms(
@@ -1631,8 +1796,24 @@ private:
         {
             return sample_period_ms;
         }
-        static_cast<void>(deadline_ms);
+        if (deadline_ms > 0.0)
+        {
+            return deadline_ms;
+        }
         return 0.0;
+    }
+
+    static int64_t sample_age_full_scale_ms(
+            double sample_period_ms,
+            double deadline_ms)
+    {
+        const double hint_ms = effective_period_hint_ms(sample_period_ms, deadline_ms);
+        if (hint_ms <= 0.0)
+        {
+            return 540;
+        }
+
+        return static_cast<int64_t>((std::max)(40.0, (std::min)(540.0, hint_ms * 3.0)));
     }
 
     static double derived_hard_defer_ms(
@@ -1801,13 +1982,54 @@ private:
         pressure.link_pressure_level = feedback_pressure ? 2 :
                 (pressure.link_outstanding_changes > 0u && pressure.old_repair_level >= 2 ? 1 : 0);
         pressure.aggregate_level = (std::max)(pressure.contention_level,
-                        (std::max)(1, pressure.old_repair_level));
+                        (std::max)((std::max)(1, pressure.old_repair_level),
+                        (std::max)(pressure.link_pressure_level + 1,
+                        (std::max)(pressure.queue_pressure_level + 1,
+                        pressure.scheduling_pressure_level + 1))));
         return pressure;
     }
 
     int32_t old_pressure_level() const
     {
         return pressure_snapshot().old_repair_level;
+    }
+
+    static int32_t same_writer_old_new_gap(
+            ValueClassRank value_class,
+            bool has_newer_change,
+            const PressureSnapshot& pressure)
+    {
+        const int32_t old_adjust = ValueClassRank::REPLACEABLE_SNAPSHOT == value_class ?
+                replaceable_old_adjust(pressure) : old_sample_bonus(value_class);
+        const int32_t superseded_penalty = ValueClassRank::REPLACEABLE_SNAPSHOT == value_class && has_newer_change ?
+                replaceable_superseded_penalty(pressure) : 0;
+        return (std::max)(0, new_sample_bonus(value_class) - old_adjust + superseded_penalty);
+    }
+
+    static int32_t derived_old_age_bonus(
+            ValueClassRank value_class,
+            bool has_newer_change,
+            const PressureSnapshot& pressure,
+            int64_t old_sample_age_ms,
+            double hard_max_defer_ms)
+    {
+        if (old_sample_age_ms <= 0 || hard_max_defer_ms <= 0.0)
+        {
+            return 0;
+        }
+
+        const int32_t same_writer_gap = same_writer_old_new_gap(value_class, has_newer_change, pressure);
+        if (0 == same_writer_gap)
+        {
+            return 0;
+        }
+
+        const int32_t cap = (std::min)(same_writer_gap, old_defer_bonus_cap(has_newer_change));
+        const int64_t bounded_age_ms = (std::min)(
+            old_sample_age_ms, static_cast<int64_t>(hard_max_defer_ms));
+        return static_cast<int32_t>(
+            (static_cast<int64_t>(cap) * bounded_age_ms) /
+            (std::max<int64_t>)(1, static_cast<int64_t>(hard_max_defer_ms)));
     }
 
     UtilityBreakdown compute_utility_breakdown(
@@ -1824,6 +2046,8 @@ private:
         const int64_t sample_age_ms = nullptr != meta ? elapsed_ms(meta->first_seen, now) : 0;
         const int64_t old_sample_age_ms = nullptr != meta && sample_is_old && 0 != meta->old_enqueue_count ?
                 elapsed_ms(meta->first_old_seen, now) : sample_age_ms;
+        const int64_t sample_age_full_scale = sample_age_full_scale_ms(
+            writer.sample_period_ms, writer.deadline_ms);
 
         if (!sample_is_old)
         {
@@ -1840,10 +2064,10 @@ private:
                     breakdown.sample_kind_adjust = old_sample_bonus(writer.value_class);
                     break;
                 case ValueClassRank::REPLACEABLE_SNAPSHOT:
-                    breakdown.sample_kind_adjust = -(150 + pressure.old_repair_level * 110);
+                    breakdown.sample_kind_adjust = replaceable_old_adjust(pressure);
                     if (has_newer_change)
                     {
-                        breakdown.superseded_old_penalty = 260 + pressure.old_repair_level * 90;
+                        breakdown.superseded_old_penalty = replaceable_superseded_penalty(pressure);
                     }
                     break;
                 default:
@@ -1851,26 +2075,26 @@ private:
             }
         }
 
-        breakdown.writer_age_bonus = static_cast<int32_t>(std::min(writer.age_boost, max_age_boost)) * 12;
-        breakdown.sample_age_bonus = static_cast<int32_t>(std::min<int64_t>(90, sample_age_ms / 6));
+        breakdown.sample_age_bonus = static_cast<int32_t>(std::min<int64_t>(
+            max_sample_age_bonus(),
+            (sample_age_ms * max_sample_age_bonus()) / (std::max<int64_t>)(1, sample_age_full_scale)));
         if (sample_is_old)
         {
-            breakdown.old_age_bonus = static_cast<int32_t>(std::min(writer.old_age_boost, max_old_age_boost)) *
-                    (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class ? 8 : 14);
+            breakdown.old_age_bonus = derived_old_age_bonus(
+                writer.value_class, has_newer_change, pressure, old_sample_age_ms, writer.hard_max_defer_ms);
             if (ValueClassRank::REPLACEABLE_SNAPSHOT == writer.value_class &&
                     writer.value_horizon_ms > 0.0 &&
                     old_sample_age_ms >= static_cast<int64_t>(writer.value_horizon_ms))
             {
                 breakdown.value_horizon_penalty = static_cast<int32_t>(std::min<int64_t>(
-                    has_newer_change ? 320 : 160,
+                    old_defer_bonus_cap(has_newer_change),
                     (old_sample_age_ms - static_cast<int64_t>(writer.value_horizon_ms)) / 2));
             }
             if (writer.hard_max_defer_ms > 0.0 &&
                     old_sample_age_ms >= static_cast<int64_t>(writer.hard_max_defer_ms))
             {
-                const int32_t hard_defer_cap = has_newer_change ? 320 : 160;
                 breakdown.hard_defer_bonus = static_cast<int32_t>(std::min<int64_t>(
-                    hard_defer_cap,
+                    old_defer_bonus_cap(has_newer_change),
                     std::max<int64_t>(0,
                     old_sample_age_ms - static_cast<int64_t>(writer.hard_max_defer_ms)) / 2));
                 // A configured defer entitlement must not be cancelled by
@@ -1895,7 +2119,7 @@ private:
 
         breakdown.recent_service_penalty = recent_service_penalty(writer, pressure);
         breakdown.utility = breakdown.base + breakdown.sample_kind_adjust - breakdown.superseded_old_penalty +
-                breakdown.writer_age_bonus + breakdown.sample_age_bonus + breakdown.old_age_bonus +
+                breakdown.sample_age_bonus + breakdown.old_age_bonus +
                 breakdown.hard_defer_bonus - breakdown.value_horizon_penalty - breakdown.cooldown_penalty -
                 breakdown.byte_cost_penalty - breakdown.recent_service_penalty;
 
@@ -1948,6 +2172,26 @@ private:
                        100u);
     }
 
+    uint32_t feedback_rtt_floor_windows(
+            const PressureSnapshot& pressure) const
+    {
+        const double period_ms = static_cast<double>((std::max<int64_t>)(1, control_period_.count()));
+        const double feedback_ms = (std::max)(pressure.link_stable_feedback_ms,
+                        pressure.link_recovery_feedback_ewma_ms);
+        if (feedback_ms <= 0.0)
+        {
+            return 1u;
+        }
+
+        return static_cast<uint32_t>((std::max)(1.0, std::ceil(feedback_ms / period_ms)));
+    }
+
+    uint32_t effective_recovery_probe_interval_windows(
+            const PressureSnapshot& pressure) const
+    {
+        return (std::max)(recovery_probe_interval_windows_, feedback_rtt_floor_windows(pressure));
+    }
+
     bool network_admissible(
             uint32_t sample_size) const
     {
@@ -1955,10 +2199,63 @@ private:
                max_network_admissible_sample_bytes();
     }
 
-    bool can_send_with_balance(
+    std::chrono::steady_clock::time_point next_period_boundary() const
+    {
+        return last_send_budget_refill_ + control_period_;
+    }
+
+    std::chrono::steady_clock::time_point period_pacing_ready_time(
             uint32_t sample_size) const
     {
-        return send_balance_bytes_ > 0 && network_admissible(sample_size);
+        const auto next_boundary = next_period_boundary();
+        if (!send_budget_initialized_ || send_balance_bytes_ <= 0 || !network_admissible(sample_size))
+        {
+            return next_boundary;
+        }
+
+        const int64_t charge = static_cast<int64_t>((std::max)(1u, sample_size));
+        if (charge <= send_balance_bytes_)
+        {
+            return last_send_budget_refill_;
+        }
+
+        const uint64_t period_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
+        const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
+        const uint64_t positive_balance = static_cast<uint64_t>(
+            (std::max<int64_t>)(0, (std::min)(send_balance_bytes_, max_positive_send_balance())));
+        const uint64_t balance_deficit = charge > static_cast<int64_t>(positive_balance) ?
+                static_cast<uint64_t>(charge - static_cast<int64_t>(positive_balance)) : 0u;
+        if (balance_deficit > budget)
+        {
+            return next_boundary;
+        }
+
+        const uint64_t ready_us = 0u == period_us ? 0u :
+                (balance_deficit * period_us + budget - 1u) / budget;
+        if (ready_us >= period_us && period_us > 1u)
+        {
+            return next_boundary - std::chrono::microseconds(1);
+        }
+        const auto ready_time = last_send_budget_refill_ + std::chrono::microseconds(
+            static_cast<int64_t>(ready_us));
+        return ready_time < next_boundary ? ready_time : next_boundary;
+    }
+
+    bool period_pacing_admissible(
+            uint32_t sample_size,
+            const std::chrono::steady_clock::time_point& now) const
+    {
+        return now >= period_pacing_ready_time(sample_size);
+    }
+
+    bool can_send_with_balance(
+            uint32_t sample_size,
+            const std::chrono::steady_clock::time_point& now) const
+    {
+        return send_balance_bytes_ > 0 && network_admissible(sample_size) &&
+               ((pacing_wakeup_due_ && sample_size <= pacing_wakeup_sample_size_) ||
+               period_pacing_admissible(sample_size, now));
     }
 
     void record_send_budget_success(
@@ -2003,39 +2300,20 @@ private:
         while (last_send_budget_refill_ + control_period_ <= now)
         {
             const auto boundary = last_send_budget_refill_ + control_period_;
-            accrue_balance_until(boundary);
-
             update_send_budget_from_window();
+            replenish_balance_for_period();
+            maybe_decay_feedback_windows();
             control_window_.reset();
             last_send_budget_refill_ = boundary;
         }
-
-        accrue_balance_until(now);
     }
 
-    void accrue_balance_until(
-            const std::chrono::steady_clock::time_point& now)
+    void replenish_balance_for_period()
     {
-        if (now <= last_send_budget_refill_)
-        {
-            return;
-        }
-
-        const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_send_budget_refill_).count();
-        const uint64_t period_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
         const uint64_t effective_budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t credit_numerator = static_cast<uint64_t>(elapsed_us) * effective_budget + balance_refill_remainder_;
-        const uint64_t credit = credit_numerator / period_us;
-        balance_refill_remainder_ = credit_numerator % period_us;
-        if (0u == credit)
-        {
-            return;
-        }
-
         send_balance_bytes_ = (std::min)(
             max_positive_send_balance(),
-            send_balance_bytes_ + static_cast<int64_t>(credit));
+            send_balance_bytes_ + static_cast<int64_t>(effective_budget));
     }
 
     void update_send_budget_from_window()
@@ -2051,18 +2329,15 @@ private:
         const bool queued_demand = pressure.pending_writers > 0u ||
                 control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
                 pressure.link_outstanding_changes > 0u;
-        const uint64_t request_delta = pressure.link_request_samples > previous_link_request_samples_ ?
-                pressure.link_request_samples - previous_link_request_samples_ : 0u;
-        const uint64_t feedback_delta = pressure.link_feedback_samples > previous_link_feedback_samples_ ?
-                pressure.link_feedback_samples - previous_link_feedback_samples_ : 0u;
-        const uint64_t request_bytes_delta = pressure.link_request_bytes > previous_link_request_bytes_ ?
-                pressure.link_request_bytes - previous_link_request_bytes_ : 0u;
-        const uint64_t feedback_bytes_delta = pressure.link_feedback_bytes > previous_link_feedback_bytes_ ?
-                pressure.link_feedback_bytes - previous_link_feedback_bytes_ : 0u;
+        const LinkFeedbackWindow feedback_window = capture_link_feedback_window();
+        const uint64_t request_delta = feedback_window.request_samples_delta;
+        const uint64_t feedback_delta = feedback_window.feedback_samples_delta;
+        const uint64_t request_bytes_delta = feedback_window.request_bytes_delta;
+        const uint64_t feedback_bytes_delta = feedback_window.feedback_bytes_delta;
         const bool link_feedback_activity = request_delta > 0u || feedback_delta > 0u;
-        const bool feedback_slow = link_feedback_activity &&
+        const bool feedback_slow = feedback_delta > 0u &&
                 pressure.link_feedback_samples >= 3u &&
-                pressure.link_feedback_slow_ratio > link_feedback_pressure_ratio_;
+                feedback_window.active_feedback_slow_ratio > link_feedback_pressure_ratio_;
         const uint64_t repair_tolerance_bytes = (std::max<uint64_t>)(
             min_link_growth_tolerance_bytes(),
             static_cast<uint64_t>(current_send_budget_bytes_) / 16u);
@@ -2084,12 +2359,8 @@ private:
         const bool positive_feedback = !nack_growth && !feedback_slow && recovery_active_send_load &&
                 feedback_bytes_delta > 0u;
         const bool recovery_probe_eligible = !nack_growth && !feedback_slow && queued_demand &&
-                current_send_budget_bytes_ < initial_send_budget_bytes_;
-
-        previous_link_request_samples_ = pressure.link_request_samples;
-        previous_link_feedback_samples_ = pressure.link_feedback_samples;
-        previous_link_request_bytes_ = pressure.link_request_bytes;
-        previous_link_feedback_bytes_ = pressure.link_feedback_bytes;
+                control_window_.throttled > 0u &&
+                current_send_budget_bytes_ < max_send_budget_bytes_;
 
         if (negative_feedback)
         {
@@ -2103,7 +2374,9 @@ private:
             trace_budget_update("negative", previous_budget, previous_state, pressure,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     negative_feedback, positive_feedback, false,
-                    request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
+                    request_delta, feedback_delta, request_bytes_delta, feedback_bytes_delta,
+                    repair_tolerance_bytes, feedback_window.active_feedback_slow_ratio,
+                    link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
@@ -2124,7 +2397,9 @@ private:
             trace_budget_update("positive", previous_budget, previous_state, pressure,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     negative_feedback, positive_feedback, false,
-                    request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
+                    request_delta, feedback_delta, request_bytes_delta, feedback_bytes_delta,
+                    repair_tolerance_bytes, feedback_window.active_feedback_slow_ratio,
+                    link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
@@ -2132,19 +2407,21 @@ private:
         if (recovery_probe_eligible)
         {
             ++recovery_probe_windows_;
-            if (recovery_probe_windows_ >= recovery_probe_interval_windows_)
+            const uint32_t effective_probe_interval = effective_recovery_probe_interval_windows(pressure);
+            if (recovery_probe_windows_ >= effective_probe_interval)
             {
                 recovery_probe_windows_ = 0u;
                 send_load_state_ = SendLoadState::RECOVERY;
-                // Ambiguous feedback may recover the conservative starting point only.
                 current_send_budget_bytes_ = (std::min)(
-                    initial_send_budget_bytes_,
+                    max_send_budget_bytes_,
                     clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_budget_update("probe_recovery", previous_budget, previous_state, pressure,
                         recovery_active_send_load, negative_feedback_activity, queued_demand,
                         negative_feedback, positive_feedback, true,
-                        request_delta, feedback_delta, link_negative_signal, feedback_slow, nack_growth);
+                        request_delta, feedback_delta, request_bytes_delta, feedback_bytes_delta,
+                        repair_tolerance_bytes, feedback_window.active_feedback_slow_ratio,
+                        link_negative_signal, feedback_slow, nack_growth);
 #endif // FASTDDS_RETRANSMISSION_TRACE
                 return;
             }
@@ -2168,6 +2445,10 @@ private:
             false,
             request_delta,
             feedback_delta,
+            request_bytes_delta,
+            feedback_bytes_delta,
+            repair_tolerance_bytes,
+            feedback_window.active_feedback_slow_ratio,
             link_negative_signal,
             feedback_slow,
             nack_growth);
@@ -2192,22 +2473,22 @@ private:
             const WriterQueue& writer,
             const PressureSnapshot& pressure) const
     {
-        const uint64_t selected = writer.feedback_window.selected_utility_new +
-                writer.feedback_window.selected_utility_old;
-        int32_t penalty = 0;
-        if (pressure.contention_level >= 2 && pressure.selected_bytes > 0u)
+        const uint32_t class_cap = recent_service_penalty_cap(writer.value_class);
+        if (0u == class_cap)
         {
-            penalty = static_cast<int32_t>(std::min<uint64_t>(
-                180u,
-                static_cast<uint64_t>(writer.feedback_window.selected_bytes) * 180u /
+            return 0;
+        }
+
+        if (pressure.pending_writers >= 2u && pressure.selected_bytes > 0u)
+        {
+            return static_cast<int32_t>(std::min<uint64_t>(
+                class_cap,
+                static_cast<uint64_t>(writer.feedback_window.selected_bytes) *
+                class_cap /
                 pressure.selected_bytes));
         }
 
-        if (pressure.contention_level >= 3 && selected > 0u)
-        {
-            penalty += 12;
-        }
-        return (std::min)(max_recent_service_penalty, static_cast<uint32_t>(penalty));
+        return 0;
     }
 
     static int32_t score_from_utility(
@@ -2262,7 +2543,7 @@ private:
         candidate.utility = candidate.breakdown.utility;
         candidate.score = score_from_utility(candidate.utility);
 
-        if (require_network_admission && !can_send_with_balance(size))
+        if (require_network_admission && !can_send_with_balance(size, now))
         {
             return;
         }
@@ -2271,10 +2552,12 @@ private:
         const bool best_due = nullptr != best.writer && best.fairness_due;
         if (nullptr == best.writer ||
                 (candidate_due && !best_due) ||
-                (candidate_due && best_due && candidate.old_sample_age_ms > best.old_sample_age_ms) ||
-                (!candidate_due && !best_due && candidate.score > best.score) ||
+                (candidate_due == best_due && candidate.score > best.score) ||
                 (candidate.fairness_due == best.fairness_due &&
                 candidate.score == best.score && candidate.utility > best.utility) ||
+                (candidate.fairness_due && best.fairness_due &&
+                candidate.score == best.score && candidate.utility == best.utility &&
+                candidate.old_sample_age_ms > best.old_sample_age_ms) ||
                 (candidate.fairness_due == best.fairness_due &&
                 candidate.score == best.score && candidate.utility == best.utility &&
                 writer.value_class < best.queue->value_class) ||
@@ -2321,6 +2604,25 @@ private:
             return;
         }
 
+        if (network_admissible(best_overall.size))
+        {
+            if (can_send_with_balance(best_overall.size, now))
+            {
+                throttled_waiting_for_budget_ = false;
+                selected = best_overall;
+                return;
+            }
+
+            ++control_window_.throttled;
+            next_scheduler_wakeup_ = period_pacing_ready_time(best_overall.size);
+            pacing_wakeup_sample_size_ = best_overall.size;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_throttled(best_overall);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            throttled_waiting_for_budget_ = true;
+            return;
+        }
+
         if (nullptr != best_network_admissible.writer)
         {
             throttled_waiting_for_budget_ = false;
@@ -2328,9 +2630,11 @@ private:
             return;
         }
 
-        if (!can_send_with_balance(best_overall.size))
+        if (!can_send_with_balance(best_overall.size, now))
         {
             ++control_window_.throttled;
+            next_scheduler_wakeup_ = period_pacing_ready_time(best_overall.size);
+            pacing_wakeup_sample_size_ = best_overall.size;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_throttled(best_overall);
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -2355,6 +2659,8 @@ private:
     bool send_budget_initialized_ = false;
     bool budget_configured_ = false;
     bool throttled_waiting_for_budget_ = false;
+    bool pacing_wakeup_due_ = false;
+    uint32_t pacing_wakeup_sample_size_ = 0u;
     uint32_t recovery_probe_windows_ = 0u;
     uint32_t min_send_budget_bytes_ = 8u * 1024u;
     uint32_t initial_send_budget_bytes_ = 64u * 1024u;
@@ -2367,14 +2673,11 @@ private:
     uint32_t feedback_slow_window_threshold_ = 2u;
     uint32_t feedback_active_load_percent_ = 50u;
     uint32_t decrease_percent_ = 75u;
+    uint32_t feedback_decay_interval_windows_ = 10u;
     double link_feedback_pressure_ratio_ = 1.5;
     int64_t send_balance_bytes_ = initial_send_budget_bytes_;
-    uint64_t balance_refill_remainder_ = 0;
-    uint64_t previous_link_request_samples_ = 0;
-    uint64_t previous_link_feedback_samples_ = 0;
-    uint64_t previous_link_request_bytes_ = 0;
-    uint64_t previous_link_feedback_bytes_ = 0;
     std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next_scheduler_wakeup_ = std::chrono::steady_clock::now();
     std::chrono::milliseconds control_period_ {10};
 
     static const std::string* find_property(
@@ -2474,12 +2777,10 @@ private:
     static uint32_t size_to_check(
             fastrtps::rtps::CacheChange_t* change)
     {
-        uint32_t size = change->serializedPayload.length;
-        if (0 != change->getFragmentCount())
-        {
-            size = change->getFragmentSize();
-        }
-        return size;
+        // ADAPTIVE_VALUE_UTILITY schedules one deliver_sample_nts() call at a
+        // time. A fragmented change can send multiple fragments in that call,
+        // so its pacing unit must cover the complete payload.
+        return change->serializedPayload.length;
     }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -2502,6 +2803,8 @@ private:
                 elapsed_ms(meta_it->second.first_seen, now);
         const int64_t old_sample_age_ms = meta_it == writer->second.sample_meta.end() ||
                 0 == meta_it->second.old_enqueue_count ? 0 : elapsed_ms(meta_it->second.first_old_seen, now);
+        const int64_t sample_age_full_scale = sample_age_full_scale_ms(
+                writer->second.sample_period_ms, writer->second.deadline_ms);
         const bool selected_has_newer_change = selected_sample_is_old &&
                 has_newer_change(writer->second, selected_change);
         const PressureSnapshot pressure = pressure_snapshot();
@@ -2513,14 +2816,17 @@ private:
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
                << ";max_network_admissible_sample_bytes=" << max_network_admissible_sample_bytes()
+               << ";oversized_sample_budget_ratio=" << max_oversized_sample_budget_ratio_
                << ";oversized_sample=" << (selected_size > current_send_budget_bytes_)
+               << ";period_pacing_admissible=" << period_pacing_admissible(selected_size, now)
+               << ";pacing_wakeup_due=" << pacing_wakeup_due_
+               << ";pacing_wakeup_sample_size=" << pacing_wakeup_sample_size_
                << ";send_balance_after_bytes=" <<
                 (send_balance_bytes_ - static_cast<int64_t>((std::max)(1u, selected_size)))
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
                << ";control_window_throttled=" << control_window_.throttled
-               << ";age_boost=" << writer->second.age_boost
-               << ";old_age_boost=" << writer->second.old_age_boost
                << ";sample_age_ms=" << sample_age_ms
+               << ";sample_age_full_scale_ms=" << sample_age_full_scale
                << ";old_sample_age_ms=" << old_sample_age_ms
                << ";fairness_due=" << (selected_sample_is_old_being_processed_ &&
                 writer->second.hard_max_defer_ms > 0.0 &&
@@ -2558,7 +2864,6 @@ private:
                << ";utility_base=" << utility_breakdown_being_processed_.base
                << ";utility_sample_kind_adjust=" << utility_breakdown_being_processed_.sample_kind_adjust
                << ";utility_superseded_old_penalty=" << utility_breakdown_being_processed_.superseded_old_penalty
-               << ";utility_writer_age_bonus=" << utility_breakdown_being_processed_.writer_age_bonus
                << ";utility_sample_age_bonus=" << utility_breakdown_being_processed_.sample_age_bonus
                << ";utility_old_age_bonus=" << utility_breakdown_being_processed_.old_age_bonus
                << ";utility_hard_defer_bonus=" << utility_breakdown_being_processed_.hard_defer_bonus
@@ -2566,6 +2871,10 @@ private:
                << ";utility_cooldown_penalty=" << utility_breakdown_being_processed_.cooldown_penalty
                << ";utility_byte_cost_penalty=" << utility_breakdown_being_processed_.byte_cost_penalty
                << ";utility_recent_service_penalty=" << utility_breakdown_being_processed_.recent_service_penalty
+               << ";utility_recent_service_penalty_cap=" << recent_service_penalty_cap(writer->second.value_class)
+               << ";utility_adjacent_value_gap_floor=" << adjacent_value_gap_floor()
+               << ";utility_max_sample_age_bonus=" << max_sample_age_bonus()
+               << ";utility_old_defer_bonus_cap=" << old_defer_bonus_cap(selected_has_newer_change)
                << ";utility=" << utility_being_processed_
                << ";score=" << score_being_processed_;
 
@@ -2587,13 +2896,8 @@ private:
             return;
         }
 
-        const uint64_t period_us = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(control_period_).count());
-        const uint64_t budget = std::max<uint64_t>(1u, current_send_budget_bytes_);
-        const uint64_t required_credit = send_balance_bytes_ > 0 ? 0u :
-                static_cast<uint64_t>(1 - send_balance_bytes_);
-        const uint64_t wait_us = 0u == period_us ? 0u :
-                (required_credit * period_us + budget - 1u) / budget;
+        const uint64_t wait_us = static_cast<uint64_t>(
+            periodic_wait_duration().count());
         const PressureSnapshot pressure = pressure_snapshot();
 
         std::ostringstream detail;
@@ -2602,9 +2906,15 @@ private:
                << ";current_send_budget_bytes=" << current_send_budget_bytes_
                << ";send_balance_bytes=" << send_balance_bytes_
                << ";max_network_admissible_sample_bytes=" << max_network_admissible_sample_bytes()
+               << ";oversized_sample_budget_ratio=" << max_oversized_sample_budget_ratio_
                << ";oversized_sample=" << (best_overall.size > current_send_budget_bytes_)
                << ";network_admissible=" << network_admissible(best_overall.size)
+               << ";period_pacing_admissible=" << period_pacing_admissible(best_overall.size,
+                std::chrono::steady_clock::now())
+               << ";pacing_wakeup_due=" << pacing_wakeup_due_
+               << ";pacing_wakeup_sample_size=" << pacing_wakeup_sample_size_
                << ";estimated_wait_us=" << wait_us
+               << ";balance_refill_mode=period_boundary"
                << ";candidate_value_class=" << value_class_name(best_overall.queue->value_class)
                << ";candidate_sample_kind=" << (best_overall.sample_is_old ? "old" : "new")
                << ";candidate_fairness_due=" << best_overall.fairness_due
@@ -2651,6 +2961,10 @@ private:
             bool recovery_probe,
             uint64_t request_delta,
             uint64_t feedback_delta,
+            uint64_t request_bytes_delta,
+            uint64_t feedback_bytes_delta,
+            uint64_t repair_tolerance_bytes,
+            double active_feedback_slow_ratio,
             bool link_negative_signal,
             bool feedback_slow,
             bool nack_growth)
@@ -2678,8 +2992,22 @@ private:
                << ";recovery_probe=" << recovery_probe
                << ";recovery_probe_windows=" << recovery_probe_windows_
                << ";recovery_probe_interval_windows=" << recovery_probe_interval_windows_
+               << ";effective_recovery_probe_interval_windows=" <<
+                effective_recovery_probe_interval_windows(pressure)
+               << ";feedback_rtt_floor_windows=" << feedback_rtt_floor_windows(pressure)
+               << ";feedback_decay_interval_windows=" << feedback_decay_interval_windows_
+               << ";oversized_sample_budget_ratio=" << max_oversized_sample_budget_ratio_
+               << ";max_network_admissible_sample_bytes=" << max_network_admissible_sample_bytes()
                << ";request_delta=" << request_delta
                << ";feedback_delta=" << feedback_delta
+               << ";request_bytes_delta=" << request_bytes_delta
+               << ";feedback_bytes_delta=" << feedback_bytes_delta
+               << ";repair_tolerance_bytes=" << repair_tolerance_bytes
+               << ";active_feedback_slow_ratio=" << active_feedback_slow_ratio
+               << ";recovery_step_bytes=" << recovery_step_bytes_
+               << ";decrease_percent=" << decrease_percent_
+               << ";control_period_ms=" << control_period_.count()
+               << ";balance_refill_mode=period_boundary"
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
                << ";control_window_selected_old=" << control_window_.selected_old
                << ";control_window_selected_new=" << control_window_.selected_new
@@ -2753,26 +3081,8 @@ private:
                     writer.second.feedback_window.last_selected_sequence =
                             change_being_processed_->sequenceNumber.to64long();
                 }
-                writer.second.age_boost = 0;
-                if (selected_sample_is_old)
-                {
-                    writer.second.old_age_boost = 0;
-                }
-                else if (nullptr != writer.second.queue.get_next_old_change())
-                {
-                    writer.second.old_age_boost = std::min(max_old_age_boost, writer.second.old_age_boost + 1);
-                }
-            }
-            else if (nullptr != writer.second.queue.get_next_change())
-            {
-                writer.second.age_boost = std::min(max_age_boost, writer.second.age_boost + 1);
-                if (nullptr != writer.second.queue.get_next_old_change())
-                {
-                    writer.second.old_age_boost = std::min(max_old_age_boost, writer.second.old_age_boost + 1);
-                }
             }
         }
-        maybe_decay_feedback_windows();
     }
 
     static void decay_feedback_summary(
@@ -2791,7 +3101,7 @@ private:
     void maybe_decay_feedback_windows()
     {
         ++feedback_decay_counter_;
-        if (feedback_decay_counter_ < feedback_decay_interval)
+        if (feedback_decay_counter_ < feedback_decay_interval_windows_)
         {
             return;
         }
@@ -2838,7 +3148,6 @@ private:
                << ";last_new_enqueue_sequence=" << queue.summary.last_new_enqueue_sequence
                << ";last_old_enqueue_sequence=" << queue.summary.last_old_enqueue_sequence
                << ";last_selected_sequence=" << queue.summary.last_selected_sequence
-               << ";old_age_boost=" << queue.old_age_boost
                << '\n';
     }
 
@@ -3063,7 +3372,7 @@ private:
         assert(nullptr == change->writer_info.previous &&
                 nullptr == change->writer_info.next);
         // Sync delivery failed. Try to store for asynchronous delivery.
-        std::unique_lock<std::mutex> lock(async_mode.changes_interested_mutex);
+        std::unique_lock<std::mutex> interested_lock(async_mode.changes_interested_mutex);
         sched.add_new_sample(writer, change);
         async_mode.cv.notify_one();
 
@@ -3144,7 +3453,7 @@ private:
         if (nullptr == change->writer_info.previous &&
                 nullptr == change->writer_info.next)
         {
-            std::unique_lock<std::mutex> lock(async_mode.changes_interested_mutex);
+            std::unique_lock<std::mutex> interested_lock(async_mode.changes_interested_mutex);
             sched.add_old_sample(writer, change);
             async_mode.cv.notify_one();
 

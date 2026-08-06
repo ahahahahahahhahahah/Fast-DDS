@@ -164,6 +164,32 @@ double update_ewma(
     return 0.0 == current ? sample : alpha * sample + (1.0 - alpha) * current;
 }
 
+double update_lower_envelope_feedback_baseline(
+        double current,
+        uint32_t& warmup_samples,
+        double sample)
+{
+    if (sample <= 0.0)
+    {
+        return current;
+    }
+    if (0.0 == current)
+    {
+        warmup_samples = 1;
+        return sample;
+    }
+    if (warmup_samples < warmup_feedback_samples)
+    {
+        ++warmup_samples;
+        return update_ewma(current, sample);
+    }
+    if (sample < current)
+    {
+        return update_ewma(current, sample);
+    }
+    return current;
+}
+
 bool boolean_property_is_enabled(
         StatefulWriter& writer,
         const char* property_name)
@@ -1223,17 +1249,10 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                     if (async_tracking)
                     {
                         WriterState& writer_state = impl_->writers[writer->getGuid()];
-                        if (0.0 == writer_state.stable_feedback_ms)
-                        {
-                            writer_state.stable_feedback_ms = feedback_ms;
-                            writer_state.stable_feedback_warmup_samples = 1;
-                        }
-                        else if (writer_state.stable_feedback_warmup_samples < warmup_feedback_samples)
-                        {
-                            writer_state.stable_feedback_ms = update_ewma(
-                                writer_state.stable_feedback_ms, feedback_ms);
-                            ++writer_state.stable_feedback_warmup_samples;
-                        }
+                        writer_state.stable_feedback_ms = update_lower_envelope_feedback_baseline(
+                            writer_state.stable_feedback_ms,
+                            writer_state.stable_feedback_warmup_samples,
+                            feedback_ms);
                     }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                     ack_traces.push_back(
