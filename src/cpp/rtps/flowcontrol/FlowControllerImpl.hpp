@@ -1127,6 +1127,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
 
         int32_t priority = 0;
         ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
+        double sample_period_ms = 0.0;
+        double deadline_ms = 0.0;
         double hard_max_defer_ms = 0.0;
         double defer_cooldown_ms = 0.0;
         double value_horizon_ms = 0.0;
@@ -1134,6 +1136,14 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         hard_max_defer_ms = default_hard_defer_ms(value_class);
         defer_cooldown_ms = default_defer_cooldown_ms(value_class);
         value_horizon_ms = default_value_horizon_ms(value_class);
+
+        parse_double_property(writer, "fastdds.adaptive_retransmission.sample_period_ms",
+                0.0, 60000.0, sample_period_ms);
+        parse_double_property(writer, "fastdds.adaptive_retransmission.deadline_ms",
+                0.0, 60000.0, deadline_ms);
+        hard_max_defer_ms = derived_hard_defer_ms(value_class, sample_period_ms, deadline_ms, hard_max_defer_ms);
+        defer_cooldown_ms = derived_defer_cooldown_ms(value_class, sample_period_ms, defer_cooldown_ms);
+        value_horizon_ms = derived_value_horizon_ms(value_class, sample_period_ms, deadline_ms, value_horizon_ms);
 
         int32_t parsed_priority = priority;
         if (parse_int32_property(writer, "fastdds.adaptive_async.priority", -10, 10, parsed_priority) ||
@@ -1153,6 +1163,8 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         writer_queue.writer = writer;
         writer_queue.priority = priority;
         writer_queue.value_class = value_class;
+        writer_queue.sample_period_ms = sample_period_ms;
+        writer_queue.deadline_ms = deadline_ms;
         writer_queue.hard_max_defer_ms = hard_max_defer_ms;
         writer_queue.defer_cooldown_ms = defer_cooldown_ms;
         writer_queue.value_horizon_ms = value_horizon_ms;
@@ -1344,6 +1356,8 @@ private:
         fastrtps::rtps::RTPSWriter* writer = nullptr;
         int32_t priority = 0;
         ValueClassRank value_class = ValueClassRank::DEFAULT_VALUE;
+        double sample_period_ms = 0.0;
+        double deadline_ms = 0.0;
         double hard_max_defer_ms = 0.0;
         double defer_cooldown_ms = 0.0;
         double value_horizon_ms = 0.0;
@@ -1607,6 +1621,73 @@ private:
     {
         return ValueClassRank::REPLACEABLE_SNAPSHOT == value_class ?
                default_replaceable_defer_cooldown_ms : 0.0;
+    }
+
+    static double effective_period_hint_ms(
+            double sample_period_ms,
+            double deadline_ms)
+    {
+        if (sample_period_ms > 0.0)
+        {
+            return sample_period_ms;
+        }
+        static_cast<void>(deadline_ms);
+        return 0.0;
+    }
+
+    static double derived_hard_defer_ms(
+            ValueClassRank value_class,
+            double sample_period_ms,
+            double deadline_ms,
+            double fallback_ms)
+    {
+        const double hint_ms = effective_period_hint_ms(sample_period_ms, deadline_ms);
+        if (hint_ms <= 0.0)
+        {
+            return deadline_ms > 0.0 ? (std::max)(fallback_ms, deadline_ms) : fallback_ms;
+        }
+
+        double class_scaled = ValueClassRank::IMPORTANT == value_class ? hint_ms * 2.0 :
+                (ValueClassRank::REPLACEABLE_SNAPSHOT == value_class ? hint_ms * 4.0 : hint_ms * 3.0);
+        class_scaled = (std::max)(fallback_ms, class_scaled);
+        if (deadline_ms > 0.0)
+        {
+            class_scaled = (std::min)(class_scaled, (std::max)(deadline_ms, fallback_ms));
+        }
+        return class_scaled;
+    }
+
+    static double derived_defer_cooldown_ms(
+            ValueClassRank value_class,
+            double sample_period_ms,
+            double fallback_ms)
+    {
+        if (ValueClassRank::REPLACEABLE_SNAPSHOT != value_class || sample_period_ms <= 0.0)
+        {
+            return fallback_ms;
+        }
+        return (std::max)(fallback_ms, sample_period_ms);
+    }
+
+    static double derived_value_horizon_ms(
+            ValueClassRank value_class,
+            double sample_period_ms,
+            double deadline_ms,
+            double fallback_ms)
+    {
+        if (ValueClassRank::REPLACEABLE_SNAPSHOT != value_class)
+        {
+            return deadline_ms > 0.0 ? deadline_ms : fallback_ms;
+        }
+
+        const double hint_ms = effective_period_hint_ms(sample_period_ms, deadline_ms);
+        if (hint_ms <= 0.0)
+        {
+            return deadline_ms > 0.0 ? (std::max)(fallback_ms, deadline_ms) : fallback_ms;
+        }
+        const double horizon_ms = hint_ms * 2.0;
+        const double derived_ms = (std::max)(fallback_ms, horizon_ms);
+        return deadline_ms > 0.0 ? (std::min)(derived_ms, (std::max)(deadline_ms, fallback_ms)) : derived_ms;
     }
 
     PressureSnapshot pressure_snapshot() const
@@ -2445,6 +2526,8 @@ private:
                 writer->second.hard_max_defer_ms > 0.0 &&
                 old_sample_age_ms >= static_cast<int64_t>(writer->second.hard_max_defer_ms))
                << ";has_newer_change=" << selected_has_newer_change
+               << ";sample_period_ms=" << writer->second.sample_period_ms
+               << ";deadline_ms=" << writer->second.deadline_ms
                << ";hard_max_defer_ms=" << writer->second.hard_max_defer_ms
                << ";defer_cooldown_ms=" << writer->second.defer_cooldown_ms
                << ";value_horizon_ms=" << writer->second.value_horizon_ms
@@ -2739,6 +2822,11 @@ private:
                << ";writer_guid=" << writer->getGuid()
                << ";value_class=" << value_class_name(queue.value_class)
                << ";priority=" << queue.priority
+               << ";sample_period_ms=" << queue.sample_period_ms
+               << ";deadline_ms=" << queue.deadline_ms
+               << ";hard_max_defer_ms=" << queue.hard_max_defer_ms
+               << ";defer_cooldown_ms=" << queue.defer_cooldown_ms
+               << ";value_horizon_ms=" << queue.value_horizon_ms
                << ";new_enqueue=" << queue.summary.new_enqueue
                << ";old_enqueue=" << queue.summary.old_enqueue
                << ";selected_utility_new=" << queue.summary.selected_utility_new
