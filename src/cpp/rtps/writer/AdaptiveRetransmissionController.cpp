@@ -35,7 +35,9 @@ constexpr const char* enabled_property = "fastdds.adaptive_retransmission.enable
 constexpr const char* async_observe_property = "fastdds.adaptive_async.observe_old_samples";
 
 // Provisional safety defaults. These are experiment inputs, not calibrated link classifications.
-constexpr uint32_t warmup_feedback_samples = 3;
+constexpr uint32_t stable_feedback_calibration_min_samples = 8;
+constexpr auto stable_feedback_calibration_min_duration = std::chrono::seconds(5);
+constexpr uint32_t pressure_feedback_min_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
 constexpr uint32_t max_planned_changes_per_cycle = 32;
@@ -136,7 +138,10 @@ struct WriterState
     uint64_t byte_budget = max_bytes_per_cycle;
     uint64_t previous_candidate_bytes = 0;
     double stable_feedback_ms = 0.0;
-    uint32_t stable_feedback_warmup_samples = 0;
+    uint32_t stable_feedback_calibration_samples = 0;
+    double stable_feedback_calibration_sum_ms = 0.0;
+    steady_clock::time_point stable_feedback_calibration_started;
+    bool stable_feedback_calibrated = false;
     RecoveryState recovery_state = RecoveryState::NORMAL;
     uint32_t pressure_cycles = 0;
     uint32_t improving_cycles = 0;
@@ -164,9 +169,13 @@ double update_ewma(
     return 0.0 == current ? sample : alpha * sample + (1.0 - alpha) * current;
 }
 
-double update_lower_envelope_feedback_baseline(
+double update_calibrated_feedback_baseline(
         double current,
-        uint32_t& warmup_samples,
+        uint32_t& calibration_samples,
+        double& calibration_sum_ms,
+        steady_clock::time_point& calibration_started,
+        bool& calibrated,
+        steady_clock::time_point now,
         double sample)
 {
     if (sample <= 0.0)
@@ -175,13 +184,23 @@ double update_lower_envelope_feedback_baseline(
     }
     if (0.0 == current)
     {
-        warmup_samples = 1;
+        calibration_started = now;
+        calibration_samples = 1;
+        calibration_sum_ms = sample;
+        calibrated = false;
         return sample;
     }
-    if (warmup_samples < warmup_feedback_samples)
+    if (!calibrated)
     {
-        ++warmup_samples;
-        return update_ewma(current, sample);
+        ++calibration_samples;
+        calibration_sum_ms += sample;
+        current = calibration_sum_ms / calibration_samples;
+        if (calibration_samples >= stable_feedback_calibration_min_samples &&
+                now - calibration_started >= stable_feedback_calibration_min_duration)
+        {
+            calibrated = true;
+        }
+        return current;
     }
     if (sample < current)
     {
@@ -512,10 +531,33 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
     auto writer_it = impl_->writers.find(writer_guid);
     const double stable_feedback_ms = writer_it == impl_->writers.end() ?
             0.0 : writer_it->second.stable_feedback_ms;
+    const bool stable_feedback_calibrated = writer_it != impl_->writers.end() &&
+            writer_it->second.stable_feedback_calibrated;
+    if (writer_it != impl_->writers.end())
+    {
+        snapshot.stable_feedback_calibration_samples = writer_it->second.stable_feedback_calibration_samples;
+        snapshot.stable_feedback_calibrated = writer_it->second.stable_feedback_calibrated;
+    }
+    std::map<GUID_t, std::size_t> reader_path_indices;
     for (const auto& item : impl_->readers)
     {
         if (item.first.writer == writer_guid)
         {
+            AdaptiveRetransmissionReaderFeedbackSnapshot reader_snapshot;
+            reader_snapshot.reader_guid = item.first.reader;
+            reader_snapshot.request_samples = item.second.request_samples;
+            reader_snapshot.feedback_samples = item.second.feedback_samples;
+            reader_snapshot.request_bytes = item.second.request_bytes;
+            reader_snapshot.feedback_bytes = item.second.feedback_bytes;
+            reader_snapshot.request_interval_ewma_ms = item.second.request_interval_ewma_ms;
+            reader_snapshot.recovery_feedback_ewma_ms = item.second.recovery_feedback_ewma_ms;
+            if (stable_feedback_calibrated && stable_feedback_ms > 0.0)
+            {
+                reader_snapshot.feedback_slow_ratio = item.second.recovery_feedback_ewma_ms / stable_feedback_ms;
+            }
+            reader_path_indices[item.first.reader] = snapshot.reader_paths.size();
+            snapshot.reader_paths.push_back(reader_snapshot);
+
             snapshot.request_samples += item.second.request_samples;
             snapshot.feedback_samples += item.second.feedback_samples;
             snapshot.request_bytes += item.second.request_bytes;
@@ -526,7 +568,7 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             snapshot.recovery_feedback_ewma_ms = std::max(
                 snapshot.recovery_feedback_ewma_ms,
                 item.second.recovery_feedback_ewma_ms);
-            if (stable_feedback_ms > 0.0)
+            if (stable_feedback_calibrated && stable_feedback_ms > 0.0)
             {
                 snapshot.feedback_slow_ratio = std::max(
                     snapshot.feedback_slow_ratio,
@@ -541,6 +583,14 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
         {
             ++snapshot.outstanding_changes;
             snapshot.outstanding_bytes += item.second.estimated_bytes;
+            auto reader_it = reader_path_indices.find(item.first.path.reader);
+            if (reader_it != reader_path_indices.end())
+            {
+                AdaptiveRetransmissionReaderFeedbackSnapshot& reader_snapshot =
+                        snapshot.reader_paths[reader_it->second];
+                ++reader_snapshot.outstanding_changes;
+                reader_snapshot.outstanding_bytes += item.second.estimated_bytes;
+            }
         }
     }
 
@@ -853,10 +903,12 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         }
         if (feedback_ms > 0.0 && 0.0 == writer_state.stable_feedback_ms)
         {
+            // Sync admission only has the reader EWMA here, not raw ACK samples.
             writer_state.stable_feedback_ms = feedback_ms;
+            writer_state.stable_feedback_calibrated = true;
         }
-
-        const bool feedback_pressure = writer_state.stable_feedback_ms > 0.0 &&
+        const bool feedback_pressure = writer_state.stable_feedback_calibrated &&
+                writer_state.stable_feedback_ms > 0.0 &&
                 feedback_ms > pressure_feedback_ratio * writer_state.stable_feedback_ms;
         const bool backlog_growing = pressure_candidate_bytes > writer_state.previous_candidate_bytes;
         const bool pressure_signal = (feedback_pressure && backlog_growing) ||
@@ -1134,7 +1186,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
 #endif // FASTDDS_RETRANSMISSION_TRACE
         const double age_ms = std::chrono::duration<double, std::milli>(now - observed.first_request).count();
         const double hard_max_defer = hard_max_defer_or(*writer);
-        const bool feedback_pressure = reader.feedback_samples >= warmup_feedback_samples &&
+        const bool feedback_pressure = reader.feedback_samples >= pressure_feedback_min_samples &&
                 reader.recovery_feedback_ewma_ms > slow_feedback_ms;
         const bool recovery_pressure = pending >= pressure_request_count ||
                 observed.requests >= pressure_request_count || feedback_pressure;
@@ -1254,9 +1306,13 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                     if (async_feedback_accounting)
                     {
                         WriterState& writer_state = impl_->writers[writer->getGuid()];
-                        writer_state.stable_feedback_ms = update_lower_envelope_feedback_baseline(
+                        writer_state.stable_feedback_ms = update_calibrated_feedback_baseline(
                             writer_state.stable_feedback_ms,
-                            writer_state.stable_feedback_warmup_samples,
+                            writer_state.stable_feedback_calibration_samples,
+                            writer_state.stable_feedback_calibration_sum_ms,
+                            writer_state.stable_feedback_calibration_started,
+                            writer_state.stable_feedback_calibrated,
+                            now,
                             feedback_ms);
                     }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
