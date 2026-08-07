@@ -2613,13 +2613,6 @@ private:
                 return;
             }
 
-            if (!best_overall.fairness_due && nullptr != best_network_admissible.writer)
-            {
-                throttled_waiting_for_budget_ = false;
-                selected = best_network_admissible;
-                return;
-            }
-
             ++control_window_.throttled;
             next_scheduler_wakeup_ = period_pacing_ready_time(best_overall.size);
             pacing_wakeup_sample_size_ = best_overall.size;
