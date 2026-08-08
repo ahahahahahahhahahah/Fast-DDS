@@ -39,6 +39,9 @@ struct AdaptiveRetransmissionReaderFeedbackSnapshot
     uint64_t outstanding_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
+    double stable_feedback_ms = 0.0;
+    uint32_t stable_feedback_calibration_samples = 0;
+    bool stable_feedback_calibrated = false;
     double feedback_slow_ratio = 0.0;
 };
 
@@ -77,6 +80,11 @@ public:
             const GUID_t& reader_guid,
             const CacheChange_t& change,
             bool queued);
+
+    void on_async_sample_sent(
+            StatefulWriter* writer,
+            const CacheChange_t& change,
+            bool old_sample);
 
     void begin_admission_cycle(
             StatefulWriter* writer);

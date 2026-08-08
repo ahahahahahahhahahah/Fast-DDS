@@ -1221,6 +1221,16 @@ struct FlowControllerAdaptiveValueUtilitySchedule
                 trace_selection(writer_being_processed_, change_being_processed_, size_being_processed_,
                         selected_sample_is_old_being_processed_);
 #endif // FASTDDS_RETRANSMISSION_TRACE
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer_being_processed_);
+                if (nullptr != stateful_writer)
+                {
+                    fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_async_sample_sent(
+                        stateful_writer,
+                        *change_being_processed_,
+                        selected_sample_is_old_being_processed_);
+                }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
                 record_send_budget_success(size_being_processed_);
                 record_successful_selection(writer_being_processed_,
                         selected_sample_is_old_being_processed_);
@@ -1638,10 +1648,13 @@ private:
                         reader_path.feedback_bytes - previous_path.previous_feedback_bytes : 0u;
                 const bool path_active = path_request_samples_delta > 0u || path_feedback_samples_delta > 0u ||
                         path_request_bytes_delta > 0u || path_feedback_bytes_delta > 0u;
+                const bool path_calibrated = reader_path.stable_feedback_calibrated;
                 const bool path_feedback_slow = (path_feedback_samples_delta > 0u ||
                         path_feedback_bytes_delta > 0u) &&
+                        path_calibrated &&
                         reader_path.feedback_slow_ratio > link_feedback_pressure_ratio_;
                 const bool path_repair_growth =
+                        path_calibrated &&
                         path_request_bytes_delta > path_feedback_bytes_delta + path_repair_tolerance_bytes &&
                         reader_path.outstanding_changes > 0u;
                 const bool path_slow = path_feedback_slow || path_repair_growth;
@@ -2162,7 +2175,7 @@ private:
                 {
                     const bool path_seen = reader_path.request_samples > 0u || reader_path.feedback_samples > 0u ||
                             reader_path.request_bytes > 0u || reader_path.feedback_bytes > 0u;
-                    if (path_seen)
+                    if (path_seen && reader_path.stable_feedback_calibrated)
                     {
                         ++writer_active_reader_paths;
                         ++pressure.link_active_reader_paths;
