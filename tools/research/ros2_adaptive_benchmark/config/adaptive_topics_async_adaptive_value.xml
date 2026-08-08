@@ -13,7 +13,7 @@
                         <scheduler>ADAPTIVE_VALUE_UTILITY</scheduler>
                         <period_ms>10</period_ms>
                         <adaptive_min_bytes_per_period>8192</adaptive_min_bytes_per_period>
-                        <adaptive_initial_bytes_per_period>24576</adaptive_initial_bytes_per_period>
+                        <adaptive_initial_bytes_per_period>20480</adaptive_initial_bytes_per_period>
                         <adaptive_max_bytes_per_period>65536</adaptive_max_bytes_per_period>
                         <adaptive_recovery_steps>14</adaptive_recovery_steps>
                         <adaptive_recovery_probe_windows>10</adaptive_recovery_probe_windows>
