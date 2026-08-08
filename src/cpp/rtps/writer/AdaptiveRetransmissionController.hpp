@@ -37,6 +37,10 @@ struct AdaptiveRetransmissionReaderFeedbackSnapshot
     uint64_t feedback_bytes = 0;
     uint64_t outstanding_changes = 0;
     uint64_t outstanding_bytes = 0;
+    uint64_t repair_send_samples = 0;
+    uint64_t repair_send_bytes = 0;
+    uint64_t repair_timeout_samples = 0;
+    uint64_t repair_timeout_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -53,6 +57,10 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     uint64_t feedback_bytes = 0;
     uint64_t outstanding_changes = 0;
     uint64_t outstanding_bytes = 0;
+    uint64_t repair_send_samples = 0;
+    uint64_t repair_send_bytes = 0;
+    uint64_t repair_timeout_samples = 0;
+    uint64_t repair_timeout_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -121,7 +129,7 @@ public:
             const GUID_t& reader_guid);
 
     AdaptiveRetransmissionFeedbackSnapshot feedback_snapshot(
-            const StatefulWriter* writer) const;
+            const StatefulWriter* writer);
 
 private:
 

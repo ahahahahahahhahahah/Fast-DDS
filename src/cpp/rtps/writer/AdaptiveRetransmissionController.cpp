@@ -38,6 +38,9 @@ constexpr const char* async_observe_property = "fastdds.adaptive_async.observe_o
 constexpr uint32_t stable_feedback_calibration_min_samples = 16;
 constexpr auto stable_feedback_calibration_min_duration = std::chrono::seconds(5);
 constexpr std::size_t max_sent_ack_tracking_per_writer = 8192;
+constexpr std::size_t max_repair_send_attempts_per_change = 8;
+constexpr double repair_timeout_baseline_multiplier = 3.0;
+constexpr double min_repair_timeout_ms = 25.0;
 constexpr uint32_t pressure_feedback_min_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
@@ -89,6 +92,10 @@ struct ReaderState
     uint32_t feedback_samples = 0;
     uint64_t request_bytes = 0;
     uint64_t feedback_bytes = 0;
+    uint64_t repair_send_samples = 0;
+    uint64_t repair_send_bytes = 0;
+    uint64_t repair_timeout_samples = 0;
+    uint64_t repair_timeout_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -109,6 +116,12 @@ struct SentChangeState
     bool old_sample = false;
 };
 
+struct RepairSendAttempt
+{
+    steady_clock::time_point sent_time;
+    uint32_t estimated_bytes = 0;
+};
+
 struct ChangeState
 {
     uint32_t requests = 0;
@@ -118,6 +131,8 @@ struct ChangeState
     steady_clock::time_point last_request;
     steady_clock::time_point last_interest;
     steady_clock::time_point defer_cooldown_until;
+    std::vector<RepairSendAttempt> repair_send_attempts;
+    bool repair_timeout_reported = false;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     bool admission_trace_initialized = false;
     AdaptiveRetransmissionDecision admission_trace_decision =
@@ -559,7 +574,7 @@ AdaptiveRetransmissionController::~AdaptiveRetransmissionController()
 }
 
 AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedback_snapshot(
-        const StatefulWriter* writer) const
+        const StatefulWriter* writer)
 {
     AdaptiveRetransmissionFeedbackSnapshot snapshot;
     if (nullptr == writer)
@@ -569,6 +584,38 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
 
     const GUID_t writer_guid = writer->getGuid();
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto now = steady_clock::now();
+    for (auto& item : impl_->changes)
+    {
+        if (item.first.path.writer != writer_guid ||
+                item.second.repair_timeout_reported ||
+                item.second.repair_send_attempts.empty())
+        {
+            continue;
+        }
+
+        auto reader_it = impl_->readers.find(item.first.path);
+        if (reader_it == impl_->readers.end() ||
+                !reader_it->second.stable_feedback_calibrated ||
+                reader_it->second.stable_feedback_ms <= 0.0)
+        {
+            continue;
+        }
+
+        const RepairSendAttempt& latest_attempt = item.second.repair_send_attempts.back();
+        const double timeout_ms = (std::max)(
+            min_repair_timeout_ms,
+            reader_it->second.stable_feedback_ms * repair_timeout_baseline_multiplier);
+        const double pending_ms = std::chrono::duration<double, std::milli>(
+            now - latest_attempt.sent_time).count();
+        if (pending_ms >= timeout_ms)
+        {
+            item.second.repair_timeout_reported = true;
+            ++reader_it->second.repair_timeout_samples;
+            reader_it->second.repair_timeout_bytes += item.second.estimated_bytes;
+        }
+    }
+
     std::map<GUID_t, std::size_t> reader_path_indices;
     for (const auto& item : impl_->readers)
     {
@@ -580,6 +627,10 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             reader_snapshot.feedback_samples = item.second.feedback_samples;
             reader_snapshot.request_bytes = item.second.request_bytes;
             reader_snapshot.feedback_bytes = item.second.feedback_bytes;
+            reader_snapshot.repair_send_samples = item.second.repair_send_samples;
+            reader_snapshot.repair_send_bytes = item.second.repair_send_bytes;
+            reader_snapshot.repair_timeout_samples = item.second.repair_timeout_samples;
+            reader_snapshot.repair_timeout_bytes = item.second.repair_timeout_bytes;
             reader_snapshot.request_interval_ewma_ms = item.second.request_interval_ewma_ms;
             reader_snapshot.recovery_feedback_ewma_ms = item.second.recovery_feedback_ewma_ms;
             reader_snapshot.stable_feedback_ms = item.second.stable_feedback_ms;
@@ -598,6 +649,10 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             snapshot.feedback_samples += item.second.feedback_samples;
             snapshot.request_bytes += item.second.request_bytes;
             snapshot.feedback_bytes += item.second.feedback_bytes;
+            snapshot.repair_send_samples += item.second.repair_send_samples;
+            snapshot.repair_send_bytes += item.second.repair_send_bytes;
+            snapshot.repair_timeout_samples += item.second.repair_timeout_samples;
+            snapshot.repair_timeout_bytes += item.second.repair_timeout_bytes;
             snapshot.request_interval_ewma_ms = std::max(
                 snapshot.request_interval_ewma_ms,
                 item.second.request_interval_ewma_ms);
@@ -783,14 +838,44 @@ void AdaptiveRetransmissionController::on_async_sample_sent(
     const auto now = steady_clock::now();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     WriterState& writer_state = impl_->writers[writer->getGuid()];
-    SentChangeState& sent = writer_state.sent_changes[change.sequenceNumber];
-    sent.sent_time = now;
-    sent.estimated_bytes = change.serializedPayload.length;
-    sent.old_sample = old_sample;
+    if (!old_sample || writer_state.sent_changes.find(change.sequenceNumber) == writer_state.sent_changes.end())
+    {
+        SentChangeState& sent = writer_state.sent_changes[change.sequenceNumber];
+        sent.sent_time = now;
+        sent.estimated_bytes = change.serializedPayload.length;
+        sent.old_sample = old_sample;
+    }
 
     while (writer_state.sent_changes.size() > max_sent_ack_tracking_per_writer)
     {
         writer_state.sent_changes.erase(writer_state.sent_changes.begin());
+    }
+
+    if (old_sample)
+    {
+        for (auto& item : impl_->changes)
+        {
+            if (item.first.path.writer != writer->getGuid() ||
+                    item.first.sequence != change.sequenceNumber ||
+                    item.second.last_interest == steady_clock::time_point())
+            {
+                continue;
+            }
+
+            ChangeState& observed = item.second;
+            RepairSendAttempt attempt;
+            attempt.sent_time = now;
+            attempt.estimated_bytes = change.serializedPayload.length;
+            observed.repair_send_attempts.push_back(attempt);
+            if (observed.repair_send_attempts.size() > max_repair_send_attempts_per_change)
+            {
+                observed.repair_send_attempts.erase(observed.repair_send_attempts.begin());
+            }
+
+            ReaderState& reader = impl_->readers[item.first.path];
+            ++reader.repair_send_samples;
+            reader.repair_send_bytes += change.serializedPayload.length;
+        }
     }
 }
 
@@ -1384,19 +1469,22 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
             const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
             if (same_reader && it->first.sequence < sequence_number)
             {
-                if (it->second.last_interest != steady_clock::time_point())
+                if (it->second.last_interest != steady_clock::time_point() &&
+                        !it->second.repair_send_attempts.empty())
                 {
+                    const RepairSendAttempt& latest_attempt = it->second.repair_send_attempts.back();
                     const double feedback_ms =
-                            std::chrono::duration<double, std::milli>(now - it->second.last_interest).count();
+                            std::chrono::duration<double, std::milli>(
+                        now - latest_attempt.sent_time).count();
                     reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
                     ++reader.feedback_samples;
-                    reader.feedback_bytes += it->second.estimated_bytes;
+                    reader.feedback_bytes += latest_attempt.estimated_bytes;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                     ack_traces.push_back(
                         AckTrace
                         {
                             it->first.sequence,
-                            it->second.estimated_bytes,
+                            latest_attempt.estimated_bytes,
                             feedback_ms
                         });
 #endif // FASTDDS_RETRANSMISSION_TRACE
@@ -1415,7 +1503,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
     {
         std::ostringstream detail;
         detail << "mode=" << controller_mode_name(*writer)
-               << ";source=cumulative_ack"
+               << ";source=repair_send_ack"
                << ";ack_base=" << sequence_number
                << ";feedback_ms=" << trace.feedback_ms;
         FASTDDS_TRACE_RETRANSMISSION(
