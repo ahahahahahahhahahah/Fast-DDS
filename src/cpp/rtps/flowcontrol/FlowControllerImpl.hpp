@@ -1447,6 +1447,10 @@ private:
         uint32_t link_stable_feedback_calibration_samples = 0;
         bool link_stable_feedback_calibrated = false;
         double link_feedback_slow_ratio = 0.0;
+        uint64_t link_observed_reader_paths = 0;
+        uint64_t link_calibrated_reader_paths = 0;
+        uint64_t link_observed_writers = 0;
+        uint64_t link_calibrated_writers = 0;
         uint64_t link_active_reader_paths = 0;
         uint64_t link_slow_reader_paths = 0;
         uint64_t link_active_writers = 0;
@@ -2169,10 +2173,19 @@ private:
                 pressure.link_feedback_slow_ratio = (std::max)(
                     pressure.link_feedback_slow_ratio,
                     feedback.feedback_slow_ratio);
+                uint64_t writer_observed_reader_paths = 0;
+                uint64_t writer_calibrated_reader_paths = 0;
                 uint64_t writer_active_reader_paths = 0;
                 uint64_t writer_slow_reader_paths = 0;
                 for (const auto& reader_path : feedback.reader_paths)
                 {
+                    ++writer_observed_reader_paths;
+                    ++pressure.link_observed_reader_paths;
+                    if (reader_path.stable_feedback_calibrated)
+                    {
+                        ++writer_calibrated_reader_paths;
+                        ++pressure.link_calibrated_reader_paths;
+                    }
                     const bool path_seen = reader_path.request_samples > 0u || reader_path.feedback_samples > 0u ||
                             reader_path.request_bytes > 0u || reader_path.feedback_bytes > 0u;
                     if (path_seen && reader_path.stable_feedback_calibrated)
@@ -2185,6 +2198,14 @@ private:
                             ++pressure.link_slow_reader_paths;
                         }
                     }
+                }
+                if (writer_observed_reader_paths > 0u)
+                {
+                    ++pressure.link_observed_writers;
+                }
+                if (writer_calibrated_reader_paths > 0u)
+                {
+                    ++pressure.link_calibrated_writers;
                 }
                 if (writer_active_reader_paths > 0u)
                 {
@@ -3214,6 +3235,10 @@ private:
                     pressure.link_stable_feedback_calibration_samples
                << ";link_stable_feedback_calibrated=" << pressure.link_stable_feedback_calibrated
                << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
+               << ";link_observed_reader_paths=" << pressure.link_observed_reader_paths
+               << ";link_calibrated_reader_paths=" << pressure.link_calibrated_reader_paths
+               << ";link_observed_writers=" << pressure.link_observed_writers
+               << ";link_calibrated_writers=" << pressure.link_calibrated_writers
                << ";link_active_reader_paths=" << pressure.link_active_reader_paths
                << ";link_slow_reader_paths=" << pressure.link_slow_reader_paths
                << ";link_active_writers=" << pressure.link_active_writers
@@ -3302,6 +3327,10 @@ private:
                     pressure.link_stable_feedback_calibration_samples
                << ";link_stable_feedback_calibrated=" << pressure.link_stable_feedback_calibrated
                << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
+               << ";link_observed_reader_paths=" << pressure.link_observed_reader_paths
+               << ";link_calibrated_reader_paths=" << pressure.link_calibrated_reader_paths
+               << ";link_observed_writers=" << pressure.link_observed_writers
+               << ";link_calibrated_writers=" << pressure.link_calibrated_writers
                << ";link_active_reader_paths=" << pressure.link_active_reader_paths
                << ";link_slow_reader_paths=" << pressure.link_slow_reader_paths
                << ";link_active_writers=" << pressure.link_active_writers
@@ -3435,6 +3464,10 @@ private:
                     pressure.link_stable_feedback_calibration_samples
                << ";link_stable_feedback_calibrated=" << pressure.link_stable_feedback_calibrated
                << ";link_feedback_slow_ratio=" << pressure.link_feedback_slow_ratio
+               << ";link_observed_reader_paths=" << pressure.link_observed_reader_paths
+               << ";link_calibrated_reader_paths=" << pressure.link_calibrated_reader_paths
+               << ";link_observed_writers=" << pressure.link_observed_writers
+               << ";link_calibrated_writers=" << pressure.link_calibrated_writers
                << ";link_active_reader_paths=" << pressure.link_active_reader_paths
                << ";link_slow_reader_paths=" << pressure.link_slow_reader_paths
                << ";link_active_writers=" << pressure.link_active_writers
