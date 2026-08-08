@@ -198,8 +198,9 @@ int main(
         size_t total_application_bytes = 0;
         const auto usage_start = benchmark::process_usage();
         const int64_t benchmark_start_ns = benchmark::steady_now_ns();
+        bool interrupted = false;
 
-        while (!all_done(streams))
+        while (rclcpp::ok() && !all_done(streams))
         {
             int64_t next_due_ns = std::numeric_limits<int64_t>::max();
             for (const auto& stream : streams)
@@ -210,15 +211,26 @@ int main(
                 }
             }
 
-            while (benchmark::steady_now_ns() < next_due_ns)
+            while (rclcpp::ok() && benchmark::steady_now_ns() < next_due_ns)
             {
                 rclcpp::spin_some(node);
+                if (!rclcpp::ok())
+                {
+                    interrupted = true;
+                    break;
+                }
                 const int64_t remaining_ns = next_due_ns - benchmark::steady_now_ns();
                 if (remaining_ns > 0)
                 {
                     std::this_thread::sleep_for(
                         std::chrono::nanoseconds(std::min<int64_t>(remaining_ns, 1000000)));
                 }
+            }
+
+            if (!rclcpp::ok())
+            {
+                interrupted = true;
+                break;
             }
 
             now_ns = benchmark::steady_now_ns();
@@ -268,11 +280,21 @@ int main(
             }
         }
 
+        if (!all_done(streams))
+        {
+            interrupted = true;
+        }
+
         const auto drain_deadline = std::chrono::steady_clock::now() +
                 std::chrono::duration<double>(drain_seconds);
-        while (std::chrono::steady_clock::now() < drain_deadline)
+        while (rclcpp::ok() && std::chrono::steady_clock::now() < drain_deadline)
         {
             rclcpp::spin_some(node);
+            if (!rclcpp::ok())
+            {
+                interrupted = true;
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
@@ -305,6 +327,7 @@ int main(
                   << ",\"late_sends\":" << late_sends
                   << ",\"max_rss_kb\":" << usage_end.max_rss_kb
                   << ",\"output\":\"" << benchmark::json_escape(output_path) << "\""
+                  << ",\"interrupted\":" << (interrupted ? "true" : "false")
                   << ",\"publish_call_p50_us\":" << benchmark::percentile(publish_call_us, 0.50)
                   << ",\"publish_call_p95_us\":" << benchmark::percentile(publish_call_us, 0.95)
                   << ",\"publish_call_p99_us\":" << benchmark::percentile(publish_call_us, 0.99)
@@ -313,7 +336,7 @@ int main(
                   << ",\"total_sent\":" << records.size() << "}\n";
 
         rclcpp::shutdown();
-        return 0;
+        return interrupted ? 130 : 0;
     }
     catch (const std::exception& error)
     {
