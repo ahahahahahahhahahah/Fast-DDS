@@ -41,6 +41,8 @@ constexpr std::size_t max_sent_ack_tracking_per_writer = 8192;
 constexpr std::size_t max_repair_send_attempts_per_change = 8;
 constexpr double repair_timeout_baseline_multiplier = 3.0;
 constexpr double min_repair_timeout_ms = 25.0;
+constexpr double repair_timeout_request_interval_multiplier = 1.5;
+constexpr double max_repair_timeout_request_interval_ms = 200.0;
 constexpr uint32_t pressure_feedback_min_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
@@ -605,9 +607,16 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
         }
 
         const RepairSendAttempt& latest_attempt = item.second.repair_send_attempts.back();
-        const double timeout_ms = (std::max)(
+        double timeout_ms = (std::max)(
             min_repair_timeout_ms,
             reader_it->second.stable_feedback_ms * repair_timeout_baseline_multiplier);
+        if (reader_it->second.request_interval_ewma_ms > 0.0)
+        {
+            const double request_interval_grace_ms = (std::min)(
+                max_repair_timeout_request_interval_ms,
+                reader_it->second.request_interval_ewma_ms * repair_timeout_request_interval_multiplier);
+            timeout_ms = (std::max)(timeout_ms, request_interval_grace_ms);
+        }
         const double pending_ms = std::chrono::duration<double, std::milli>(
             now - latest_attempt.sent_time).count();
         if (pending_ms >= timeout_ms)
@@ -622,6 +631,7 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                    << ";pending_ms=" << pending_ms
                    << ";timeout_ms=" << timeout_ms
                    << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
+                   << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
                    << ";repair_send_attempts=" << item.second.repair_send_attempts.size()
                    << ";latest_send_bytes=" << latest_attempt.estimated_bytes;
             FASTDDS_TRACE_RETRANSMISSION(
