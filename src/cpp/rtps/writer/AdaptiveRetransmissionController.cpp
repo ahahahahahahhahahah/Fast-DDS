@@ -615,6 +615,23 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             item.second.repair_timeout_reported = true;
             ++reader_it->second.repair_timeout_samples;
             reader_it->second.repair_timeout_bytes += item.second.estimated_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            std::ostringstream detail;
+            detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
+                   << ";source=repair_timeout"
+                   << ";pending_ms=" << pending_ms
+                   << ";timeout_ms=" << timeout_ms
+                   << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
+                   << ";repair_send_attempts=" << item.second.repair_send_attempts.size()
+                   << ";latest_send_bytes=" << latest_attempt.estimated_bytes;
+            FASTDDS_TRACE_RETRANSMISSION(
+                writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
+                writer->getGuid(),
+                item.first.path.reader,
+                item.first.sequence,
+                item.second.estimated_bytes,
+                detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
         }
     }
 
