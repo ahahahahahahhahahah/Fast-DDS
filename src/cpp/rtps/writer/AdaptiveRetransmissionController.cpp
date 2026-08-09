@@ -104,6 +104,8 @@ struct ReaderState
     steady_clock::time_point stable_feedback_calibration_started;
     bool stable_feedback_calibrated = false;
     SequenceNumber_t last_ack_base = SequenceNumber_t();
+    bool ack_progress_tracking_started = false;
+    steady_clock::time_point ack_progress_tracking_start_time;
     steady_clock::time_point last_request;
     uint32_t admitted_changes_in_cycle = 0;
     uint64_t admitted_bytes_in_cycle = 0;
@@ -1444,21 +1446,31 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
 
         if (async_feedback_accounting && sequence_number > reader.last_ack_base)
         {
-            for (auto sent_it = writer_state.sent_changes.lower_bound(reader.last_ack_base);
-                    sent_it != writer_state.sent_changes.end() && sent_it->first < sequence_number; ++sent_it)
+            if (!reader.ack_progress_tracking_started)
             {
-                if (!sent_it->second.old_sample && sent_it->second.sent_time != steady_clock::time_point())
+                reader.ack_progress_tracking_started = true;
+                reader.ack_progress_tracking_start_time = now;
+            }
+            else
+            {
+                for (auto sent_it = writer_state.sent_changes.lower_bound(reader.last_ack_base);
+                        sent_it != writer_state.sent_changes.end() && sent_it->first < sequence_number; ++sent_it)
                 {
-                    const double ack_progress_ms =
-                            std::chrono::duration<double, std::milli>(now - sent_it->second.sent_time).count();
-                    reader.stable_feedback_ms = update_calibrated_feedback_baseline_from_ack_progress(
-                        reader.stable_feedback_ms,
-                        reader.stable_feedback_calibration_samples,
-                        reader.stable_feedback_calibration_samples_ms,
-                        reader.stable_feedback_calibration_started,
-                        reader.stable_feedback_calibrated,
-                        now,
-                        ack_progress_ms);
+                    if (!sent_it->second.old_sample &&
+                            sent_it->second.sent_time != steady_clock::time_point() &&
+                            sent_it->second.sent_time >= reader.ack_progress_tracking_start_time)
+                    {
+                        const double ack_progress_ms =
+                                std::chrono::duration<double, std::milli>(now - sent_it->second.sent_time).count();
+                        reader.stable_feedback_ms = update_calibrated_feedback_baseline_from_ack_progress(
+                            reader.stable_feedback_ms,
+                            reader.stable_feedback_calibration_samples,
+                            reader.stable_feedback_calibration_samples_ms,
+                            reader.stable_feedback_calibration_started,
+                            reader.stable_feedback_calibrated,
+                            now,
+                            ack_progress_ms);
+                    }
                 }
             }
             reader.last_ack_base = sequence_number;

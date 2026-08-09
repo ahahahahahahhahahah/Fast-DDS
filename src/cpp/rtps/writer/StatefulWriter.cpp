@@ -2142,8 +2142,15 @@ bool StatefulWriter::process_acknack(
                                             cache_change->serializedPayload.length,
                                             detail.str());
 #else
-                                        flow_controller_->add_old_sample(this, cache_change);
+                                        const bool queued = flow_controller_->add_old_sample(this, cache_change);
 #endif // FASTDDS_RETRANSMISSION_TRACE
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                                        detail::AdaptiveRetransmissionController::instance().on_old_sample_enqueued(
+                                            this,
+                                            remote_reader->guid(),
+                                            *cache_change,
+                                            queued);
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
                                     }))
                                     {
                                         if (remote_reader->is_remote_and_reliable())
