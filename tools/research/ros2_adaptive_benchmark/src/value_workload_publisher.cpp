@@ -321,7 +321,7 @@ int main(
         std::cout << std::fixed << std::setprecision(6)
                   << "{\"application_mbps\":"
                   << (send_span_seconds > 0.0 ? total_application_bytes * 8.0 / send_span_seconds / 1000000.0 : 0.0)
-                  << ",\"control_sent\":" << streams[0].messages
+                  << ",\"control_sent\":" << streams[0].sequence
                   << ",\"cpu_percent\":" << (wall_seconds > 0.0 ? cpu_seconds / wall_seconds * 100.0 : 0.0)
                   << ",\"late_p95_us\":" << benchmark::percentile(late_us, 0.95)
                   << ",\"late_sends\":" << late_sends
@@ -331,8 +331,8 @@ int main(
                   << ",\"publish_call_p50_us\":" << benchmark::percentile(publish_call_us, 0.50)
                   << ",\"publish_call_p95_us\":" << benchmark::percentile(publish_call_us, 0.95)
                   << ",\"publish_call_p99_us\":" << benchmark::percentile(publish_call_us, 0.99)
-                  << ",\"sensor_sent\":" << streams[2].messages
-                  << ",\"state_sent\":" << streams[1].messages
+                  << ",\"sensor_sent\":" << streams[2].sequence
+                  << ",\"state_sent\":" << streams[1].sequence
                   << ",\"total_sent\":" << records.size() << "}\n";
 
         rclcpp::shutdown();

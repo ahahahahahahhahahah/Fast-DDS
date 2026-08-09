@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -85,6 +86,18 @@ struct ChangeKey
             return false;
         }
         return sequence < other.sequence;
+    }
+};
+
+struct WriterSequenceKey
+{
+    GUID_t writer;
+    SequenceNumber_t sequence;
+
+    bool operator <(
+            const WriterSequenceKey& other) const
+    {
+        return writer < other.writer || (!(other.writer < writer) && sequence < other.sequence);
     }
 };
 
@@ -528,36 +541,159 @@ struct AdaptiveRetransmissionController::Implementation
     std::mutex mutex;
     std::map<ReaderKey, ReaderState> readers;
     std::map<ChangeKey, ChangeState> changes;
+    std::map<WriterSequenceKey, std::vector<ChangeKey>> changes_by_writer_sequence;
+    std::map<GUID_t, std::set<ChangeKey>> changes_by_writer;
+    std::map<ReaderKey, uint64_t> outstanding_changes_by_reader;
+    std::map<ReaderKey, uint64_t> outstanding_bytes_by_reader;
+    std::map<GUID_t, uint64_t> outstanding_changes_by_writer;
+    std::map<GUID_t, uint64_t> outstanding_bytes_by_writer;
     std::map<GUID_t, WriterState> writers;
     std::map<GUID_t, std::vector<AdmissionCandidate>> cycle_candidates;
     std::map<ChangeKey, AdaptiveRetransmissionDecision> cycle_plan;
 
+    static bool same_change_key(
+            const ChangeKey& left,
+            const ChangeKey& right)
+    {
+        return !(left < right) && !(right < left);
+    }
+
+    ChangeState& ensure_change(
+            const ChangeKey& key)
+    {
+        const auto inserted = changes.emplace(key, ChangeState());
+        if (inserted.second)
+        {
+            changes_by_writer_sequence[WriterSequenceKey {key.path.writer, key.sequence}].push_back(key);
+            changes_by_writer[key.path.writer].insert(key);
+            ++outstanding_changes_by_reader[key.path];
+            ++outstanding_changes_by_writer[key.path.writer];
+        }
+        return inserted.first->second;
+    }
+
+    static void remove_indexed_key(
+            std::vector<ChangeKey>& keys,
+            const ChangeKey& key)
+    {
+        keys.erase(std::remove_if(keys.begin(), keys.end(),
+                        [&key](const ChangeKey& current)
+                        {
+                            return same_change_key(current, key);
+                        }),
+                keys.end());
+    }
+
+    void update_estimated_bytes(
+            const ChangeKey& key,
+            ChangeState& state,
+            uint32_t estimated_bytes)
+    {
+        if (state.estimated_bytes == estimated_bytes)
+        {
+            return;
+        }
+
+        if (estimated_bytes > state.estimated_bytes)
+        {
+            const uint64_t delta = static_cast<uint64_t>(estimated_bytes - state.estimated_bytes);
+            outstanding_bytes_by_reader[key.path] += delta;
+            outstanding_bytes_by_writer[key.path.writer] += delta;
+        }
+        else
+        {
+            const uint64_t delta = static_cast<uint64_t>(state.estimated_bytes - estimated_bytes);
+            auto reader_bytes = outstanding_bytes_by_reader.find(key.path);
+            if (reader_bytes != outstanding_bytes_by_reader.end())
+            {
+                reader_bytes->second = reader_bytes->second > delta ? reader_bytes->second - delta : 0u;
+                if (0u == reader_bytes->second)
+                {
+                    outstanding_bytes_by_reader.erase(reader_bytes);
+                }
+            }
+            auto writer_bytes = outstanding_bytes_by_writer.find(key.path.writer);
+            if (writer_bytes != outstanding_bytes_by_writer.end())
+            {
+                writer_bytes->second = writer_bytes->second > delta ? writer_bytes->second - delta : 0u;
+                if (0u == writer_bytes->second)
+                {
+                    outstanding_bytes_by_writer.erase(writer_bytes);
+                }
+            }
+        }
+        state.estimated_bytes = estimated_bytes;
+    }
+
+    void remove_change_from_indexes(
+            const ChangeKey& key)
+    {
+        auto indexed = changes_by_writer_sequence.find(WriterSequenceKey {key.path.writer, key.sequence});
+        if (indexed != changes_by_writer_sequence.end())
+        {
+            remove_indexed_key(indexed->second, key);
+            if (indexed->second.empty())
+            {
+                changes_by_writer_sequence.erase(indexed);
+            }
+        }
+
+        auto writer_indexed = changes_by_writer.find(key.path.writer);
+        if (writer_indexed != changes_by_writer.end())
+        {
+            writer_indexed->second.erase(key);
+            if (writer_indexed->second.empty())
+            {
+                changes_by_writer.erase(writer_indexed);
+            }
+        }
+    }
+
+    std::map<ChangeKey, ChangeState>::iterator erase_change(
+            std::map<ChangeKey, ChangeState>::iterator it)
+    {
+        const ChangeKey key = it->first;
+        auto reader_count = outstanding_changes_by_reader.find(key.path);
+        if (reader_count != outstanding_changes_by_reader.end())
+        {
+            if (reader_count->second > 1u)
+            {
+                --reader_count->second;
+            }
+            else
+            {
+                outstanding_changes_by_reader.erase(reader_count);
+            }
+        }
+        auto writer_count = outstanding_changes_by_writer.find(key.path.writer);
+        if (writer_count != outstanding_changes_by_writer.end())
+        {
+            if (writer_count->second > 1u)
+            {
+                --writer_count->second;
+            }
+            else
+            {
+                outstanding_changes_by_writer.erase(writer_count);
+            }
+        }
+        update_estimated_bytes(key, it->second, 0u);
+        remove_change_from_indexes(key);
+        return changes.erase(it);
+    }
+
     size_t outstanding_changes(
             const ReaderKey& key) const
     {
-        size_t count = 0;
-        for (const auto& item : changes)
-        {
-            if (!(item.first.path < key) && !(key < item.first.path))
-            {
-                ++count;
-            }
-        }
-        return count;
+        auto count = outstanding_changes_by_reader.find(key);
+        return count == outstanding_changes_by_reader.end() ? 0u : static_cast<size_t>(count->second);
     }
 
     uint64_t outstanding_bytes(
             const ReaderKey& key) const
     {
-        uint64_t bytes = 0;
-        for (const auto& item : changes)
-        {
-            if (!(item.first.path < key) && !(key < item.first.path))
-            {
-                bytes += item.second.estimated_bytes;
-            }
-        }
-        return bytes;
+        auto bytes = outstanding_bytes_by_reader.find(key);
+        return bytes == outstanding_bytes_by_reader.end() ? 0u : bytes->second;
     }
 };
 
@@ -589,63 +725,78 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
     const GUID_t writer_guid = writer->getGuid();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto now = steady_clock::now();
-    for (auto& item : impl_->changes)
+    auto writer_changes = impl_->changes_by_writer.find(writer_guid);
+    if (writer_changes != impl_->changes_by_writer.end())
     {
-        if (item.first.path.writer != writer_guid ||
-                item.second.repair_timeout_reported ||
-                item.second.repair_send_attempts.empty())
+        for (const ChangeKey& change_key : writer_changes->second)
         {
-            continue;
-        }
+            auto item = impl_->changes.find(change_key);
+            if (item == impl_->changes.end() ||
+                    item->second.repair_timeout_reported ||
+                    item->second.repair_send_attempts.empty())
+            {
+                continue;
+            }
 
-        auto reader_it = impl_->readers.find(item.first.path);
-        if (reader_it == impl_->readers.end() ||
-                !reader_it->second.stable_feedback_calibrated ||
-                reader_it->second.stable_feedback_ms <= 0.0)
-        {
-            continue;
-        }
+            auto reader_it = impl_->readers.find(item->first.path);
+            if (reader_it == impl_->readers.end() ||
+                    !reader_it->second.stable_feedback_calibrated ||
+                    reader_it->second.stable_feedback_ms <= 0.0)
+            {
+                continue;
+            }
 
-        const RepairSendAttempt& latest_attempt = item.second.repair_send_attempts.back();
-        double timeout_ms = (std::max)(
-            min_repair_timeout_ms,
-            reader_it->second.stable_feedback_ms * repair_timeout_baseline_multiplier);
-        if (reader_it->second.request_interval_ewma_ms > 0.0)
-        {
-            const double request_interval_grace_ms = (std::min)(
-                max_repair_timeout_request_interval_ms,
-                reader_it->second.request_interval_ewma_ms * repair_timeout_request_interval_multiplier);
-            timeout_ms = (std::max)(timeout_ms, request_interval_grace_ms);
-        }
-        const double pending_ms = std::chrono::duration<double, std::milli>(
-            now - latest_attempt.sent_time).count();
-        if (pending_ms >= timeout_ms)
-        {
-            item.second.repair_timeout_reported = true;
-            ++reader_it->second.repair_timeout_samples;
-            reader_it->second.repair_timeout_bytes += item.second.estimated_bytes;
+            const RepairSendAttempt& latest_attempt = item->second.repair_send_attempts.back();
+            double timeout_ms = (std::max)(
+                min_repair_timeout_ms,
+                reader_it->second.stable_feedback_ms * repair_timeout_baseline_multiplier);
+            if (reader_it->second.request_interval_ewma_ms > 0.0)
+            {
+                const double request_interval_grace_ms = (std::min)(
+                    max_repair_timeout_request_interval_ms,
+                    reader_it->second.request_interval_ewma_ms * repair_timeout_request_interval_multiplier);
+                timeout_ms = (std::max)(timeout_ms, request_interval_grace_ms);
+            }
+            const double pending_ms = std::chrono::duration<double, std::milli>(
+                now - latest_attempt.sent_time).count();
+            if (pending_ms >= timeout_ms)
+            {
+                item->second.repair_timeout_reported = true;
+                ++reader_it->second.repair_timeout_samples;
+                reader_it->second.repair_timeout_bytes += item->second.estimated_bytes;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-            std::ostringstream detail;
-            detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
-                   << ";source=repair_timeout"
-                   << ";pending_ms=" << pending_ms
-                   << ";timeout_ms=" << timeout_ms
-                   << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
-                   << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
-                   << ";repair_send_attempts=" << item.second.repair_send_attempts.size()
-                   << ";latest_send_bytes=" << latest_attempt.estimated_bytes;
-            FASTDDS_TRACE_RETRANSMISSION(
-                writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
-                writer->getGuid(),
-                item.first.path.reader,
-                item.first.sequence,
-                item.second.estimated_bytes,
-                detail.str());
+                std::ostringstream detail;
+                detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
+                       << ";source=repair_timeout"
+                       << ";pending_ms=" << pending_ms
+                       << ";timeout_ms=" << timeout_ms
+                       << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
+                       << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
+                       << ";repair_send_attempts=" << item->second.repair_send_attempts.size()
+                       << ";latest_send_bytes=" << latest_attempt.estimated_bytes;
+                FASTDDS_TRACE_RETRANSMISSION(
+                    writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
+                    writer->getGuid(),
+                    item->first.path.reader,
+                    item->first.sequence,
+                    item->second.estimated_bytes,
+                    detail.str());
 #endif // FASTDDS_RETRANSMISSION_TRACE
+            }
         }
     }
 
-    std::map<GUID_t, std::size_t> reader_path_indices;
+    auto writer_outstanding_changes = impl_->outstanding_changes_by_writer.find(writer_guid);
+    if (writer_outstanding_changes != impl_->outstanding_changes_by_writer.end())
+    {
+        snapshot.outstanding_changes = writer_outstanding_changes->second;
+    }
+    auto writer_outstanding_bytes = impl_->outstanding_bytes_by_writer.find(writer_guid);
+    if (writer_outstanding_bytes != impl_->outstanding_bytes_by_writer.end())
+    {
+        snapshot.outstanding_bytes = writer_outstanding_bytes->second;
+    }
+
     for (const auto& item : impl_->readers)
     {
         if (item.first.writer == writer_guid)
@@ -671,7 +822,16 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                 reader_snapshot.feedback_slow_ratio =
                         item.second.recovery_feedback_ewma_ms / item.second.stable_feedback_ms;
             }
-            reader_path_indices[item.first.reader] = snapshot.reader_paths.size();
+            auto reader_outstanding_changes = impl_->outstanding_changes_by_reader.find(item.first);
+            if (reader_outstanding_changes != impl_->outstanding_changes_by_reader.end())
+            {
+                reader_snapshot.outstanding_changes = reader_outstanding_changes->second;
+            }
+            auto reader_outstanding_bytes = impl_->outstanding_bytes_by_reader.find(item.first);
+            if (reader_outstanding_bytes != impl_->outstanding_bytes_by_reader.end())
+            {
+                reader_snapshot.outstanding_bytes = reader_outstanding_bytes->second;
+            }
             snapshot.reader_paths.push_back(reader_snapshot);
 
             snapshot.request_samples += item.second.request_samples;
@@ -704,23 +864,6 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                 snapshot.feedback_slow_ratio = std::max(
                     snapshot.feedback_slow_ratio,
                     item.second.recovery_feedback_ewma_ms / item.second.stable_feedback_ms);
-            }
-        }
-    }
-
-    for (const auto& item : impl_->changes)
-    {
-        if (item.first.path.writer == writer_guid)
-        {
-            ++snapshot.outstanding_changes;
-            snapshot.outstanding_bytes += item.second.estimated_bytes;
-            auto reader_it = reader_path_indices.find(item.first.path.reader);
-            if (reader_it != reader_path_indices.end())
-            {
-                AdaptiveRetransmissionReaderFeedbackSnapshot& reader_snapshot =
-                        snapshot.reader_paths[reader_it->second];
-                ++reader_snapshot.outstanding_changes;
-                reader_snapshot.outstanding_bytes += item.second.estimated_bytes;
             }
         }
     }
@@ -765,14 +908,14 @@ void AdaptiveRetransmissionController::on_requested(
         reader.request_bytes += estimated_bytes;
         reader.last_request = now;
 
-        ChangeState& observed = impl_->changes[change_key];
+        ChangeState& observed = impl_->ensure_change(change_key);
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         ++observed.requests;
         observed.requested_fragments = requested_fragments;
-        observed.estimated_bytes = estimated_bytes;
+        impl_->update_estimated_bytes(change_key, observed, estimated_bytes);
         observed.last_request = now;
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -819,14 +962,14 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
 #endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        ChangeState& observed = impl_->changes[change_key];
+        ChangeState& observed = impl_->ensure_change(change_key);
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         if (0 == observed.estimated_bytes)
         {
-            observed.estimated_bytes = change.serializedPayload.length;
+            impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
         }
         observed.last_interest = now;
 
@@ -882,16 +1025,29 @@ void AdaptiveRetransmissionController::on_async_sample_sent(
 
     if (old_sample)
     {
-        for (auto& item : impl_->changes)
+        auto indexed = impl_->changes_by_writer_sequence.find(
+            WriterSequenceKey {writer->getGuid(), change.sequenceNumber});
+        if (indexed == impl_->changes_by_writer_sequence.end())
         {
-            if (item.first.path.writer != writer->getGuid() ||
-                    item.first.sequence != change.sequenceNumber ||
-                    item.second.last_interest == steady_clock::time_point())
+            return;
+        }
+
+        auto& interested_paths = indexed->second;
+        for (auto path_it = interested_paths.begin(); path_it != interested_paths.end(); )
+        {
+            auto item = impl_->changes.find(*path_it);
+            if (item == impl_->changes.end())
             {
+                path_it = interested_paths.erase(path_it);
+                continue;
+            }
+            if (item->second.last_interest == steady_clock::time_point())
+            {
+                ++path_it;
                 continue;
             }
 
-            ChangeState& observed = item.second;
+            ChangeState& observed = item->second;
             RepairSendAttempt attempt;
             attempt.sent_time = now;
             attempt.estimated_bytes = change.serializedPayload.length;
@@ -901,9 +1057,14 @@ void AdaptiveRetransmissionController::on_async_sample_sent(
                 observed.repair_send_attempts.erase(observed.repair_send_attempts.begin());
             }
 
-            ReaderState& reader = impl_->readers[item.first.path];
+            ReaderState& reader = impl_->readers[item->first.path];
             ++reader.repair_send_samples;
             reader.repair_send_bytes += change.serializedPayload.length;
+            ++path_it;
+        }
+        if (interested_paths.empty())
+        {
+            impl_->changes_by_writer_sequence.erase(indexed);
         }
     }
 }
@@ -960,11 +1121,11 @@ void AdaptiveRetransmissionController::add_admission_candidate(
     const ReaderKey reader_key {writer->getGuid(), reader_guid};
     const ChangeKey change_key {reader_key, change.sequenceNumber};
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    ChangeState& observed = impl_->changes[change_key];
+    ChangeState& observed = impl_->ensure_change(change_key);
     if (0 == observed.requests)
     {
         observed.first_request = now;
-        observed.estimated_bytes = change.serializedPayload.length;
+        impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
     }
 
     AdmissionCandidate candidate;
@@ -1028,7 +1189,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         for (size_t index = 0; index < candidates.size(); ++index)
         {
             const AdmissionCandidate& candidate = candidates[index];
-            ChangeState& observed = impl_->changes[candidate.key];
+            ChangeState& observed = impl_->ensure_change(candidate.key);
             const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
             const bool cooldown_active = ForceClass::NONE == candidate_force &&
                     defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
@@ -1206,12 +1367,14 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 impl_->cycle_plan[candidate.key] = decision;
                 if (AdaptiveRetransmissionDecision::DEFER != decision)
                 {
-                    impl_->changes[candidate.key].last_interest = steady_clock::now();
-                    impl_->changes[candidate.key].defer_cooldown_until = steady_clock::time_point();
+                    ChangeState& observed = impl_->ensure_change(candidate.key);
+                    observed.last_interest = steady_clock::now();
+                    observed.defer_cooldown_until = steady_clock::time_point();
                 }
                 else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
                 {
-                    impl_->changes[candidate.key].defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
+                    impl_->ensure_change(candidate.key).defer_cooldown_until =
+                            now + milliseconds_duration(defer_cooldown_ms);
                 }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -1313,7 +1476,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
         bool emit_trace = false;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            ChangeState& observed = impl_->changes[key];
+            ChangeState& observed = impl_->ensure_change(key);
             emit_trace = !observed.admission_trace_initialized ||
                     observed.admission_trace_decision != planned_decision;
             if (emit_trace)
@@ -1351,14 +1514,14 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ReaderState& reader = impl_->readers[reader_key];
-        ChangeState& observed = impl_->changes[change_key];
+        ChangeState& observed = impl_->ensure_change(change_key);
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         if (0 == observed.estimated_bytes)
         {
-            observed.estimated_bytes = change.serializedPayload.length;
+            impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
         }
 
         const size_t pending = impl_->outstanding_changes(reader_key);
@@ -1528,7 +1691,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                         });
 #endif // FASTDDS_RETRANSMISSION_TRACE
                 }
-                it = impl_->changes.erase(it);
+                it = impl_->erase_change(it);
             }
             else
             {
@@ -1582,7 +1745,7 @@ void AdaptiveRetransmissionController::on_change_removed(
         if (change != impl_->changes.end())
         {
             estimated_bytes = change->second.estimated_bytes;
-            impl_->changes.erase(change);
+            impl_->erase_change(change);
             removed = true;
         }
     }
@@ -1599,7 +1762,11 @@ void AdaptiveRetransmissionController::on_change_removed(
     }
 #else
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->changes.erase(key);
+    auto change = impl_->changes.find(key);
+    if (change != impl_->changes.end())
+    {
+        impl_->erase_change(change);
+    }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
@@ -1627,7 +1794,7 @@ void AdaptiveRetransmissionController::on_reader_removed(
         {
             if (!(it->first.path < key) && !(key < it->first.path))
             {
-                it = impl_->changes.erase(it);
+                it = impl_->erase_change(it);
                 ++removed_changes;
             }
             else
