@@ -121,6 +121,24 @@ void update_deadline_gaps(
     }
 }
 
+std::vector<double> interarrival_values(
+        const StreamStats& stats)
+{
+    std::vector<double> values;
+    values.reserve(stats.records.size() > 0 ? stats.records.size() - 1 : 0);
+    for (size_t i = 1; i < stats.records.size(); ++i)
+    {
+        values.push_back((stats.records[i].receive_ns - stats.records[i - 1].receive_ns) / 1000.0);
+    }
+    return values;
+}
+
+double max_value(
+        const std::vector<double>& values)
+{
+    return values.empty() ? 0.0 : *std::max_element(values.begin(), values.end());
+}
+
 } // namespace
 
 int main(
@@ -273,6 +291,7 @@ int main(
             const StreamStats& s = stats[stream];
             uint64_t missing = s.expected > s.unique_sequences.size() ?
                     s.expected - s.unique_sequences.size() : 0;
+            const std::vector<double> interarrival_us = interarrival_values(s);
             std::ostringstream json;
             json << "{\"expected\":" << s.expected
                  << ",\"received\":" << s.unique_sequences.size()
@@ -281,15 +300,9 @@ int main(
                  << ",\"malformed\":" << s.malformed
                  << ",\"out_of_order\":" << s.out_of_order
                  << ",\"deadline_gaps\":" << s.deadline_gaps
-                 << ",\"interarrival_p95_us\":" << benchmark::percentile(
-                        [&]() {
-                            std::vector<double> values;
-                            for (size_t i = 1; i < s.records.size(); ++i)
-                            {
-                                values.push_back((s.records[i].receive_ns - s.records[i - 1].receive_ns) / 1000.0);
-                            }
-                            return values;
-                        }(), 0.95)
+                 << ",\"interarrival_p95_us\":" << benchmark::percentile(interarrival_us, 0.95)
+                 << ",\"interarrival_p99_us\":" << benchmark::percentile(interarrival_us, 0.99)
+                 << ",\"interarrival_max_us\":" << max_value(interarrival_us)
                  << '}';
             return json.str();
         };

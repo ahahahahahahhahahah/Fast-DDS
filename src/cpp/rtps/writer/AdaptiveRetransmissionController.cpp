@@ -44,6 +44,8 @@ constexpr double repair_timeout_baseline_multiplier = 3.0;
 constexpr double min_repair_timeout_ms = 25.0;
 constexpr double repair_timeout_request_interval_multiplier = 1.5;
 constexpr double max_repair_timeout_request_interval_ms = 200.0;
+constexpr double default_feedback_strong_positive_ratio = 1.0;
+constexpr double default_feedback_slow_ratio = 1.5;
 constexpr uint32_t pressure_feedback_min_samples = 3;
 constexpr uint32_t pressure_request_count = 4;
 constexpr uint32_t max_changes_per_cycle = 2;
@@ -89,18 +91,6 @@ struct ChangeKey
     }
 };
 
-struct WriterSequenceKey
-{
-    GUID_t writer;
-    SequenceNumber_t sequence;
-
-    bool operator <(
-            const WriterSequenceKey& other) const
-    {
-        return writer < other.writer || (!(other.writer < writer) && sequence < other.sequence);
-    }
-};
-
 struct ReaderState
 {
     uint32_t request_samples = 0;
@@ -111,6 +101,14 @@ struct ReaderState
     uint64_t repair_send_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t feedback_strong_positive_samples = 0;
+    uint64_t feedback_strong_positive_bytes = 0;
+    uint64_t feedback_normal_samples = 0;
+    uint64_t feedback_normal_bytes = 0;
+    uint64_t feedback_mild_negative_samples = 0;
+    uint64_t feedback_mild_negative_bytes = 0;
+    uint64_t feedback_severe_negative_samples = 0;
+    uint64_t feedback_severe_negative_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -122,6 +120,7 @@ struct ReaderState
     bool ack_progress_tracking_started = false;
     steady_clock::time_point ack_progress_tracking_start_time;
     steady_clock::time_point last_request;
+    std::set<SequenceNumber_t> repair_tainted_sequences;
     uint32_t admitted_changes_in_cycle = 0;
     uint64_t admitted_bytes_in_cycle = 0;
 };
@@ -137,6 +136,8 @@ struct RepairSendAttempt
 {
     steady_clock::time_point sent_time;
     uint32_t estimated_bytes = 0;
+    bool timeout_reported = false;
+    bool feedback_classified = false;
 };
 
 struct ChangeState
@@ -149,7 +150,6 @@ struct ChangeState
     steady_clock::time_point last_interest;
     steady_clock::time_point defer_cooldown_until;
     std::vector<RepairSendAttempt> repair_send_attempts;
-    bool repair_timeout_reported = false;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     bool admission_trace_initialized = false;
     AdaptiveRetransmissionDecision admission_trace_decision =
@@ -191,7 +191,17 @@ struct WriterState
     RecoveryState recovery_state = RecoveryState::NORMAL;
     uint32_t pressure_cycles = 0;
     uint32_t improving_cycles = 0;
+    double feedback_strong_positive_ratio = default_feedback_strong_positive_ratio;
+    double feedback_slow_ratio = default_feedback_slow_ratio;
     std::map<SequenceNumber_t, SentChangeState> sent_changes;
+};
+
+enum class RepairFeedbackClass
+{
+    STRONG_POSITIVE,
+    NORMAL,
+    MILD_NEGATIVE,
+    SEVERE_NEGATIVE
 };
 
 struct AdmissionCandidate
@@ -281,6 +291,90 @@ double update_calibrated_feedback_baseline_from_ack_progress(
     }
     return current;
 }
+
+double repair_timeout_window_ms(
+        const ReaderState& reader)
+{
+    double timeout_ms = (std::max)(
+        min_repair_timeout_ms,
+        reader.stable_feedback_ms * repair_timeout_baseline_multiplier);
+    if (reader.request_interval_ewma_ms > 0.0)
+    {
+        const double request_interval_grace_ms = (std::min)(
+            max_repair_timeout_request_interval_ms,
+            reader.request_interval_ewma_ms * repair_timeout_request_interval_multiplier);
+        timeout_ms = (std::max)(timeout_ms, request_interval_grace_ms);
+    }
+    return timeout_ms;
+}
+
+RepairFeedbackClass classify_repair_feedback(
+        const ReaderState& reader,
+        const WriterState& writer,
+        double feedback_ms)
+{
+    const double timeout_ms = repair_timeout_window_ms(reader);
+    if (feedback_ms >= timeout_ms)
+    {
+        return RepairFeedbackClass::SEVERE_NEGATIVE;
+    }
+
+    const double ratio = feedback_ms / reader.stable_feedback_ms;
+    if (ratio < writer.feedback_strong_positive_ratio)
+    {
+        return RepairFeedbackClass::STRONG_POSITIVE;
+    }
+    if (ratio <= writer.feedback_slow_ratio)
+    {
+        return RepairFeedbackClass::NORMAL;
+    }
+    return RepairFeedbackClass::MILD_NEGATIVE;
+}
+
+void record_classified_repair_feedback(
+        ReaderState& reader,
+        RepairFeedbackClass feedback_class,
+        uint32_t estimated_bytes)
+{
+    switch (feedback_class)
+    {
+        case RepairFeedbackClass::STRONG_POSITIVE:
+            ++reader.feedback_strong_positive_samples;
+            reader.feedback_strong_positive_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::NORMAL:
+            ++reader.feedback_normal_samples;
+            reader.feedback_normal_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::MILD_NEGATIVE:
+            ++reader.feedback_mild_negative_samples;
+            reader.feedback_mild_negative_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::SEVERE_NEGATIVE:
+            ++reader.feedback_severe_negative_samples;
+            reader.feedback_severe_negative_bytes += estimated_bytes;
+            break;
+    }
+}
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+const char* repair_feedback_class_name(
+        RepairFeedbackClass feedback_class)
+{
+    switch (feedback_class)
+    {
+        case RepairFeedbackClass::STRONG_POSITIVE:
+            return "strong_positive";
+        case RepairFeedbackClass::NORMAL:
+            return "normal";
+        case RepairFeedbackClass::MILD_NEGATIVE:
+            return "mild_negative";
+        case RepairFeedbackClass::SEVERE_NEGATIVE:
+            return "severe_negative";
+    }
+    return "unknown";
+}
+#endif // FASTDDS_RETRANSMISSION_TRACE
 
 bool boolean_property_is_enabled(
         StatefulWriter& writer,
@@ -541,171 +635,36 @@ struct AdaptiveRetransmissionController::Implementation
     std::mutex mutex;
     std::map<ReaderKey, ReaderState> readers;
     std::map<ChangeKey, ChangeState> changes;
-    std::map<WriterSequenceKey, std::vector<ChangeKey>> changes_by_writer_sequence;
-    std::map<GUID_t, std::set<ChangeKey>> changes_by_writer;
-    std::map<ReaderKey, std::set<ChangeKey>> changes_by_reader;
-    std::map<ReaderKey, uint64_t> outstanding_changes_by_reader;
-    std::map<ReaderKey, uint64_t> outstanding_bytes_by_reader;
-    std::map<GUID_t, uint64_t> outstanding_changes_by_writer;
-    std::map<GUID_t, uint64_t> outstanding_bytes_by_writer;
     std::map<GUID_t, WriterState> writers;
     std::map<GUID_t, std::vector<AdmissionCandidate>> cycle_candidates;
     std::map<ChangeKey, AdaptiveRetransmissionDecision> cycle_plan;
 
-    static bool same_change_key(
-            const ChangeKey& left,
-            const ChangeKey& right)
-    {
-        return !(left < right) && !(right < left);
-    }
-
-    ChangeState& ensure_change(
-            const ChangeKey& key)
-    {
-        const auto inserted = changes.emplace(key, ChangeState());
-        if (inserted.second)
-        {
-            changes_by_writer_sequence[WriterSequenceKey {key.path.writer, key.sequence}].push_back(key);
-            changes_by_writer[key.path.writer].insert(key);
-            changes_by_reader[key.path].insert(key);
-            ++outstanding_changes_by_reader[key.path];
-            ++outstanding_changes_by_writer[key.path.writer];
-        }
-        return inserted.first->second;
-    }
-
-    static void remove_indexed_key(
-            std::vector<ChangeKey>& keys,
-            const ChangeKey& key)
-    {
-        keys.erase(std::remove_if(keys.begin(), keys.end(),
-                        [&key](const ChangeKey& current)
-                        {
-                            return same_change_key(current, key);
-                        }),
-                keys.end());
-    }
-
-    void update_estimated_bytes(
-            const ChangeKey& key,
-            ChangeState& state,
-            uint32_t estimated_bytes)
-    {
-        if (state.estimated_bytes == estimated_bytes)
-        {
-            return;
-        }
-
-        if (estimated_bytes > state.estimated_bytes)
-        {
-            const uint64_t delta = static_cast<uint64_t>(estimated_bytes - state.estimated_bytes);
-            outstanding_bytes_by_reader[key.path] += delta;
-            outstanding_bytes_by_writer[key.path.writer] += delta;
-        }
-        else
-        {
-            const uint64_t delta = static_cast<uint64_t>(state.estimated_bytes - estimated_bytes);
-            auto reader_bytes = outstanding_bytes_by_reader.find(key.path);
-            if (reader_bytes != outstanding_bytes_by_reader.end())
-            {
-                reader_bytes->second = reader_bytes->second > delta ? reader_bytes->second - delta : 0u;
-                if (0u == reader_bytes->second)
-                {
-                    outstanding_bytes_by_reader.erase(reader_bytes);
-                }
-            }
-            auto writer_bytes = outstanding_bytes_by_writer.find(key.path.writer);
-            if (writer_bytes != outstanding_bytes_by_writer.end())
-            {
-                writer_bytes->second = writer_bytes->second > delta ? writer_bytes->second - delta : 0u;
-                if (0u == writer_bytes->second)
-                {
-                    outstanding_bytes_by_writer.erase(writer_bytes);
-                }
-            }
-        }
-        state.estimated_bytes = estimated_bytes;
-    }
-
-    void remove_change_from_indexes(
-            const ChangeKey& key)
-    {
-        auto indexed = changes_by_writer_sequence.find(WriterSequenceKey {key.path.writer, key.sequence});
-        if (indexed != changes_by_writer_sequence.end())
-        {
-            remove_indexed_key(indexed->second, key);
-            if (indexed->second.empty())
-            {
-                changes_by_writer_sequence.erase(indexed);
-            }
-        }
-
-        auto writer_indexed = changes_by_writer.find(key.path.writer);
-        if (writer_indexed != changes_by_writer.end())
-        {
-            writer_indexed->second.erase(key);
-            if (writer_indexed->second.empty())
-            {
-                changes_by_writer.erase(writer_indexed);
-            }
-        }
-
-        auto reader_indexed = changes_by_reader.find(key.path);
-        if (reader_indexed != changes_by_reader.end())
-        {
-            reader_indexed->second.erase(key);
-            if (reader_indexed->second.empty())
-            {
-                changes_by_reader.erase(reader_indexed);
-            }
-        }
-    }
-
-    std::map<ChangeKey, ChangeState>::iterator erase_change(
-            std::map<ChangeKey, ChangeState>::iterator it)
-    {
-        const ChangeKey key = it->first;
-        auto reader_count = outstanding_changes_by_reader.find(key.path);
-        if (reader_count != outstanding_changes_by_reader.end())
-        {
-            if (reader_count->second > 1u)
-            {
-                --reader_count->second;
-            }
-            else
-            {
-                outstanding_changes_by_reader.erase(reader_count);
-            }
-        }
-        auto writer_count = outstanding_changes_by_writer.find(key.path.writer);
-        if (writer_count != outstanding_changes_by_writer.end())
-        {
-            if (writer_count->second > 1u)
-            {
-                --writer_count->second;
-            }
-            else
-            {
-                outstanding_changes_by_writer.erase(writer_count);
-            }
-        }
-        update_estimated_bytes(key, it->second, 0u);
-        remove_change_from_indexes(key);
-        return changes.erase(it);
-    }
-
     size_t outstanding_changes(
             const ReaderKey& key) const
     {
-        auto count = outstanding_changes_by_reader.find(key);
-        return count == outstanding_changes_by_reader.end() ? 0u : static_cast<size_t>(count->second);
+        size_t count = 0;
+        for (const auto& item : changes)
+        {
+            if (!(item.first.path < key) && !(key < item.first.path))
+            {
+                ++count;
+            }
+        }
+        return count;
     }
 
     uint64_t outstanding_bytes(
             const ReaderKey& key) const
     {
-        auto bytes = outstanding_bytes_by_reader.find(key);
-        return bytes == outstanding_bytes_by_reader.end() ? 0u : bytes->second;
+        uint64_t bytes = 0;
+        for (const auto& item : changes)
+        {
+            if (!(item.first.path < key) && !(key < item.first.path))
+            {
+                bytes += item.second.estimated_bytes;
+            }
+        }
+        return bytes;
     }
 };
 
@@ -725,6 +684,32 @@ AdaptiveRetransmissionController::~AdaptiveRetransmissionController()
     delete impl_;
 }
 
+void AdaptiveRetransmissionController::configure_feedback_thresholds(
+        StatefulWriter* writer,
+        double strong_positive_ratio,
+        double slow_ratio)
+{
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    if (strong_positive_ratio <= 0.0)
+    {
+        strong_positive_ratio = default_feedback_strong_positive_ratio;
+    }
+    if (slow_ratio <= 0.0)
+    {
+        slow_ratio = default_feedback_slow_ratio;
+    }
+    slow_ratio = (std::max)(slow_ratio, strong_positive_ratio);
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    WriterState& writer_state = impl_->writers[writer->getGuid()];
+    writer_state.feedback_strong_positive_ratio = strong_positive_ratio;
+    writer_state.feedback_slow_ratio = slow_ratio;
+}
+
 AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedback_snapshot(
         const StatefulWriter* writer)
 {
@@ -737,78 +722,70 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
     const GUID_t writer_guid = writer->getGuid();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto now = steady_clock::now();
-    auto writer_changes = impl_->changes_by_writer.find(writer_guid);
-    if (writer_changes != impl_->changes_by_writer.end())
+    for (auto& item : impl_->changes)
     {
-        for (const ChangeKey& change_key : writer_changes->second)
+        if (item.first.path.writer != writer_guid ||
+                item.second.repair_send_attempts.empty())
         {
-            auto item = impl_->changes.find(change_key);
-            if (item == impl_->changes.end() ||
-                    item->second.repair_timeout_reported ||
-                    item->second.repair_send_attempts.empty())
+            continue;
+        }
+
+        auto reader_it = impl_->readers.find(item.first.path);
+        if (reader_it == impl_->readers.end() ||
+                !reader_it->second.stable_feedback_calibrated ||
+                reader_it->second.stable_feedback_ms <= 0.0)
+        {
+            continue;
+        }
+
+        const double timeout_ms = repair_timeout_window_ms(reader_it->second);
+        for (RepairSendAttempt& attempt : item.second.repair_send_attempts)
+        {
+            if (attempt.feedback_classified)
             {
                 continue;
             }
 
-            auto reader_it = impl_->readers.find(item->first.path);
-            if (reader_it == impl_->readers.end() ||
-                    !reader_it->second.stable_feedback_calibrated ||
-                    reader_it->second.stable_feedback_ms <= 0.0)
-            {
-                continue;
-            }
-
-            const RepairSendAttempt& latest_attempt = item->second.repair_send_attempts.back();
-            double timeout_ms = (std::max)(
-                min_repair_timeout_ms,
-                reader_it->second.stable_feedback_ms * repair_timeout_baseline_multiplier);
-            if (reader_it->second.request_interval_ewma_ms > 0.0)
-            {
-                const double request_interval_grace_ms = (std::min)(
-                    max_repair_timeout_request_interval_ms,
-                    reader_it->second.request_interval_ewma_ms * repair_timeout_request_interval_multiplier);
-                timeout_ms = (std::max)(timeout_ms, request_interval_grace_ms);
-            }
             const double pending_ms = std::chrono::duration<double, std::milli>(
-                now - latest_attempt.sent_time).count();
-            if (pending_ms >= timeout_ms)
+                now - attempt.sent_time).count();
+            if (pending_ms < timeout_ms)
             {
-                item->second.repair_timeout_reported = true;
-                ++reader_it->second.repair_timeout_samples;
-                reader_it->second.repair_timeout_bytes += item->second.estimated_bytes;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                std::ostringstream detail;
-                detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
-                       << ";source=repair_timeout"
-                       << ";pending_ms=" << pending_ms
-                       << ";timeout_ms=" << timeout_ms
-                       << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
-                       << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
-                       << ";repair_send_attempts=" << item->second.repair_send_attempts.size()
-                       << ";latest_send_bytes=" << latest_attempt.estimated_bytes;
-                FASTDDS_TRACE_RETRANSMISSION(
-                    writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
-                    writer->getGuid(),
-                    item->first.path.reader,
-                    item->first.sequence,
-                    item->second.estimated_bytes,
-                    detail.str());
-#endif // FASTDDS_RETRANSMISSION_TRACE
+                continue;
             }
+
+            const uint32_t timeout_bytes = attempt.estimated_bytes > 0u ?
+                    attempt.estimated_bytes : item.second.estimated_bytes;
+            attempt.timeout_reported = true;
+            attempt.feedback_classified = true;
+            ++reader_it->second.repair_timeout_samples;
+            reader_it->second.repair_timeout_bytes += timeout_bytes;
+            record_classified_repair_feedback(
+                reader_it->second,
+                RepairFeedbackClass::SEVERE_NEGATIVE,
+                timeout_bytes);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            std::ostringstream detail;
+            detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
+                   << ";source=repair_timeout"
+                   << ";pending_ms=" << pending_ms
+                   << ";timeout_ms=" << timeout_ms
+                   << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
+                   << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
+                   << ";feedback_class=severe_negative"
+                   << ";repair_send_attempts=" << item.second.repair_send_attempts.size()
+                   << ";attempt_send_bytes=" << attempt.estimated_bytes;
+            FASTDDS_TRACE_RETRANSMISSION(
+                writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
+                writer->getGuid(),
+                item.first.path.reader,
+                item.first.sequence,
+                item.second.estimated_bytes,
+                detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
         }
     }
 
-    auto writer_outstanding_changes = impl_->outstanding_changes_by_writer.find(writer_guid);
-    if (writer_outstanding_changes != impl_->outstanding_changes_by_writer.end())
-    {
-        snapshot.outstanding_changes = writer_outstanding_changes->second;
-    }
-    auto writer_outstanding_bytes = impl_->outstanding_bytes_by_writer.find(writer_guid);
-    if (writer_outstanding_bytes != impl_->outstanding_bytes_by_writer.end())
-    {
-        snapshot.outstanding_bytes = writer_outstanding_bytes->second;
-    }
-
+    std::map<GUID_t, std::size_t> reader_path_indices;
     for (const auto& item : impl_->readers)
     {
         if (item.first.writer == writer_guid)
@@ -823,6 +800,14 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             reader_snapshot.repair_send_bytes = item.second.repair_send_bytes;
             reader_snapshot.repair_timeout_samples = item.second.repair_timeout_samples;
             reader_snapshot.repair_timeout_bytes = item.second.repair_timeout_bytes;
+            reader_snapshot.feedback_strong_positive_samples = item.second.feedback_strong_positive_samples;
+            reader_snapshot.feedback_strong_positive_bytes = item.second.feedback_strong_positive_bytes;
+            reader_snapshot.feedback_normal_samples = item.second.feedback_normal_samples;
+            reader_snapshot.feedback_normal_bytes = item.second.feedback_normal_bytes;
+            reader_snapshot.feedback_mild_negative_samples = item.second.feedback_mild_negative_samples;
+            reader_snapshot.feedback_mild_negative_bytes = item.second.feedback_mild_negative_bytes;
+            reader_snapshot.feedback_severe_negative_samples = item.second.feedback_severe_negative_samples;
+            reader_snapshot.feedback_severe_negative_bytes = item.second.feedback_severe_negative_bytes;
             reader_snapshot.request_interval_ewma_ms = item.second.request_interval_ewma_ms;
             reader_snapshot.recovery_feedback_ewma_ms = item.second.recovery_feedback_ewma_ms;
             reader_snapshot.stable_feedback_ms = item.second.stable_feedback_ms;
@@ -834,16 +819,7 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                 reader_snapshot.feedback_slow_ratio =
                         item.second.recovery_feedback_ewma_ms / item.second.stable_feedback_ms;
             }
-            auto reader_outstanding_changes = impl_->outstanding_changes_by_reader.find(item.first);
-            if (reader_outstanding_changes != impl_->outstanding_changes_by_reader.end())
-            {
-                reader_snapshot.outstanding_changes = reader_outstanding_changes->second;
-            }
-            auto reader_outstanding_bytes = impl_->outstanding_bytes_by_reader.find(item.first);
-            if (reader_outstanding_bytes != impl_->outstanding_bytes_by_reader.end())
-            {
-                reader_snapshot.outstanding_bytes = reader_outstanding_bytes->second;
-            }
+            reader_path_indices[item.first.reader] = snapshot.reader_paths.size();
             snapshot.reader_paths.push_back(reader_snapshot);
 
             snapshot.request_samples += item.second.request_samples;
@@ -854,6 +830,14 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             snapshot.repair_send_bytes += item.second.repair_send_bytes;
             snapshot.repair_timeout_samples += item.second.repair_timeout_samples;
             snapshot.repair_timeout_bytes += item.second.repair_timeout_bytes;
+            snapshot.feedback_strong_positive_samples += item.second.feedback_strong_positive_samples;
+            snapshot.feedback_strong_positive_bytes += item.second.feedback_strong_positive_bytes;
+            snapshot.feedback_normal_samples += item.second.feedback_normal_samples;
+            snapshot.feedback_normal_bytes += item.second.feedback_normal_bytes;
+            snapshot.feedback_mild_negative_samples += item.second.feedback_mild_negative_samples;
+            snapshot.feedback_mild_negative_bytes += item.second.feedback_mild_negative_bytes;
+            snapshot.feedback_severe_negative_samples += item.second.feedback_severe_negative_samples;
+            snapshot.feedback_severe_negative_bytes += item.second.feedback_severe_negative_bytes;
             snapshot.request_interval_ewma_ms = std::max(
                 snapshot.request_interval_ewma_ms,
                 item.second.request_interval_ewma_ms);
@@ -876,6 +860,23 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                 snapshot.feedback_slow_ratio = std::max(
                     snapshot.feedback_slow_ratio,
                     item.second.recovery_feedback_ewma_ms / item.second.stable_feedback_ms);
+            }
+        }
+    }
+
+    for (const auto& item : impl_->changes)
+    {
+        if (item.first.path.writer == writer_guid)
+        {
+            ++snapshot.outstanding_changes;
+            snapshot.outstanding_bytes += item.second.estimated_bytes;
+            auto reader_it = reader_path_indices.find(item.first.path.reader);
+            if (reader_it != reader_path_indices.end())
+            {
+                AdaptiveRetransmissionReaderFeedbackSnapshot& reader_snapshot =
+                        snapshot.reader_paths[reader_it->second];
+                ++reader_snapshot.outstanding_changes;
+                reader_snapshot.outstanding_bytes += item.second.estimated_bytes;
             }
         }
     }
@@ -919,15 +920,16 @@ void AdaptiveRetransmissionController::on_requested(
         ++reader.request_samples;
         reader.request_bytes += estimated_bytes;
         reader.last_request = now;
+        reader.repair_tainted_sequences.insert(change.sequenceNumber);
 
-        ChangeState& observed = impl_->ensure_change(change_key);
+        ChangeState& observed = impl_->changes[change_key];
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         ++observed.requests;
         observed.requested_fragments = requested_fragments;
-        impl_->update_estimated_bytes(change_key, observed, estimated_bytes);
+        observed.estimated_bytes = estimated_bytes;
         observed.last_request = now;
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -974,14 +976,16 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
 #endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        ChangeState& observed = impl_->ensure_change(change_key);
+        ReaderState& reader = impl_->readers[reader_key];
+        reader.repair_tainted_sequences.insert(change.sequenceNumber);
+        ChangeState& observed = impl_->changes[change_key];
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         if (0 == observed.estimated_bytes)
         {
-            impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
+            observed.estimated_bytes = change.serializedPayload.length;
         }
         observed.last_interest = now;
 
@@ -1037,46 +1041,50 @@ void AdaptiveRetransmissionController::on_async_sample_sent(
 
     if (old_sample)
     {
-        auto indexed = impl_->changes_by_writer_sequence.find(
-            WriterSequenceKey {writer->getGuid(), change.sequenceNumber});
-        if (indexed == impl_->changes_by_writer_sequence.end())
+        for (auto& item : impl_->changes)
         {
-            return;
-        }
-
-        auto& interested_paths = indexed->second;
-        for (auto path_it = interested_paths.begin(); path_it != interested_paths.end(); )
-        {
-            auto item = impl_->changes.find(*path_it);
-            if (item == impl_->changes.end())
+            if (item.first.path.writer != writer->getGuid() ||
+                    item.first.sequence != change.sequenceNumber ||
+                    item.second.last_interest == steady_clock::time_point())
             {
-                path_it = interested_paths.erase(path_it);
-                continue;
-            }
-            if (item->second.last_interest == steady_clock::time_point())
-            {
-                ++path_it;
                 continue;
             }
 
-            ChangeState& observed = item->second;
+            ReaderState& reader = impl_->readers[item.first.path];
+            ChangeState& observed = item.second;
+            while (observed.repair_send_attempts.size() >= max_repair_send_attempts_per_change)
+            {
+                RepairSendAttempt& evicted_attempt = observed.repair_send_attempts.front();
+                if (!evicted_attempt.feedback_classified &&
+                        reader.stable_feedback_calibrated &&
+                        reader.stable_feedback_ms > 0.0)
+                {
+                    const double timeout_ms = repair_timeout_window_ms(reader);
+                    const double pending_ms = std::chrono::duration<double, std::milli>(
+                        now - evicted_attempt.sent_time).count();
+                    if (pending_ms >= timeout_ms)
+                    {
+                        const uint32_t timeout_bytes = evicted_attempt.estimated_bytes > 0u ?
+                                evicted_attempt.estimated_bytes : observed.estimated_bytes;
+                        ++reader.repair_timeout_samples;
+                        reader.repair_timeout_bytes += timeout_bytes;
+                        record_classified_repair_feedback(
+                            reader,
+                            RepairFeedbackClass::SEVERE_NEGATIVE,
+                            timeout_bytes);
+                    }
+                }
+                observed.repair_send_attempts.erase(observed.repair_send_attempts.begin());
+            }
+
             RepairSendAttempt attempt;
             attempt.sent_time = now;
             attempt.estimated_bytes = change.serializedPayload.length;
             observed.repair_send_attempts.push_back(attempt);
-            if (observed.repair_send_attempts.size() > max_repair_send_attempts_per_change)
-            {
-                observed.repair_send_attempts.erase(observed.repair_send_attempts.begin());
-            }
 
-            ReaderState& reader = impl_->readers[item->first.path];
+            reader.repair_tainted_sequences.insert(item.first.sequence);
             ++reader.repair_send_samples;
             reader.repair_send_bytes += change.serializedPayload.length;
-            ++path_it;
-        }
-        if (interested_paths.empty())
-        {
-            impl_->changes_by_writer_sequence.erase(indexed);
         }
     }
 }
@@ -1133,11 +1141,11 @@ void AdaptiveRetransmissionController::add_admission_candidate(
     const ReaderKey reader_key {writer->getGuid(), reader_guid};
     const ChangeKey change_key {reader_key, change.sequenceNumber};
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    ChangeState& observed = impl_->ensure_change(change_key);
+    ChangeState& observed = impl_->changes[change_key];
     if (0 == observed.requests)
     {
         observed.first_request = now;
-        impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
+        observed.estimated_bytes = change.serializedPayload.length;
     }
 
     AdmissionCandidate candidate;
@@ -1201,7 +1209,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         for (size_t index = 0; index < candidates.size(); ++index)
         {
             const AdmissionCandidate& candidate = candidates[index];
-            ChangeState& observed = impl_->ensure_change(candidate.key);
+            ChangeState& observed = impl_->changes[candidate.key];
             const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
             const bool cooldown_active = ForceClass::NONE == candidate_force &&
                     defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
@@ -1379,14 +1387,12 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 impl_->cycle_plan[candidate.key] = decision;
                 if (AdaptiveRetransmissionDecision::DEFER != decision)
                 {
-                    ChangeState& observed = impl_->ensure_change(candidate.key);
-                    observed.last_interest = steady_clock::now();
-                    observed.defer_cooldown_until = steady_clock::time_point();
+                    impl_->changes[candidate.key].last_interest = steady_clock::now();
+                    impl_->changes[candidate.key].defer_cooldown_until = steady_clock::time_point();
                 }
                 else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
                 {
-                    impl_->ensure_change(candidate.key).defer_cooldown_until =
-                            now + milliseconds_duration(defer_cooldown_ms);
+                    impl_->changes[candidate.key].defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
                 }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -1488,7 +1494,7 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
         bool emit_trace = false;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            ChangeState& observed = impl_->ensure_change(key);
+            ChangeState& observed = impl_->changes[key];
             emit_trace = !observed.admission_trace_initialized ||
                     observed.admission_trace_decision != planned_decision;
             if (emit_trace)
@@ -1526,14 +1532,14 @@ AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransm
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ReaderState& reader = impl_->readers[reader_key];
-        ChangeState& observed = impl_->ensure_change(change_key);
+        ChangeState& observed = impl_->changes[change_key];
         if (0 == observed.requests)
         {
             observed.first_request = now;
         }
         if (0 == observed.estimated_bytes)
         {
-            impl_->update_estimated_bytes(change_key, observed, change.serializedPayload.length);
+            observed.estimated_bytes = change.serializedPayload.length;
         }
 
         const size_t pending = impl_->outstanding_changes(reader_key);
@@ -1637,8 +1643,25 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         SequenceNumber_t sequence;
         uint32_t estimated_bytes;
         double feedback_ms;
+        double stable_feedback_ms;
+        double feedback_ratio;
+        double timeout_ms;
+        bool classified;
+        RepairFeedbackClass feedback_class;
+    };
+    struct TimeoutAckTrace
+    {
+        SequenceNumber_t sequence;
+        uint32_t estimated_bytes;
+        double feedback_ms;
+        double stable_feedback_ms;
+        double feedback_ratio;
+        double timeout_ms;
+        std::size_t repair_send_attempts;
+        uint32_t timeout_reported_attempts;
     };
     std::vector<AckTrace> ack_traces;
+    std::vector<TimeoutAckTrace> timeout_ack_traces;
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
     {
@@ -1659,6 +1682,8 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                         sent_it != writer_state.sent_changes.end() && sent_it->first < sequence_number; ++sent_it)
                 {
                     if (!sent_it->second.old_sample &&
+                            reader.repair_tainted_sequences.find(sent_it->first) ==
+                            reader.repair_tainted_sequences.end() &&
                             sent_it->second.sent_time != steady_clock::time_point() &&
                             sent_it->second.sent_time >= reader.ack_progress_tracking_start_time)
                     {
@@ -1676,51 +1701,141 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                 }
             }
             reader.last_ack_base = sequence_number;
+            for (auto tainted = reader.repair_tainted_sequences.begin();
+                    tainted != reader.repair_tainted_sequences.end() && *tainted < sequence_number; )
+            {
+                tainted = reader.repair_tainted_sequences.erase(tainted);
+            }
         }
 
-        for (auto reader_index = impl_->changes_by_reader.find(reader_key);
-                reader_index != impl_->changes_by_reader.end() && !reader_index->second.empty(); )
+        for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
         {
-            const ChangeKey change_key = *reader_index->second.begin();
-            if (!(change_key.sequence < sequence_number))
+            const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
+            if (same_reader && it->first.sequence < sequence_number)
             {
-                break;
-            }
-
-            auto it = impl_->changes.find(change_key);
-            if (it == impl_->changes.end())
-            {
-                reader_index->second.erase(reader_index->second.begin());
-                if (reader_index->second.empty())
+                if (it->second.last_interest != steady_clock::time_point() &&
+                        !it->second.repair_send_attempts.empty())
                 {
-                    impl_->changes_by_reader.erase(reader_index);
-                    break;
-                }
-                continue;
-            }
-
-            if (it->second.last_interest != steady_clock::time_point() &&
-                    !it->second.repair_send_attempts.empty())
-            {
-                const RepairSendAttempt& latest_attempt = it->second.repair_send_attempts.back();
-                const double feedback_ms =
-                        std::chrono::duration<double, std::milli>(
-                    now - latest_attempt.sent_time).count();
-                reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
-                ++reader.feedback_samples;
-                reader.feedback_bytes += latest_attempt.estimated_bytes;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                ack_traces.push_back(
-                    AckTrace
+                    const bool classified = reader.stable_feedback_calibrated && reader.stable_feedback_ms > 0.0;
+                    auto latest_unclassified = it->second.repair_send_attempts.end();
+                    for (auto attempt_it = it->second.repair_send_attempts.begin();
+                            attempt_it != it->second.repair_send_attempts.end(); ++attempt_it)
                     {
-                        it->first.sequence,
-                        latest_attempt.estimated_bytes,
-                        feedback_ms
-                    });
+                        if (!attempt_it->feedback_classified)
+                        {
+                            latest_unclassified = attempt_it;
+                        }
+                    }
+
+                    if (latest_unclassified != it->second.repair_send_attempts.end())
+                    {
+                        const double timeout_ms = classified ? repair_timeout_window_ms(reader) : 0.0;
+                        for (auto attempt_it = it->second.repair_send_attempts.begin();
+                                attempt_it != latest_unclassified; ++attempt_it)
+                        {
+                            if (attempt_it->feedback_classified)
+                            {
+                                continue;
+                            }
+                            if (classified)
+                            {
+                                const double pending_ms = std::chrono::duration<double, std::milli>(
+                                    now - attempt_it->sent_time).count();
+                                if (pending_ms >= timeout_ms)
+                                {
+                                    const uint32_t timeout_bytes = attempt_it->estimated_bytes > 0u ?
+                                            attempt_it->estimated_bytes : it->second.estimated_bytes;
+                                    attempt_it->timeout_reported = true;
+                                    ++reader.repair_timeout_samples;
+                                    reader.repair_timeout_bytes += timeout_bytes;
+                                    record_classified_repair_feedback(
+                                        reader,
+                                        RepairFeedbackClass::SEVERE_NEGATIVE,
+                                        timeout_bytes);
+                                }
+                            }
+                            attempt_it->feedback_classified = true;
+                        }
+
+                        const double feedback_ms =
+                                std::chrono::duration<double, std::milli>(
+                            now - latest_unclassified->sent_time).count();
+                        const uint32_t feedback_bytes = latest_unclassified->estimated_bytes > 0u ?
+                                latest_unclassified->estimated_bytes : it->second.estimated_bytes;
+                        reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
+                        ++reader.feedback_samples;
+                        reader.feedback_bytes += feedback_bytes;
+                        RepairFeedbackClass feedback_class = RepairFeedbackClass::NORMAL;
+                        if (classified)
+                        {
+                            feedback_class = classify_repair_feedback(reader, writer_state, feedback_ms);
+                            record_classified_repair_feedback(reader, feedback_class, feedback_bytes);
+                            latest_unclassified->feedback_classified = true;
+                            if (RepairFeedbackClass::SEVERE_NEGATIVE == feedback_class)
+                            {
+                                latest_unclassified->timeout_reported = true;
+                                ++reader.repair_timeout_samples;
+                                reader.repair_timeout_bytes += feedback_bytes;
+                            }
+                        }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                        ack_traces.push_back(
+                            AckTrace
+                            {
+                                it->first.sequence,
+                                feedback_bytes,
+                                feedback_ms,
+                                reader.stable_feedback_ms,
+                                reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
+                                timeout_ms,
+                                classified,
+                                feedback_class
+                            });
 #endif // FASTDDS_RETRANSMISSION_TRACE
+                    }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    else
+                    {
+                        uint32_t timeout_reported_attempts = 0;
+                        const RepairSendAttempt* latest_timeout_attempt = nullptr;
+                        for (const RepairSendAttempt& attempt : it->second.repair_send_attempts)
+                        {
+                            if (attempt.timeout_reported)
+                            {
+                                ++timeout_reported_attempts;
+                                latest_timeout_attempt = &attempt;
+                            }
+                        }
+                        if (nullptr != latest_timeout_attempt)
+                        {
+                            const double timeout_ms = classified ? repair_timeout_window_ms(reader) : 0.0;
+                            const double feedback_ms = std::chrono::duration<double, std::milli>(
+                                now - latest_timeout_attempt->sent_time).count();
+                            const uint32_t feedback_bytes = latest_timeout_attempt->estimated_bytes > 0u ?
+                                    latest_timeout_attempt->estimated_bytes : it->second.estimated_bytes;
+                            timeout_ack_traces.push_back(
+                                TimeoutAckTrace
+                                {
+                                    it->first.sequence,
+                                    feedback_bytes,
+                                    feedback_ms,
+                                    reader.stable_feedback_ms,
+                                    reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
+                                    timeout_ms,
+                                    it->second.repair_send_attempts.size(),
+                                    timeout_reported_attempts
+                                });
+                        }
+                    }
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                reader.repair_tainted_sequences.erase(it->first.sequence);
+                it = impl_->changes.erase(it);
             }
-            impl_->erase_change(it);
-            reader_index = impl_->changes_by_reader.find(reader_key);
+            else
+            {
+                ++it;
+            }
         }
     }
 
@@ -1731,9 +1846,36 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         detail << "mode=" << controller_mode_name(*writer)
                << ";source=repair_send_ack"
                << ";ack_base=" << sequence_number
-               << ";feedback_ms=" << trace.feedback_ms;
+               << ";feedback_ms=" << trace.feedback_ms
+               << ";stable_feedback_ms=" << trace.stable_feedback_ms
+               << ";feedback_ratio=" << trace.feedback_ratio
+               << ";timeout_ms=" << trace.timeout_ms
+               << ";classified=" << trace.classified
+               << ";feedback_class=" << repair_feedback_class_name(trace.feedback_class);
         FASTDDS_TRACE_RETRANSMISSION(
             writer->isAsync() ? "ADAPT_ASYNC_ACK_CONFIRMED" : "ACK_CONFIRMED_PROXY",
+            writer->getGuid(),
+            reader_guid,
+            trace.sequence,
+            trace.estimated_bytes,
+            detail.str());
+    }
+    for (const TimeoutAckTrace& trace : timeout_ack_traces)
+    {
+        std::ostringstream detail;
+        detail << "mode=" << controller_mode_name(*writer)
+               << ";source=repair_timeout_ack_observed"
+               << ";ack_base=" << sequence_number
+               << ";feedback_ms=" << trace.feedback_ms
+               << ";stable_feedback_ms=" << trace.stable_feedback_ms
+               << ";feedback_ratio=" << trace.feedback_ratio
+               << ";timeout_ms=" << trace.timeout_ms
+               << ";classified=already_timeout"
+               << ";feedback_class=severe_negative"
+               << ";repair_send_attempts=" << trace.repair_send_attempts
+               << ";timeout_reported_attempts=" << trace.timeout_reported_attempts;
+        FASTDDS_TRACE_RETRANSMISSION(
+            writer->isAsync() ? "ADAPT_ASYNC_TIMEOUT_ACK_OBSERVED" : "TIMEOUT_ACK_OBSERVED_PROXY",
             writer->getGuid(),
             reader_guid,
             trace.sequence,
@@ -1769,7 +1911,7 @@ void AdaptiveRetransmissionController::on_change_removed(
         if (change != impl_->changes.end())
         {
             estimated_bytes = change->second.estimated_bytes;
-            impl_->erase_change(change);
+            impl_->changes.erase(change);
             removed = true;
         }
     }
@@ -1786,11 +1928,7 @@ void AdaptiveRetransmissionController::on_change_removed(
     }
 #else
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto change = impl_->changes.find(key);
-    if (change != impl_->changes.end())
-    {
-        impl_->erase_change(change);
-    }
+    impl_->changes.erase(key);
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
@@ -1818,7 +1956,7 @@ void AdaptiveRetransmissionController::on_reader_removed(
         {
             if (!(it->first.path < key) && !(key < it->first.path))
             {
-                it = impl_->erase_change(it);
+                it = impl_->changes.erase(it);
                 ++removed_changes;
             }
             else

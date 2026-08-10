@@ -41,6 +41,14 @@ struct AdaptiveRetransmissionReaderFeedbackSnapshot
     uint64_t repair_send_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t feedback_strong_positive_samples = 0;
+    uint64_t feedback_strong_positive_bytes = 0;
+    uint64_t feedback_normal_samples = 0;
+    uint64_t feedback_normal_bytes = 0;
+    uint64_t feedback_mild_negative_samples = 0;
+    uint64_t feedback_mild_negative_bytes = 0;
+    uint64_t feedback_severe_negative_samples = 0;
+    uint64_t feedback_severe_negative_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -61,6 +69,14 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     uint64_t repair_send_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t feedback_strong_positive_samples = 0;
+    uint64_t feedback_strong_positive_bytes = 0;
+    uint64_t feedback_normal_samples = 0;
+    uint64_t feedback_normal_bytes = 0;
+    uint64_t feedback_mild_negative_samples = 0;
+    uint64_t feedback_mild_negative_bytes = 0;
+    uint64_t feedback_severe_negative_samples = 0;
+    uint64_t feedback_severe_negative_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -113,6 +129,11 @@ public:
             StatefulWriter* writer,
             const GUID_t& reader_guid,
             const CacheChange_t& change);
+
+    void configure_feedback_thresholds(
+            StatefulWriter* writer,
+            double strong_positive_ratio,
+            double slow_ratio);
 
     void on_acknowledged_before(
             StatefulWriter* writer,
