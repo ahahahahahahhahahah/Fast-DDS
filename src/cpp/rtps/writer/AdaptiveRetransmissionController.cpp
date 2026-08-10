@@ -543,6 +543,7 @@ struct AdaptiveRetransmissionController::Implementation
     std::map<ChangeKey, ChangeState> changes;
     std::map<WriterSequenceKey, std::vector<ChangeKey>> changes_by_writer_sequence;
     std::map<GUID_t, std::set<ChangeKey>> changes_by_writer;
+    std::map<ReaderKey, std::set<ChangeKey>> changes_by_reader;
     std::map<ReaderKey, uint64_t> outstanding_changes_by_reader;
     std::map<ReaderKey, uint64_t> outstanding_bytes_by_reader;
     std::map<GUID_t, uint64_t> outstanding_changes_by_writer;
@@ -566,6 +567,7 @@ struct AdaptiveRetransmissionController::Implementation
         {
             changes_by_writer_sequence[WriterSequenceKey {key.path.writer, key.sequence}].push_back(key);
             changes_by_writer[key.path.writer].insert(key);
+            changes_by_reader[key.path].insert(key);
             ++outstanding_changes_by_reader[key.path];
             ++outstanding_changes_by_writer[key.path.writer];
         }
@@ -645,6 +647,16 @@ struct AdaptiveRetransmissionController::Implementation
             if (writer_indexed->second.empty())
             {
                 changes_by_writer.erase(writer_indexed);
+            }
+        }
+
+        auto reader_indexed = changes_by_reader.find(key.path);
+        if (reader_indexed != changes_by_reader.end())
+        {
+            reader_indexed->second.erase(key);
+            if (reader_indexed->second.empty())
+            {
+                changes_by_reader.erase(reader_indexed);
             }
         }
     }
@@ -1666,37 +1678,49 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
             reader.last_ack_base = sequence_number;
         }
 
-        for (auto it = impl_->changes.begin(); it != impl_->changes.end(); )
+        for (auto reader_index = impl_->changes_by_reader.find(reader_key);
+                reader_index != impl_->changes_by_reader.end() && !reader_index->second.empty(); )
         {
-            const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
-            if (same_reader && it->first.sequence < sequence_number)
+            const ChangeKey change_key = *reader_index->second.begin();
+            if (!(change_key.sequence < sequence_number))
             {
-                if (it->second.last_interest != steady_clock::time_point() &&
-                        !it->second.repair_send_attempts.empty())
+                break;
+            }
+
+            auto it = impl_->changes.find(change_key);
+            if (it == impl_->changes.end())
+            {
+                reader_index->second.erase(reader_index->second.begin());
+                if (reader_index->second.empty())
                 {
-                    const RepairSendAttempt& latest_attempt = it->second.repair_send_attempts.back();
-                    const double feedback_ms =
-                            std::chrono::duration<double, std::milli>(
-                        now - latest_attempt.sent_time).count();
-                    reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
-                    ++reader.feedback_samples;
-                    reader.feedback_bytes += latest_attempt.estimated_bytes;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    ack_traces.push_back(
-                        AckTrace
-                        {
-                            it->first.sequence,
-                            latest_attempt.estimated_bytes,
-                            feedback_ms
-                        });
-#endif // FASTDDS_RETRANSMISSION_TRACE
+                    impl_->changes_by_reader.erase(reader_index);
+                    break;
                 }
-                it = impl_->erase_change(it);
+                continue;
             }
-            else
+
+            if (it->second.last_interest != steady_clock::time_point() &&
+                    !it->second.repair_send_attempts.empty())
             {
-                ++it;
+                const RepairSendAttempt& latest_attempt = it->second.repair_send_attempts.back();
+                const double feedback_ms =
+                        std::chrono::duration<double, std::milli>(
+                    now - latest_attempt.sent_time).count();
+                reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
+                ++reader.feedback_samples;
+                reader.feedback_bytes += latest_attempt.estimated_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                ack_traces.push_back(
+                    AckTrace
+                    {
+                        it->first.sequence,
+                        latest_attempt.estimated_bytes,
+                        feedback_ms
+                    });
+#endif // FASTDDS_RETRANSMISSION_TRACE
             }
+            impl_->erase_change(it);
+            reader_index = impl_->changes_by_reader.find(reader_key);
         }
     }
 
