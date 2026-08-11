@@ -318,7 +318,7 @@ struct FlowControllerAsyncPublishMode
     std::atomic<uint32_t> writers_interested_in_remove = {0};
 };
 
-//! Sends new samples synchronously. Old samples are sent asynchronously */
+//! Sends new samples synchronously. Old samples are sent by the SyncFlowController worker thread. */
 struct FlowControllerSyncPublishMode : public FlowControllerPureSyncPublishMode, public FlowControllerAsyncPublishMode
 {
 
@@ -4787,6 +4787,20 @@ private:
 
                 locator_selector.unlock();
                 current_writer->getMutex().unlock();
+
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+                if (std::is_same<FlowControllerSyncPublishMode, PublishMode>::value)
+                {
+                    auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(current_writer);
+                    if (nullptr != stateful_writer)
+                    {
+                        fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
+                            stateful_writer,
+                            *change_to_process,
+                            true);
+                    }
+                }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 
                 {
                     std::unique_lock<std::mutex> in_lock(async_mode.changes_interested_mutex);

@@ -105,6 +105,12 @@ public:
             const CacheChange_t& change,
             bool queued);
 
+    // Records one actual repair send attempt for a requested old sample.
+    void on_repair_sample_sent(
+            StatefulWriter* writer,
+            const CacheChange_t& change,
+            bool old_sample);
+
     void on_async_sample_sent(
             StatefulWriter* writer,
             const CacheChange_t& change,
