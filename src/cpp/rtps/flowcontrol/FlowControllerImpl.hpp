@@ -113,6 +113,11 @@ struct FlowQueue
         return nullptr;
     }
 
+    bool next_change_is_old() const noexcept
+    {
+        return new_ones_.is_empty() && !old_ones_.is_empty();
+    }
+
     fastrtps::rtps::CacheChange_t* get_next_new_change() noexcept
     {
         return new_ones_.is_empty() ? nullptr : new_ones_.head.writer_info.next;
@@ -131,11 +136,6 @@ struct FlowQueue
     fastrtps::rtps::CacheChange_t* get_next_old_change() const noexcept
     {
         return old_ones_.is_empty() ? nullptr : old_ones_.head.writer_info.next;
-    }
-
-    bool next_change_is_old() const noexcept
-    {
-        return new_ones_.is_empty() && !old_ones_.is_empty();
     }
 
     void add_interested_changes_to_queue() noexcept
@@ -480,6 +480,11 @@ struct FlowControllerFifoSchedule
         return queue_.get_next_change();
     }
 
+    bool selected_sample_is_old() const
+    {
+        return queue_.next_change_is_old();
+    }
+
     /*!
      * Store the sample at the end of the list.
      *
@@ -640,6 +645,11 @@ struct FlowControllerRoundRobinSchedule
         return ret_change;
     }
 
+    bool selected_sample_is_old() const
+    {
+        return writers_queue_.end() != next_writer_ && std::get<1>(*next_writer_).next_change_is_old();
+    }
+
     void add_interested_changes_to_queue_nts()
     {
         // This function should be called with mutex_  and interested_lock locked, because the queue is changed.
@@ -777,6 +787,22 @@ struct FlowControllerHighPrioritySchedule
         }
 
         return ret_change;
+    }
+
+    bool selected_sample_is_old() const
+    {
+        if (0 < writers_queue_.size())
+        {
+            for (auto it = writers_queue_.begin(); it != writers_queue_.end(); ++it)
+            {
+                if (nullptr != it->second.get_next_change())
+                {
+                    return it->second.next_change_is_old();
+                }
+            }
+        }
+
+        return false;
     }
 
     void add_interested_changes_to_queue_nts()
@@ -954,7 +980,9 @@ struct FlowControllerPriorityWithReservationSchedule
     fastrtps::rtps::CacheChange_t* get_next_change_nts()
     {
         fastrtps::rtps::CacheChange_t* highest_priority = nullptr;
+        bool highest_priority_is_old = false;
         fastrtps::rtps::CacheChange_t* ret_change = nullptr;
+        selected_sample_is_old_ = false;
 
         if (0 < writers_queue_.size())
         {
@@ -968,6 +996,7 @@ struct FlowControllerPriorityWithReservationSchedule
                     if (nullptr == highest_priority)
                     {
                         highest_priority = change;
+                        highest_priority_is_old = std::get<0>(writer->second).next_change_is_old();
                     }
 
                     if (nullptr != change)
@@ -983,6 +1012,7 @@ struct FlowControllerPriorityWithReservationSchedule
                         if (std::get<2>(writer->second) > (std::get<3>(writer->second) + size_to_check))
                         {
                             ret_change = change;
+                            selected_sample_is_old_ = std::get<0>(writer->second).next_change_is_old();
                             writer_being_processed_ = writer_it;
                             size_being_processed_ = size_to_check;
                             break;
@@ -997,7 +1027,16 @@ struct FlowControllerPriorityWithReservationSchedule
             }
         }
 
+        if (nullptr == ret_change)
+        {
+            selected_sample_is_old_ = highest_priority_is_old;
+        }
         return (nullptr != ret_change ? ret_change : highest_priority);
+    }
+
+    bool selected_sample_is_old() const
+    {
+        return selected_sample_is_old_;
     }
 
     void add_interested_changes_to_queue_nts()
@@ -1059,6 +1098,8 @@ private:
     fastrtps::rtps::RTPSWriter* writer_being_processed_ = nullptr;
 
     uint32_t size_being_processed_ = 0;
+
+    bool selected_sample_is_old_ = false;
 };
 
 //! Sample-level adaptive value utility scheduling
@@ -1330,6 +1371,11 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         }
 
         return selected.change;
+    }
+
+    bool selected_sample_is_old() const
+    {
+        return selected_sample_is_old_being_processed_;
     }
 
     void add_interested_changes_to_queue_nts()
@@ -1714,6 +1760,40 @@ private:
         double repair_timeout_byte_share = 0.0;
     };
 
+    enum class NegativeFeedbackKind
+    {
+        NONE,
+        MILD,
+        SEVERE
+    };
+
+    struct BudgetDecreaseObservation
+    {
+        bool active = false;
+        NegativeFeedbackKind kind = NegativeFeedbackKind::NONE;
+        uint32_t budget_before = 0u;
+        uint32_t budget_after = 0u;
+        uint32_t windows = 0u;
+        uint32_t min_windows = 1u;
+        uint32_t max_windows = 3u;
+        double before_negative_share = 0.0;
+        double before_severe_share = 0.0;
+        double before_timeout_share = 0.0;
+        uint64_t evidence_units = 0u;
+        uint64_t negative_units = 0u;
+        uint64_t severe_units = 0u;
+        uint64_t repair_active_units = 0u;
+        uint64_t timeout_units = 0u;
+    };
+
+    enum class BudgetObservationResult
+    {
+        ACTIVE,
+        COMMIT_IMPROVED,
+        ROLLBACK_NO_IMPROVEMENT,
+        COMMIT_WORSENED
+    };
+
     static double fraction(
             uint64_t numerator,
             uint64_t denominator)
@@ -1733,6 +1813,208 @@ private:
             uint64_t denominator)
     {
         return denominator > 0u && numerator >= denominator - numerator;
+    }
+
+    static const char* negative_feedback_kind_name(
+            NegativeFeedbackKind kind)
+    {
+        switch (kind)
+        {
+            case NegativeFeedbackKind::MILD:
+                return "mild";
+            case NegativeFeedbackKind::SEVERE:
+                return "severe";
+            default:
+                return "none";
+        }
+    }
+
+    static const char* budget_observation_result_name(
+            BudgetObservationResult result)
+    {
+        switch (result)
+        {
+            case BudgetObservationResult::COMMIT_IMPROVED:
+                return "commit_improved";
+            case BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT:
+                return "rollback_no_improvement";
+            case BudgetObservationResult::COMMIT_WORSENED:
+                return "commit_worsened";
+            default:
+                return "active";
+        }
+    }
+
+    static uint64_t evidence_units(
+            const LinkFeedbackWindow& window)
+    {
+        return window.evidence_bytes_delta > 0u ?
+               window.evidence_bytes_delta :
+               window.strong_positive_samples_delta + window.normal_samples_delta +
+               window.mild_negative_samples_delta + window.severe_negative_samples_delta;
+    }
+
+    static uint64_t negative_units(
+            const LinkFeedbackWindow& window)
+    {
+        return window.evidence_bytes_delta > 0u ?
+               window.negative_bytes_delta :
+               window.mild_negative_samples_delta + window.severe_negative_samples_delta;
+    }
+
+    static uint64_t severe_units(
+            const LinkFeedbackWindow& window)
+    {
+        return window.evidence_bytes_delta > 0u ?
+               window.classified_severe_bytes_delta :
+               window.severe_negative_samples_delta;
+    }
+
+    static uint64_t repair_active_units(
+            const LinkFeedbackWindow& window)
+    {
+        return window.repair_active_send_bytes_delta > 0u ?
+               window.repair_active_send_bytes_delta :
+               window.repair_send_samples_delta + window.repair_timeout_samples_delta;
+    }
+
+    static uint64_t timeout_units(
+            const LinkFeedbackWindow& window)
+    {
+        return window.repair_timeout_bytes_delta_by_path > 0u ?
+               window.repair_timeout_bytes_delta_by_path :
+               window.repair_timeout_samples_delta;
+    }
+
+    static bool share_improved(
+            double before,
+            double after)
+    {
+        return before > 0.0 && (after <= before * 0.8 || before - after >= 0.10);
+    }
+
+    static bool share_worsened(
+            double before,
+            double after)
+    {
+        if (before < 0.05)
+        {
+            return after - before >= 0.10;
+        }
+        return after > before && (after >= before * 1.1 || after - before >= 0.10);
+    }
+
+    double observation_after_negative_share() const
+    {
+        return fraction(budget_decrease_observation_.negative_units, budget_decrease_observation_.evidence_units);
+    }
+
+    double observation_after_severe_share() const
+    {
+        return fraction(budget_decrease_observation_.severe_units, budget_decrease_observation_.evidence_units);
+    }
+
+    double observation_after_timeout_share() const
+    {
+        return fraction(budget_decrease_observation_.timeout_units, budget_decrease_observation_.evidence_units);
+    }
+
+    void start_budget_decrease_observation(
+            NegativeFeedbackKind kind,
+            uint32_t budget_before,
+            uint32_t budget_after,
+            const LinkFeedbackWindow& trigger_window,
+            uint32_t min_windows)
+    {
+        budget_decrease_observation_ = BudgetDecreaseObservation();
+        budget_decrease_observation_.active = true;
+        budget_decrease_observation_.kind = kind;
+        budget_decrease_observation_.budget_before = budget_before;
+        budget_decrease_observation_.budget_after = budget_after;
+        budget_decrease_observation_.min_windows = (std::max)(1u, min_windows);
+        budget_decrease_observation_.max_windows =
+                (std::max)(budget_decrease_observation_.min_windows + 1u,
+                budget_decrease_observation_.min_windows * 3u);
+        const uint64_t trigger_evidence = evidence_units(trigger_window);
+        budget_decrease_observation_.before_negative_share =
+                fraction(negative_units(trigger_window), trigger_evidence);
+        budget_decrease_observation_.before_severe_share =
+                fraction(severe_units(trigger_window), trigger_evidence);
+        budget_decrease_observation_.before_timeout_share =
+                fraction(timeout_units(trigger_window), trigger_evidence);
+    }
+
+    void accumulate_budget_decrease_observation(
+            const LinkFeedbackWindow& window)
+    {
+        ++budget_decrease_observation_.windows;
+        budget_decrease_observation_.evidence_units += evidence_units(window);
+        budget_decrease_observation_.negative_units += negative_units(window);
+        budget_decrease_observation_.severe_units += severe_units(window);
+        budget_decrease_observation_.repair_active_units += repair_active_units(window);
+        budget_decrease_observation_.timeout_units += timeout_units(window);
+    }
+
+    BudgetObservationResult evaluate_budget_decrease_observation() const
+    {
+        if (!budget_decrease_observation_.active)
+        {
+            return BudgetObservationResult::ACTIVE;
+        }
+
+        if (budget_decrease_observation_.windows < budget_decrease_observation_.min_windows)
+        {
+            return BudgetObservationResult::ACTIVE;
+        }
+
+        const bool has_observation_evidence = budget_decrease_observation_.evidence_units > 0u ||
+                budget_decrease_observation_.timeout_units > 0u;
+        if (!has_observation_evidence &&
+                budget_decrease_observation_.windows < budget_decrease_observation_.max_windows)
+        {
+            return BudgetObservationResult::ACTIVE;
+        }
+
+        const double after_negative_share = observation_after_negative_share();
+        const double after_severe_share = observation_after_severe_share();
+        const double after_timeout_share = observation_after_timeout_share();
+        const bool negative_improved = share_improved(
+            budget_decrease_observation_.before_negative_share, after_negative_share);
+        const bool severe_improved = share_improved(
+            budget_decrease_observation_.before_severe_share, after_severe_share);
+        const bool timeout_improved = share_improved(
+            budget_decrease_observation_.before_timeout_share, after_timeout_share);
+        const bool negative_worsened = share_worsened(
+            budget_decrease_observation_.before_negative_share, after_negative_share);
+        const bool severe_worsened = share_worsened(
+            budget_decrease_observation_.before_severe_share, after_severe_share);
+        const bool timeout_worsened = share_worsened(
+            budget_decrease_observation_.before_timeout_share, after_timeout_share);
+        const bool severe_or_timeout_worsened = severe_worsened || timeout_worsened;
+        const bool trigger_metric_improved =
+                NegativeFeedbackKind::SEVERE == budget_decrease_observation_.kind ?
+                (severe_improved || timeout_improved) : negative_improved;
+        if (trigger_metric_improved && !severe_or_timeout_worsened)
+        {
+            return BudgetObservationResult::COMMIT_IMPROVED;
+        }
+        if (severe_or_timeout_worsened || negative_worsened)
+        {
+            return BudgetObservationResult::COMMIT_WORSENED;
+        }
+        return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
+    }
+
+    void reset_negative_feedback_episodes()
+    {
+        feedback_slow_windows_ = 0u;
+        repair_timeout_windows_ = 0u;
+        feedback_slow_clear_windows_ = 0u;
+        repair_timeout_clear_windows_ = 0u;
+        feedback_slow_episode_ = false;
+        feedback_slow_triggered_ = false;
+        repair_timeout_episode_ = false;
+        repair_timeout_triggered_ = false;
     }
 
     LinkFeedbackWindow capture_link_feedback_window()
@@ -3281,19 +3563,118 @@ private:
         const bool negative_feedback_activity = control_window_.selected_bytes > 0u || link_feedback_activity ||
                 request_bytes_delta > 0u;
         const bool negative_feedback = negative_feedback_activity && link_negative_signal;
-        const bool positive_feedback = feedback_calibrated &&
-                !negative_feedback_episode &&
+        const bool positive_feedback_candidate = feedback_calibrated &&
                 recovery_active_send_load &&
                 classified_feedback_activity &&
                 (flow_strong_positive || flow_normal);
+        const bool positive_feedback = positive_feedback_candidate &&
+                !negative_feedback_episode;
         const bool repair_demand = pressure.link_outstanding_changes > 0u ||
                 pressure.pending_old_writers > 0u;
         const bool blocked_demand = queued_demand &&
                 (control_window_.throttled > 0u ||
                 (repair_demand && control_window_.selected_bytes < active_send_load_floor_bytes()));
-        const bool recovery_probe_eligible = feedback_calibrated &&
-                !negative_feedback_episode && blocked_demand &&
+        const bool recovery_probe_candidate = feedback_calibrated &&
+                blocked_demand &&
                 current_send_budget_bytes_ < max_send_budget_bytes_;
+        const bool recovery_probe_eligible = recovery_probe_candidate &&
+                !negative_feedback_episode;
+
+        if (budget_decrease_observation_.active)
+        {
+            accumulate_budget_decrease_observation(feedback_window);
+            const BudgetObservationResult observation_result = evaluate_budget_decrease_observation();
+            const bool negative_suppressed = negative_feedback;
+            const bool positive_suppressed = positive_feedback_candidate;
+            const bool probe_suppressed = recovery_probe_candidate;
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+            static_cast<void>(negative_suppressed);
+            static_cast<void>(positive_suppressed);
+            static_cast<void>(probe_suppressed);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            recovery_probe_windows_ = 0u;
+            if (BudgetObservationResult::ACTIVE == observation_result)
+            {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                trace_budget_update("observation_active", previous_budget, previous_state, pressure,
+                        recovery_active_send_load, negative_feedback_activity, queued_demand,
+                        blocked_demand,
+                        negative_feedback, positive_feedback, false,
+                        request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
+                        request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
+                        repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta,
+                        feedback_window.active_feedback_slow_ratio,
+                        feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
+                        feedback_window.active_writers, feedback_window.slow_writers,
+                        feedback_window.slow_reader_share, feedback_window.slow_writer_share,
+                        feedback_window.slow_request_byte_share,
+                        feedback_window.feedback_slow_reader_share,
+                        feedback_window.feedback_slow_writer_share,
+                        feedback_window.feedback_slow_request_byte_share,
+                        feedback_window.repair_timeout_reader_share,
+                        feedback_window.repair_timeout_writer_share,
+                        feedback_window.repair_timeout_byte_share,
+                        link_negative_signal, feedback_slow, repair_timeout,
+                        feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold,
+                        budget_observation_result_name(observation_result), false,
+                        negative_suppressed, positive_suppressed, probe_suppressed);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                return;
+            }
+
+            if (BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT == observation_result)
+            {
+                current_send_budget_bytes_ = clamp_budget(budget_decrease_observation_.budget_before);
+                if (queued_demand)
+                {
+                    send_load_state_ = SendLoadState::RECOVERY;
+                }
+                else
+                {
+                    send_load_state_ = SendLoadState::NORMAL;
+                }
+            }
+            else
+            {
+                current_send_budget_bytes_ = clamp_budget(budget_decrease_observation_.budget_after);
+                send_load_state_ = BudgetObservationResult::COMMIT_WORSENED == observation_result ?
+                        SendLoadState::PRESSURE : SendLoadState::RECOVERY;
+            }
+            send_balance_bytes_ = (std::min)(
+                send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            trace_budget_update(
+                    BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT == observation_result ?
+                    "observation_rollback_no_improvement" :
+                    (BudgetObservationResult::COMMIT_WORSENED == observation_result ?
+                    "observation_commit_worsened" : "observation_commit_improved"),
+                    previous_budget, previous_state, pressure,
+                    recovery_active_send_load, negative_feedback_activity, queued_demand,
+                    blocked_demand,
+                    negative_feedback, positive_feedback, false,
+                    request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
+                    request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
+                    repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta,
+                    feedback_window.active_feedback_slow_ratio,
+                    feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
+                    feedback_window.active_writers, feedback_window.slow_writers,
+                    feedback_window.slow_reader_share, feedback_window.slow_writer_share,
+                    feedback_window.slow_request_byte_share,
+                    feedback_window.feedback_slow_reader_share,
+                    feedback_window.feedback_slow_writer_share,
+                    feedback_window.feedback_slow_request_byte_share,
+                    feedback_window.repair_timeout_reader_share,
+                    feedback_window.repair_timeout_writer_share,
+                    feedback_window.repair_timeout_byte_share,
+                    link_negative_signal, feedback_slow, repair_timeout,
+                    feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold,
+                    budget_observation_result_name(observation_result), false,
+                    negative_suppressed, positive_suppressed, probe_suppressed);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            budget_decrease_observation_ = BudgetDecreaseObservation();
+            reset_negative_feedback_episodes();
+            return;
+        }
 
         if (negative_feedback)
         {
@@ -3307,6 +3688,7 @@ private:
             }
             recovery_probe_windows_ = 0u;
             send_load_state_ = SendLoadState::PRESSURE;
+            const uint32_t budget_before_decrease = current_send_budget_bytes_;
             if (repair_timeout)
             {
                 current_send_budget_bytes_ = clamp_budget(
@@ -3318,10 +3700,16 @@ private:
                         current_send_budget_bytes_ - recovery_step_bytes_ : 0u;
                 current_send_budget_bytes_ = clamp_budget(decreased_budget);
             }
+            start_budget_decrease_observation(
+                repair_timeout ? NegativeFeedbackKind::SEVERE : NegativeFeedbackKind::MILD,
+                budget_before_decrease,
+                current_send_budget_bytes_,
+                feedback_window,
+                negative_feedback_window_threshold);
             send_balance_bytes_ = (std::min)(
                 send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-            trace_budget_update(repair_timeout ? "severe_negative" : "mild_negative",
+            trace_budget_update(repair_timeout ? "severe_negative_tentative" : "mild_negative_tentative",
                     previous_budget, previous_state, pressure,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     blocked_demand,
@@ -3340,7 +3728,8 @@ private:
                     feedback_window.repair_timeout_writer_share,
                     feedback_window.repair_timeout_byte_share,
                     link_negative_signal, feedback_slow, repair_timeout,
-                    feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold);
+                    feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold,
+                    "active", true, false, false, false);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
@@ -3378,7 +3767,8 @@ private:
                     feedback_window.repair_timeout_writer_share,
                     feedback_window.repair_timeout_byte_share,
                     link_negative_signal, feedback_slow, repair_timeout,
-                    feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold);
+                    feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold,
+                    "none", false, false, false, false);
 #endif // FASTDDS_RETRANSMISSION_TRACE
             return;
         }
@@ -3413,7 +3803,8 @@ private:
                         feedback_window.repair_timeout_writer_share,
                         feedback_window.repair_timeout_byte_share,
                         link_negative_signal, feedback_slow, repair_timeout,
-                        feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold);
+                        feedback_slow_sample, repair_timeout_sample, negative_feedback_window_threshold,
+                        "none", false, false, false, false);
 #endif // FASTDDS_RETRANSMISSION_TRACE
                 return;
             }
@@ -3464,7 +3855,12 @@ private:
             repair_timeout,
             feedback_slow_sample,
             repair_timeout_sample,
-            negative_feedback_window_threshold);
+            negative_feedback_window_threshold,
+            "none",
+            false,
+            false,
+            false,
+            false);
 #endif // FASTDDS_RETRANSMISSION_TRACE
     }
 
@@ -3723,6 +4119,7 @@ private:
     bool feedback_slow_triggered_ = false;
     bool repair_timeout_episode_ = false;
     bool repair_timeout_triggered_ = false;
+    BudgetDecreaseObservation budget_decrease_observation_;
     double link_feedback_pressure_ratio_ = 1.5;
     int64_t send_balance_bytes_ = initial_send_budget_bytes_;
     std::chrono::steady_clock::time_point last_send_budget_refill_ = std::chrono::steady_clock::now();
@@ -4069,7 +4466,12 @@ private:
             bool repair_timeout,
             bool feedback_slow_sample,
             bool repair_timeout_sample,
-            uint32_t negative_feedback_window_threshold)
+            uint32_t negative_feedback_window_threshold,
+            const char* observation_result,
+            bool tentative_decrease,
+            bool negative_decrease_suppressed_by_observation,
+            bool positive_suppressed_by_observation,
+            bool probe_suppressed_by_observation)
     {
         std::ostringstream detail;
         detail << "scheduler=ADAPTIVE_VALUE_UTILITY"
@@ -4101,6 +4503,31 @@ private:
                << ";repair_timeout_episode=" << repair_timeout_episode_
                << ";repair_timeout_triggered=" << repair_timeout_triggered_
                << ";negative_feedback_window_threshold=" << negative_feedback_window_threshold
+               << ";observation_active=" << budget_decrease_observation_.active
+               << ";observation_kind=" << negative_feedback_kind_name(budget_decrease_observation_.kind)
+               << ";observation_windows=" << budget_decrease_observation_.windows
+               << ";observation_min_windows=" << budget_decrease_observation_.min_windows
+               << ";observation_max_windows=" << budget_decrease_observation_.max_windows
+               << ";observation_budget_before=" << budget_decrease_observation_.budget_before
+               << ";observation_budget_after=" << budget_decrease_observation_.budget_after
+               << ";observation_before_negative_share=" <<
+                budget_decrease_observation_.before_negative_share
+               << ";observation_before_severe_share=" << budget_decrease_observation_.before_severe_share
+               << ";observation_before_timeout_share=" << budget_decrease_observation_.before_timeout_share
+               << ";observation_after_negative_share=" << observation_after_negative_share()
+               << ";observation_after_severe_share=" << observation_after_severe_share()
+               << ";observation_after_timeout_share=" << observation_after_timeout_share()
+               << ";observation_evidence_units=" << budget_decrease_observation_.evidence_units
+               << ";observation_negative_units=" << budget_decrease_observation_.negative_units
+               << ";observation_severe_units=" << budget_decrease_observation_.severe_units
+               << ";observation_repair_active_units=" << budget_decrease_observation_.repair_active_units
+               << ";observation_timeout_units=" << budget_decrease_observation_.timeout_units
+               << ";observation_result=" << observation_result
+               << ";tentative_decrease=" << tentative_decrease
+               << ";negative_decrease_suppressed_by_observation=" <<
+                negative_decrease_suppressed_by_observation
+               << ";positive_suppressed_by_observation=" << positive_suppressed_by_observation
+               << ";probe_suppressed_by_observation=" << probe_suppressed_by_observation
                << ";recovery_probe=" << recovery_probe
                << ";recovery_probe_windows=" << recovery_probe_windows_
                << ";recovery_probe_interval_windows=" << recovery_probe_interval_windows_
@@ -4563,6 +4990,17 @@ private:
             return enqueue_new_sample_impl(writer, change, max_blocking_time);
         }
 
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer);
+        if (nullptr != stateful_writer)
+        {
+            fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
+                stateful_writer,
+                *change,
+                false);
+        }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+
         return true;
     }
 
@@ -4695,6 +5133,7 @@ private:
 
             std::unique_lock<std::mutex> lock(mutex_);
             fastrtps::rtps::CacheChange_t* change_to_process = nullptr;
+            bool change_to_process_is_old = false;
 
             //Check if we have to sleep.
             {
@@ -4726,6 +5165,10 @@ private:
                         sched.trigger_bandwidth_limit_reset();
                     }
                     sched.add_interested_changes_to_queue_nts();
+                }
+                if (nullptr != change_to_process)
+                {
+                    change_to_process_is_old = sched.selected_sample_is_old();
                 }
             }
 
@@ -4797,7 +5240,7 @@ private:
                         fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
                             stateful_writer,
                             *change_to_process,
-                            true);
+                            change_to_process_is_old);
                     }
                 }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
@@ -4818,6 +5261,7 @@ private:
                     std::unique_lock<std::mutex> in_lock(async_mode.changes_interested_mutex);
                     sched.add_interested_changes_to_queue_nts();
                     change_to_process = sched.get_next_change_nts();
+                    change_to_process_is_old = nullptr != change_to_process && sched.selected_sample_is_old();
                 }
             }
 

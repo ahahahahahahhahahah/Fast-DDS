@@ -178,9 +178,62 @@ enum class ForceClass
     STRONG
 };
 
+enum class SyncNegativeFeedbackKind
+{
+    NONE,
+    MILD,
+    SEVERE
+};
+
+struct WriterNegativeEpisode
+{
+    bool severe_active = false;
+    bool severe_triggered = false;
+    uint32_t severe_windows = 0;
+    uint32_t severe_clear_windows = 0;
+    bool mild_active = false;
+    bool mild_triggered = false;
+    uint32_t mild_windows = 0;
+    uint32_t mild_clear_windows = 0;
+};
+
+struct BudgetDecreaseObservation
+{
+    bool active = false;
+    SyncNegativeFeedbackKind kind = SyncNegativeFeedbackKind::NONE;
+    uint64_t budget_before = 0u;
+    uint64_t budget_after = 0u;
+    uint32_t windows = 0u;
+    uint32_t min_windows = 3u;
+    uint32_t max_windows = 9u;
+    steady_clock::time_point started;
+    double min_duration_ms = 0.0;
+    double max_duration_ms = 0.0;
+    double before_negative_share = 0.0;
+    double before_severe_share = 0.0;
+    double before_timeout_share = 0.0;
+    uint64_t evidence_units = 0u;
+    uint64_t negative_units = 0u;
+    uint64_t severe_units = 0u;
+    uint64_t repair_active_units = 0u;
+    uint64_t timeout_units = 0u;
+};
+
+enum class BudgetObservationResult
+{
+    ACTIVE,
+    COMMIT_IMPROVED,
+    ROLLBACK_NO_IMPROVEMENT,
+    COMMIT_WORSENED
+};
+
 struct WriterState
 {
     uint64_t byte_budget = max_bytes_per_cycle;
+    uint64_t previous_repair_send_samples = 0;
+    uint64_t previous_repair_timeout_samples = 0;
+    uint64_t previous_repair_send_bytes = 0;
+    uint64_t previous_repair_timeout_bytes = 0;
     uint64_t previous_feedback_strong_positive_samples = 0;
     uint64_t previous_feedback_normal_samples = 0;
     uint64_t previous_feedback_mild_negative_samples = 0;
@@ -197,6 +250,8 @@ struct WriterState
     RecoveryState recovery_state = RecoveryState::NORMAL;
     uint32_t pressure_cycles = 0;
     uint32_t improving_cycles = 0;
+    WriterNegativeEpisode negative_episode;
+    BudgetDecreaseObservation budget_observation;
     double feedback_strong_positive_ratio = default_feedback_strong_positive_ratio;
     double feedback_slow_ratio = default_feedback_slow_ratio;
     std::map<SequenceNumber_t, SentChangeState> sent_changes;
@@ -363,7 +418,238 @@ void record_classified_repair_feedback(
     }
 }
 
+double ratio(
+        uint64_t numerator,
+        uint64_t denominator)
+{
+    return denominator > 0u ? static_cast<double>(numerator) / static_cast<double>(denominator) : 0.0;
+}
+
+bool strict_majority_count(
+        uint64_t numerator,
+        uint64_t denominator)
+{
+    return denominator > 0u && numerator > denominator - numerator;
+}
+
+bool half_or_more_count(
+        uint64_t numerator,
+        uint64_t denominator)
+{
+    return denominator > 0u && numerator >= denominator - numerator;
+}
+
+bool share_improved(
+        double before,
+        double after)
+{
+    return before > 0.0 && (after <= before * 0.8 || before - after >= 0.10);
+}
+
+bool share_worsened(
+        double before,
+        double after)
+{
+    if (before < 0.05)
+    {
+        return after - before >= 0.10;
+    }
+    return after > before && (after >= before * 1.1 || after - before >= 0.10);
+}
+
+void update_writer_negative_episode(
+        bool signal_sample,
+        uint32_t clear_threshold,
+        uint32_t& signal_windows,
+        uint32_t& clear_windows,
+        bool& episode_active,
+        bool& episode_triggered)
+{
+    if (signal_sample)
+    {
+        episode_active = true;
+        clear_windows = 0u;
+        signal_windows = std::min(clear_threshold, signal_windows + 1u);
+        return;
+    }
+
+    if (!episode_active)
+    {
+        signal_windows = 0u;
+        clear_windows = 0u;
+        episode_triggered = false;
+        return;
+    }
+
+    clear_windows = std::min(clear_threshold, clear_windows + 1u);
+    if (clear_windows >= clear_threshold)
+    {
+        episode_active = false;
+        episode_triggered = false;
+        signal_windows = 0u;
+        clear_windows = 0u;
+    }
+}
+
+void reset_writer_negative_episode(
+        WriterState& writer)
+{
+    writer.negative_episode = WriterNegativeEpisode();
+    writer.pressure_cycles = 0u;
+}
+
+double observation_elapsed_ms(
+        const BudgetDecreaseObservation& observation,
+        steady_clock::time_point now)
+{
+    if (steady_clock::time_point() == observation.started)
+    {
+        return 0.0;
+    }
+    return std::chrono::duration<double, std::milli>(now - observation.started).count();
+}
+
+double observation_after_negative_share(
+        const BudgetDecreaseObservation& observation)
+{
+    return ratio(observation.negative_units, observation.evidence_units);
+}
+
+double observation_after_severe_share(
+        const BudgetDecreaseObservation& observation)
+{
+    return ratio(observation.severe_units, observation.evidence_units);
+}
+
+double observation_after_timeout_share(
+        const BudgetDecreaseObservation& observation)
+{
+    return ratio(observation.timeout_units, observation.evidence_units);
+}
+
+void start_budget_observation(
+        WriterState& writer,
+        SyncNegativeFeedbackKind kind,
+        uint64_t budget_before,
+        uint64_t budget_after,
+        steady_clock::time_point now,
+        double repair_window_ms,
+        uint64_t evidence_units,
+        uint64_t negative_units,
+        uint64_t severe_units,
+        uint64_t repair_active_units,
+        uint64_t timeout_units)
+{
+    writer.budget_observation = BudgetDecreaseObservation();
+    writer.budget_observation.active = true;
+    writer.budget_observation.kind = kind;
+    writer.budget_observation.budget_before = budget_before;
+    writer.budget_observation.budget_after = budget_after;
+    writer.budget_observation.started = now;
+    writer.budget_observation.min_duration_ms = std::max(min_repair_timeout_ms, repair_window_ms);
+    writer.budget_observation.max_duration_ms = writer.budget_observation.min_duration_ms * 3.0;
+    writer.budget_observation.before_negative_share = ratio(negative_units, evidence_units);
+    writer.budget_observation.before_severe_share = ratio(severe_units, evidence_units);
+    writer.budget_observation.before_timeout_share = ratio(timeout_units, evidence_units);
+    static_cast<void>(repair_active_units);
+}
+
+void accumulate_budget_observation(
+        BudgetDecreaseObservation& observation,
+        uint64_t evidence_units,
+        uint64_t negative_units,
+        uint64_t severe_units,
+        uint64_t repair_active_units,
+        uint64_t timeout_units)
+{
+    ++observation.windows;
+    observation.evidence_units += evidence_units;
+    observation.negative_units += negative_units;
+    observation.severe_units += severe_units;
+    observation.repair_active_units += repair_active_units;
+    observation.timeout_units += timeout_units;
+}
+
+BudgetObservationResult evaluate_budget_observation(
+        const BudgetDecreaseObservation& observation,
+        steady_clock::time_point now)
+{
+    if (!observation.active)
+    {
+        return BudgetObservationResult::ACTIVE;
+    }
+
+    const double elapsed_ms = observation_elapsed_ms(observation, now);
+    const bool min_elapsed = observation.windows >= observation.min_windows &&
+            elapsed_ms >= observation.min_duration_ms;
+    const bool max_elapsed = observation.windows >= observation.max_windows ||
+            (observation.max_duration_ms > 0.0 && elapsed_ms >= observation.max_duration_ms);
+    const bool has_observation_evidence = observation.evidence_units > 0u ||
+            observation.timeout_units > 0u;
+    if (!min_elapsed && !max_elapsed)
+    {
+        return BudgetObservationResult::ACTIVE;
+    }
+
+    if (!has_observation_evidence)
+    {
+        return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
+    }
+
+    const double after_negative_share = observation_after_negative_share(observation);
+    const double after_severe_share = observation_after_severe_share(observation);
+    const double after_timeout_share = observation_after_timeout_share(observation);
+    const bool negative_improved = share_improved(observation.before_negative_share, after_negative_share);
+    const bool severe_improved = share_improved(observation.before_severe_share, after_severe_share);
+    const bool timeout_improved = share_improved(observation.before_timeout_share, after_timeout_share);
+    const bool negative_worsened = share_worsened(observation.before_negative_share, after_negative_share);
+    const bool severe_worsened = share_worsened(observation.before_severe_share, after_severe_share);
+    const bool timeout_worsened = share_worsened(observation.before_timeout_share, after_timeout_share);
+    const bool severe_or_timeout_worsened = severe_worsened || timeout_worsened;
+    const bool trigger_metric_improved = SyncNegativeFeedbackKind::SEVERE == observation.kind ?
+            (severe_improved || timeout_improved) : negative_improved;
+    if (trigger_metric_improved && !severe_or_timeout_worsened)
+    {
+        return BudgetObservationResult::COMMIT_IMPROVED;
+    }
+    if (severe_or_timeout_worsened || negative_worsened)
+    {
+        return BudgetObservationResult::COMMIT_WORSENED;
+    }
+    return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
+}
+
 #ifdef FASTDDS_RETRANSMISSION_TRACE
+const char* sync_negative_kind_name(
+        SyncNegativeFeedbackKind kind)
+{
+    switch (kind)
+    {
+        case SyncNegativeFeedbackKind::MILD:
+            return "mild";
+        case SyncNegativeFeedbackKind::SEVERE:
+            return "severe";
+        default:
+            return "none";
+    }
+}
+
+const char* budget_observation_result_name(
+        BudgetObservationResult result)
+{
+    switch (result)
+    {
+        case BudgetObservationResult::COMMIT_IMPROVED:
+            return "commit_improved";
+        case BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT:
+            return "rollback_no_improvement";
+        case BudgetObservationResult::COMMIT_WORSENED:
+            return "commit_worsened";
+        default:
+            return "active";
+    }
+}
+
 const char* repair_feedback_class_name(
         RepairFeedbackClass feedback_class)
 {
@@ -903,7 +1189,8 @@ void AdaptiveRetransmissionController::on_requested(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_feedback_accounting)
+    const bool sync_admission = admission_enabled(*writer);
+    if (!sync_admission && !async_feedback_accounting)
     {
         return;
     }
@@ -1059,9 +1346,10 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         WriterState& writer_state = impl_->writers[writer->getGuid()];
-        if (async_feedback_accounting &&
-                (!old_sample ||
-                writer_state.sent_changes.find(change.sequenceNumber) == writer_state.sent_changes.end()))
+        const bool track_clean_new_send = !old_sample && (async_feedback_accounting || sync_admission);
+        const bool track_async_old_send = old_sample && async_feedback_accounting &&
+                writer_state.sent_changes.find(change.sequenceNumber) == writer_state.sent_changes.end();
+        if (track_clean_new_send || track_async_old_send)
         {
             SentChangeState& sent = writer_state.sent_changes[change.sequenceNumber];
             sent.sent_time = now;
@@ -1069,7 +1357,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
             sent.old_sample = old_sample;
         }
 
-        while (async_feedback_accounting &&
+        while ((async_feedback_accounting || sync_admission) &&
                 writer_state.sent_changes.size() > max_sent_ack_tracking_per_writer)
         {
             writer_state.sent_changes.erase(writer_state.sent_changes.begin());
@@ -1341,6 +1629,10 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         const uint64_t pressure_candidate_bytes = candidate_bytes + cooldown_skipped_bytes;
 
         WriterState& writer_state = impl_->writers[writer->getGuid()];
+        uint64_t repair_send_samples = 0;
+        uint64_t repair_timeout_samples = 0;
+        uint64_t repair_send_bytes = 0;
+        uint64_t repair_timeout_bytes = 0;
         uint64_t strong_positive_samples = 0;
         uint64_t normal_samples = 0;
         uint64_t mild_negative_samples = 0;
@@ -1355,6 +1647,10 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         {
             if (item.first.writer == writer->getGuid())
             {
+                repair_send_samples += item.second.repair_send_samples;
+                repair_timeout_samples += item.second.repair_timeout_samples;
+                repair_send_bytes += item.second.repair_send_bytes;
+                repair_timeout_bytes += item.second.repair_timeout_bytes;
                 strong_positive_samples += item.second.feedback_strong_positive_samples;
                 normal_samples += item.second.feedback_normal_samples;
                 mild_negative_samples += item.second.feedback_mild_negative_samples;
@@ -1368,7 +1664,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     calibrated_feedback_available = true;
                     calibrated_feedback_ms = std::max(
                         calibrated_feedback_ms,
-                        item.second.recovery_feedback_ewma_ms);
+                        item.second.stable_feedback_ms);
                 }
             }
         }
@@ -1392,15 +1688,14 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 {
                     return current > previous ? current - previous : 0u;
                 };
-        const auto strict_majority = [](uint64_t numerator, uint64_t denominator) -> bool
-                {
-                    return denominator > 0u && numerator > denominator - numerator;
-                };
-        const auto half_or_more = [](uint64_t numerator, uint64_t denominator) -> bool
-                {
-                    return denominator > 0u && numerator >= denominator - numerator;
-                };
-
+        const uint64_t repair_send_samples_delta = counter_delta(
+            repair_send_samples, writer_state.previous_repair_send_samples);
+        const uint64_t repair_timeout_samples_delta = counter_delta(
+            repair_timeout_samples, writer_state.previous_repair_timeout_samples);
+        const uint64_t repair_send_bytes_delta = counter_delta(
+            repair_send_bytes, writer_state.previous_repair_send_bytes);
+        const uint64_t repair_timeout_bytes_delta = counter_delta(
+            repair_timeout_bytes, writer_state.previous_repair_timeout_bytes);
         const uint64_t strong_positive_samples_delta = counter_delta(
             strong_positive_samples, writer_state.previous_feedback_strong_positive_samples);
         const uint64_t normal_samples_delta = counter_delta(
@@ -1418,6 +1713,10 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         const uint64_t severe_negative_bytes_delta = counter_delta(
             severe_negative_bytes, writer_state.previous_feedback_severe_negative_bytes);
 
+        writer_state.previous_repair_send_samples = repair_send_samples;
+        writer_state.previous_repair_timeout_samples = repair_timeout_samples;
+        writer_state.previous_repair_send_bytes = repair_send_bytes;
+        writer_state.previous_repair_timeout_bytes = repair_timeout_bytes;
         writer_state.previous_feedback_strong_positive_samples = strong_positive_samples;
         writer_state.previous_feedback_normal_samples = normal_samples;
         writer_state.previous_feedback_mild_negative_samples = mild_negative_samples;
@@ -1442,11 +1741,16 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         const uint64_t strong_positive_weight = evidence_bytes_delta > 0u ?
                 strong_positive_bytes_delta : strong_positive_samples_delta;
         const bool classified_feedback_activity = evidence_weight > 0u;
-        const bool severe_negative_feedback = strict_majority(severe_weight, evidence_weight);
+        const uint64_t repair_active_weight = repair_send_bytes_delta + repair_timeout_bytes_delta > 0u ?
+                repair_send_bytes_delta + repair_timeout_bytes_delta :
+                repair_send_samples_delta + repair_timeout_samples_delta;
+        const uint64_t timeout_weight = repair_send_bytes_delta + repair_timeout_bytes_delta > 0u ?
+                repair_timeout_bytes_delta : repair_timeout_samples_delta;
+        const bool severe_negative_feedback = strict_majority_count(severe_weight, evidence_weight);
         const bool mild_negative_feedback =
-                !severe_negative_feedback && strict_majority(negative_weight, evidence_weight);
+                !severe_negative_feedback && strict_majority_count(negative_weight, evidence_weight);
         const bool strong_positive_feedback = 0u == negative_weight &&
-                half_or_more(strong_positive_weight, evidence_weight);
+                half_or_more_count(strong_positive_weight, evidence_weight);
         const bool normal_feedback = classified_feedback_activity &&
                 !severe_negative_feedback && !mild_negative_feedback && !strong_positive_feedback;
         const uint64_t active_load_floor = std::max<uint64_t>(
@@ -1454,41 +1758,156 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             writer_state.byte_budget / 2u);
         const bool active_repair_load = pressure_candidate_bytes >= active_load_floor;
         const bool budget_limited = pressure_candidate_bytes > writer_state.byte_budget;
-        const bool positive_feedback = active_repair_load &&
+        const bool positive_feedback_candidate = active_repair_load &&
                 (strong_positive_feedback || normal_feedback);
-        const bool recovery_probe = !classified_feedback_activity && budget_limited &&
+        const bool recovery_probe_candidate = !classified_feedback_activity && budget_limited &&
                 writer_state.byte_budget < max_dynamic_bytes_per_cycle;
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         const uint64_t previous_byte_budget = writer_state.byte_budget;
         const char* budget_reason = "hold";
+        const char* observation_result = "none";
+        bool tentative_decrease = false;
+        bool negative_decrease_suppressed_by_observation = false;
+        bool positive_suppressed_by_observation = false;
+        bool probe_suppressed_by_observation = false;
 #endif // FASTDDS_RETRANSMISSION_TRACE
+        bool reset_budget_observation_after_trace = false;
 
-        if (severe_negative_feedback)
+        const uint32_t negative_clear_threshold = 2u;
+        update_writer_negative_episode(
+            severe_negative_feedback,
+            negative_clear_threshold,
+            writer_state.negative_episode.severe_windows,
+            writer_state.negative_episode.severe_clear_windows,
+            writer_state.negative_episode.severe_active,
+            writer_state.negative_episode.severe_triggered);
+        update_writer_negative_episode(
+            mild_negative_feedback,
+            negative_clear_threshold,
+            writer_state.negative_episode.mild_windows,
+            writer_state.negative_episode.mild_clear_windows,
+            writer_state.negative_episode.mild_active,
+            writer_state.negative_episode.mild_triggered);
+        writer_state.pressure_cycles = writer_state.negative_episode.mild_windows;
+        const bool negative_episode_active = writer_state.negative_episode.severe_active ||
+                writer_state.negative_episode.mild_active;
+        const bool positive_feedback = positive_feedback_candidate && !negative_episode_active;
+        const bool recovery_probe = recovery_probe_candidate && !negative_episode_active;
+
+        if (writer_state.budget_observation.active)
+        {
+            accumulate_budget_observation(
+                writer_state.budget_observation,
+                evidence_weight,
+                negative_weight,
+                severe_weight,
+                repair_active_weight,
+                timeout_weight);
+            const BudgetObservationResult result = evaluate_budget_observation(
+                writer_state.budget_observation,
+                now);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            observation_result = budget_observation_result_name(result);
+            negative_decrease_suppressed_by_observation = severe_negative_feedback || mild_negative_feedback;
+            positive_suppressed_by_observation = positive_feedback_candidate;
+            probe_suppressed_by_observation = recovery_probe_candidate;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            writer_state.improving_cycles = 0;
+            if (BudgetObservationResult::ACTIVE == result)
+            {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                budget_reason = "observation_active";
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            }
+            else
+            {
+                if (BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT == result)
+                {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    budget_reason = "observation_rollback_no_improvement";
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                    writer_state.byte_budget = std::min(
+                        max_dynamic_bytes_per_cycle,
+                        writer_state.budget_observation.budget_before);
+                    writer_state.recovery_state = pressure_candidate_bytes > 0u ?
+                            RecoveryState::RECOVERY : RecoveryState::NORMAL;
+                }
+                else
+                {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    budget_reason = BudgetObservationResult::COMMIT_WORSENED == result ?
+                            "observation_commit_worsened" : "observation_commit_improved";
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                    writer_state.byte_budget = std::min(
+                        max_dynamic_bytes_per_cycle,
+                        std::max(min_dynamic_bytes_per_cycle, writer_state.budget_observation.budget_after));
+                    writer_state.recovery_state = BudgetObservationResult::COMMIT_WORSENED == result ?
+                            RecoveryState::PRESSURE : RecoveryState::RECOVERY;
+                }
+                reset_budget_observation_after_trace = true;
+                reset_writer_negative_episode(writer_state);
+            }
+        }
+        else if (severe_negative_feedback && !writer_state.negative_episode.severe_triggered)
         {
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-            budget_reason = "severe_negative";
+            budget_reason = "severe_negative_tentative";
+            tentative_decrease = true;
 #endif // FASTDDS_RETRANSMISSION_TRACE
+            writer_state.negative_episode.severe_triggered = true;
             writer_state.pressure_cycles = 0;
             writer_state.improving_cycles = 0;
             writer_state.recovery_state = RecoveryState::PRESSURE;
+            const uint64_t budget_before = writer_state.byte_budget;
             writer_state.byte_budget = std::max(
                 min_dynamic_bytes_per_cycle, writer_state.byte_budget / 2);
+            const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
+                    writer_state.stable_feedback_ms * repair_timeout_baseline_multiplier : min_repair_timeout_ms;
+            start_budget_observation(
+                writer_state,
+                SyncNegativeFeedbackKind::SEVERE,
+                budget_before,
+                writer_state.byte_budget,
+                now,
+                observation_repair_window_ms,
+                evidence_weight,
+                negative_weight,
+                severe_weight,
+                repair_active_weight,
+                timeout_weight);
         }
         else if (mild_negative_feedback)
         {
-            ++writer_state.pressure_cycles;
             writer_state.improving_cycles = 0;
-            if (writer_state.pressure_cycles >= 2)
+            if (writer_state.negative_episode.mild_windows >= 2u &&
+                    !writer_state.negative_episode.mild_triggered)
             {
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-                budget_reason = "mild_negative";
+                budget_reason = "mild_negative_tentative";
+                tentative_decrease = true;
 #endif // FASTDDS_RETRANSMISSION_TRACE
+                writer_state.negative_episode.mild_triggered = true;
                 writer_state.recovery_state = RecoveryState::PRESSURE;
+                const uint64_t budget_before = writer_state.byte_budget;
                 const uint64_t decreased_budget = writer_state.byte_budget > additive_budget_step ?
                         writer_state.byte_budget - additive_budget_step : 0u;
                 writer_state.byte_budget = std::max(
                     min_dynamic_bytes_per_cycle, decreased_budget);
+                const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
+                        writer_state.stable_feedback_ms * repair_timeout_baseline_multiplier : min_repair_timeout_ms;
+                start_budget_observation(
+                    writer_state,
+                    SyncNegativeFeedbackKind::MILD,
+                    budget_before,
+                    writer_state.byte_budget,
+                    now,
+                    observation_repair_window_ms,
+                    evidence_weight,
+                    negative_weight,
+                    severe_weight,
+                    repair_active_weight,
+                    timeout_weight);
             }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             else
@@ -1499,7 +1918,6 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         }
         else
         {
-            writer_state.pressure_cycles = 0;
             if (positive_feedback || recovery_probe)
             {
                 ++writer_state.improving_cycles;
@@ -1567,6 +1985,54 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                    << ";normal_bytes_delta=" << normal_bytes_delta
                    << ";mild_negative_bytes_delta=" << mild_negative_bytes_delta
                    << ";severe_negative_bytes_delta=" << severe_negative_bytes_delta
+                   << ";repair_send_samples_delta=" << repair_send_samples_delta
+                   << ";repair_timeout_samples_delta=" << repair_timeout_samples_delta
+                   << ";repair_send_bytes_delta=" << repair_send_bytes_delta
+                   << ";repair_timeout_bytes_delta=" << repair_timeout_bytes_delta
+                   << ";repair_active_weight=" << repair_active_weight
+                   << ";timeout_weight=" << timeout_weight
+                   << ";observation_active=" << writer_state.budget_observation.active
+                   << ";observation_kind=" << sync_negative_kind_name(writer_state.budget_observation.kind)
+                   << ";observation_windows=" << writer_state.budget_observation.windows
+                   << ";observation_min_windows=" << writer_state.budget_observation.min_windows
+                   << ";observation_max_windows=" << writer_state.budget_observation.max_windows
+                   << ";observation_elapsed_ms=" << observation_elapsed_ms(
+                        writer_state.budget_observation, now)
+                   << ";observation_min_duration_ms=" << writer_state.budget_observation.min_duration_ms
+                   << ";observation_max_duration_ms=" << writer_state.budget_observation.max_duration_ms
+                   << ";observation_budget_before=" << writer_state.budget_observation.budget_before
+                   << ";observation_budget_after=" << writer_state.budget_observation.budget_after
+                   << ";observation_before_negative_share=" <<
+                        writer_state.budget_observation.before_negative_share
+                   << ";observation_before_severe_share=" <<
+                        writer_state.budget_observation.before_severe_share
+                   << ";observation_before_timeout_share=" <<
+                        writer_state.budget_observation.before_timeout_share
+                   << ";observation_after_negative_share=" <<
+                        observation_after_negative_share(writer_state.budget_observation)
+                   << ";observation_after_severe_share=" <<
+                        observation_after_severe_share(writer_state.budget_observation)
+                   << ";observation_after_timeout_share=" <<
+                        observation_after_timeout_share(writer_state.budget_observation)
+                   << ";observation_evidence_units=" << writer_state.budget_observation.evidence_units
+                   << ";observation_negative_units=" << writer_state.budget_observation.negative_units
+                   << ";observation_severe_units=" << writer_state.budget_observation.severe_units
+                   << ";observation_repair_active_units=" << writer_state.budget_observation.repair_active_units
+                   << ";observation_timeout_units=" << writer_state.budget_observation.timeout_units
+                   << ";observation_result=" << observation_result
+                   << ";tentative_decrease=" << tentative_decrease
+                   << ";negative_decrease_suppressed_by_observation=" <<
+                        negative_decrease_suppressed_by_observation
+                   << ";positive_suppressed_by_observation=" << positive_suppressed_by_observation
+                   << ";probe_suppressed_by_observation=" << probe_suppressed_by_observation
+                   << ";severe_episode_active=" << writer_state.negative_episode.severe_active
+                   << ";severe_episode_triggered=" << writer_state.negative_episode.severe_triggered
+                   << ";severe_episode_windows=" << writer_state.negative_episode.severe_windows
+                   << ";severe_episode_clear_windows=" << writer_state.negative_episode.severe_clear_windows
+                   << ";mild_episode_active=" << writer_state.negative_episode.mild_active
+                   << ";mild_episode_triggered=" << writer_state.negative_episode.mild_triggered
+                   << ";mild_episode_windows=" << writer_state.negative_episode.mild_windows
+                   << ";mild_episode_clear_windows=" << writer_state.negative_episode.mild_clear_windows
                    << ";stable_feedback_ms=" << writer_state.stable_feedback_ms
                    << ";stable_feedback_calibrated=" << writer_state.stable_feedback_calibrated
                    << ";pressure_cycles=" << writer_state.pressure_cycles
@@ -1574,6 +2040,11 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             budget_traces.push_back(BudgetTrace {detail.str()});
         }
 #endif // FASTDDS_RETRANSMISSION_TRACE
+
+        if (reset_budget_observation_after_trace)
+        {
+            writer_state.budget_observation = BudgetDecreaseObservation();
+        }
 
         std::sort(ordered.begin(), ordered.end(),
                 [](const ChangeGroup* left, const ChangeGroup* right)
@@ -1905,7 +2376,8 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_feedback_accounting)
+    const bool sync_admission = admission_enabled(*writer);
+    if (!sync_admission && !async_feedback_accounting)
     {
         return;
     }
@@ -1944,7 +2416,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         ReaderState& reader = impl_->readers[reader_key];
         WriterState& writer_state = impl_->writers[writer->getGuid()];
 
-        if (async_feedback_accounting && sequence_number > reader.last_ack_base)
+        if ((async_feedback_accounting || sync_admission) && sequence_number > reader.last_ack_base)
         {
             if (!reader.ack_progress_tracking_started)
             {
@@ -2007,18 +2479,6 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                         const double feedback_ms =
                                 std::chrono::duration<double, std::milli>(
                             now - latest_unclassified->sent_time).count();
-                        if (!async_feedback_accounting)
-                        {
-                            reader.stable_feedback_ms = update_calibrated_feedback_baseline_from_ack_progress(
-                                reader.stable_feedback_ms,
-                                reader.stable_feedback_calibration_samples,
-                                reader.stable_feedback_calibration_samples_ms,
-                                reader.stable_feedback_calibration_started,
-                                reader.stable_feedback_calibrated,
-                                now,
-                                feedback_ms);
-                            classified = reader.stable_feedback_calibrated && reader.stable_feedback_ms > 0.0;
-                        }
                         const double timeout_ms = classified ? repair_timeout_window_ms(reader) : 0.0;
                         for (auto attempt_it = it->second.repair_send_attempts.begin();
                                 attempt_it != latest_unclassified; ++attempt_it)
