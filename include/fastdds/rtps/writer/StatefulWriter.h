@@ -28,6 +28,7 @@
 #include <fastrtps/utils/collections/ResourceLimitedVector.hpp>
 #include <condition_variable>
 #include <mutex>
+#include <vector>
 
 namespace eprosima {
 namespace fastrtps {
@@ -419,6 +420,14 @@ public:
             LocatorSelectorSender& locator_selector,
             const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time) override;
 
+    DeliveryRetCode deliver_sample_nts_with_sample_kind(
+            CacheChange_t* cache_change,
+            RTPSMessageGroup& group,
+            LocatorSelectorSender& locator_selector,
+            const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+            bool old_sample,
+            uint64_t send_period_id = 0u);
+
     LocatorSelectorSender& get_general_locator_selector() override
     {
         return locator_selector_general_;
@@ -476,7 +485,17 @@ private:
             CacheChange_t* change,
             RTPSMessageGroup& group,
             LocatorSelectorSender& locator_selector,
-            const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time);
+            const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+            std::vector<GUID_t>* served_readers = nullptr);
+
+    DeliveryRetCode deliver_sample_nts_impl(
+            CacheChange_t* cache_change,
+            RTPSMessageGroup& group,
+            LocatorSelectorSender& locator_selector,
+            const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+            bool sample_kind_known,
+            bool old_sample,
+            uint64_t send_period_id);
 
     void prepare_datasharing_delivery(
             CacheChange_t* change);

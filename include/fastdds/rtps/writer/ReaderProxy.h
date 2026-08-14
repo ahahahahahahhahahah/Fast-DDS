@@ -240,6 +240,18 @@ public:
             uint32_t& deferred);
 
     /**
+     * Turns one admitted REQUESTED change into UNSENT and leaves all other
+     * REQUESTED changes untouched.
+     *
+     * @param sequence Sequence number selected by the admission tick.
+     * @param func Function executed if the selected change changes status.
+     * @return true when the selected change was still REQUESTED and changed to UNSENT.
+     */
+    bool admit_requested_change(
+            const SequenceNumber_t& sequence,
+            const std::function<void(ChangeForReader_t& change)>& func);
+
+    /**
      * Call this to inform a change was removed from history.
      * @param seq_num Sequence number of the removed change.
      */

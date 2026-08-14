@@ -55,6 +55,8 @@
 #include "../RetransmissionTrace.hpp"
 #include "AdaptiveRetransmissionController.hpp"
 
+#include <algorithm>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <vector>
@@ -677,7 +679,8 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
         CacheChange_t* change,
         RTPSMessageGroup& group,
         LocatorSelectorSender& locator_selector, // Object locked by FlowControllerImpl
-        const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time)
+        const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+        std::vector<GUID_t>* served_readers)
 {
     NetworkFactory& network = mp_RTPSParticipant->network_factory();
     DeliveryRetCode ret_code = DeliveryRetCode::DELIVERED;
@@ -852,6 +855,10 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                                         change->sequenceNumber,
                                                         UNDERWAY,
                                                         true);
+                                                    if (nullptr != served_readers)
+                                                    {
+                                                        served_readers->push_back((*remote_reader)->guid());
+                                                    }
                                                 }
                                             }
                                         }
@@ -894,6 +901,10 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                                 change->sequenceNumber,
                                                 UNDERWAY,
                                                 true);
+                                            if (nullptr != served_readers)
+                                            {
+                                                served_readers->push_back((*remote_reader)->guid());
+                                            }
                                         }
                                     }
                                 }
@@ -957,6 +968,10 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                                     change->sequenceNumber,
                                                     UNDERWAY,
                                                     true);
+                                                if (nullptr != served_readers)
+                                                {
+                                                    served_readers->push_back((*remote_reader)->guid());
+                                                }
                                             }
                                         }
                                         add_statistics_sent_submessage(change, (*remote_reader)->locators_size());
@@ -991,6 +1006,10 @@ DeliveryRetCode StatefulWriter::deliver_sample_to_network(
                                             change->sequenceNumber,
                                             UNDERWAY,
                                             true);
+                                        if (nullptr != served_readers)
+                                        {
+                                            served_readers->push_back((*remote_reader)->guid());
+                                        }
                                     }
                                     add_statistics_sent_submessage(change, (*remote_reader)->locators_size());
                                 }
@@ -1976,6 +1995,8 @@ bool StatefulWriter::perform_nack_response_event()
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
     const bool adaptive_admission_planning =
             detail::AdaptiveRetransmissionController::instance().admission_planning_enabled(this);
+    std::vector<detail::AdaptiveRetransmissionPlanEntry> adaptive_plan_entries;
+    std::map<GUID_t, ReaderProxy*> adaptive_reader_by_guid;
     if (adaptive_admission_planning)
     {
         detail::AdaptiveRetransmissionController::instance().begin_admission_cycle(this);
@@ -1992,34 +2013,69 @@ bool StatefulWriter::perform_nack_response_event()
                         earliest_requested);
                 });
         }
-        detail::AdaptiveRetransmissionController::instance().finalize_admission_cycle(this);
+        adaptive_plan_entries =
+                detail::AdaptiveRetransmissionController::instance().finalize_admission_cycle(this);
+        for (ReaderProxy* candidate_reader : matched_remote_readers_)
+        {
+            adaptive_reader_by_guid[candidate_reader->guid()] = candidate_reader;
+        }
     }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
-    for (ReaderProxy* reader : matched_remote_readers_)
-    {
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-        if (adaptive_admission_planning)
+    if (adaptive_admission_planning)
+    {
+        for (const detail::AdaptiveRetransmissionPlanEntry& entry : adaptive_plan_entries)
         {
-            uint32_t reader_deferred = 0;
-            changes_to_resend += reader->perform_acknack_response(
-                        [&](const ChangeForReader_t& change)
-                        {
-                            assert(nullptr != change.getChange());
-                            return detail::AdaptiveRetransmissionDecision::DEFER !=
-                                   detail::AdaptiveRetransmissionController::instance().decide_retransmission(
-                                this,
-                                reader->guid(),
-                                *change.getChange());
-                        },
-                        [&](ChangeForReader_t& change)
-                        {
-                            // This lambda is called if the ChangeForReader_t passes from REQUESTED to UNSENT.
-                            enqueue_retransmission(reader->guid(), change);
-                        },
-                        reader_deferred);
-            deferred_changes += reader_deferred;
+            if (detail::AdaptiveRetransmissionDecision::DEFER == entry.decision)
+            {
+                ++deferred_changes;
+                continue;
+            }
+
+            const auto reader_it = adaptive_reader_by_guid.find(entry.reader_guid);
+            if (reader_it == adaptive_reader_by_guid.end() || nullptr == reader_it->second)
+            {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "ADAPT_ADMISSION_STALE_SELECTION",
+                    getGuid(),
+                    entry.reader_guid,
+                    entry.sequence,
+                    0,
+                    "state=PERIODIC_ADMISSION_TICK;decision=SEND_NOW;reason=reader_not_found");
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                continue;
+            }
+
+            const bool admitted = reader_it->second->admit_requested_change(
+                entry.sequence,
+                [&](ChangeForReader_t& change)
+                {
+                    assert(nullptr != change.getChange());
+                    enqueue_retransmission(reader_it->second->guid(), change);
+                });
+            if (admitted)
+            {
+                ++changes_to_resend;
+            }
+            else
+            {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                FASTDDS_TRACE_RETRANSMISSION(
+                    "ADAPT_ADMISSION_STALE_SELECTION",
+                    getGuid(),
+                    entry.reader_guid,
+                    entry.sequence,
+                    0,
+                    "state=PERIODIC_ADMISSION_TICK;decision=SEND_NOW;reason=request_no_longer_requested");
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            }
         }
-        else
+    }
+    else
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+    {
+        for (ReaderProxy* reader : matched_remote_readers_)
         {
             changes_to_resend += reader->perform_acknack_response(
                         [&](ChangeForReader_t& change)
@@ -2027,13 +2083,6 @@ bool StatefulWriter::perform_nack_response_event()
                             enqueue_retransmission(reader->guid(), change);
                         });
         }
-#else
-        changes_to_resend += reader->perform_acknack_response(
-                    [&](ChangeForReader_t& change)
-                    {
-                        enqueue_retransmission(reader->guid(), change);
-                    });
-#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
     }
 
     lock.unlock();
@@ -2145,7 +2194,7 @@ bool StatefulWriter::process_acknack(
                                         const bool queued = flow_controller_->add_old_sample(this, cache_change);
 #endif // FASTDDS_RETRANSMISSION_TRACE
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-                                        detail::AdaptiveRetransmissionController::instance().on_old_sample_enqueued(
+                                        detail::AdaptiveRetransmissionController::instance().on_initial_old_sample_enqueued(
                                             this,
                                             remote_reader->guid(),
                                             *cache_change,
@@ -2319,6 +2368,43 @@ DeliveryRetCode StatefulWriter::deliver_sample_nts(
         LocatorSelectorSender& locator_selector, // Object locked by FlowControllerImpl
         const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time)
 {
+    return deliver_sample_nts_impl(
+        cache_change,
+        group,
+        locator_selector,
+        max_blocking_time,
+        false,
+        false,
+        0u);
+}
+
+DeliveryRetCode StatefulWriter::deliver_sample_nts_with_sample_kind(
+        CacheChange_t* cache_change,
+        RTPSMessageGroup& group,
+        LocatorSelectorSender& locator_selector,
+        const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+        bool old_sample,
+        uint64_t send_period_id)
+{
+    return deliver_sample_nts_impl(
+        cache_change,
+        group,
+        locator_selector,
+        max_blocking_time,
+        true,
+        old_sample,
+        send_period_id);
+}
+
+DeliveryRetCode StatefulWriter::deliver_sample_nts_impl(
+        CacheChange_t* cache_change,
+        RTPSMessageGroup& group,
+        LocatorSelectorSender& locator_selector,
+        const std::chrono::time_point<std::chrono::steady_clock>& max_blocking_time,
+        bool sample_kind_known,
+        bool old_sample,
+        uint64_t send_period_id)
+{
     DeliveryRetCode ret_code = DeliveryRetCode::DELIVERED;
 
     if (there_are_local_readers_)
@@ -2334,7 +2420,35 @@ DeliveryRetCode StatefulWriter::deliver_sample_nts(
 
     if (there_are_remote_readers_)
     {
-        ret_code = deliver_sample_to_network(cache_change, group, locator_selector, max_blocking_time);
+        std::vector<GUID_t> served_readers;
+        ret_code = deliver_sample_to_network(cache_change, group, locator_selector, max_blocking_time,
+                        &served_readers);
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        if (sample_kind_known && (DeliveryRetCode::DELIVERED == ret_code || !served_readers.empty()))
+        {
+            std::sort(served_readers.begin(), served_readers.end());
+            served_readers.erase(
+                std::unique(served_readers.begin(), served_readers.end()),
+                served_readers.end());
+            if (old_sample)
+            {
+                detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
+                    this,
+                    *cache_change,
+                    true,
+                    served_readers,
+                    send_period_id);
+            }
+            else
+            {
+                detail::AdaptiveRetransmissionController::instance().on_new_sample_sent(
+                    this,
+                    *cache_change,
+                    served_readers,
+                    send_period_id);
+            }
+        }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
     }
 
     check_acked_status();

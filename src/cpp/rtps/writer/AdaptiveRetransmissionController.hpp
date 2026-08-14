@@ -35,12 +35,47 @@ struct AdaptiveRetransmissionReaderFeedbackSnapshot
     uint64_t feedback_samples = 0;
     uint64_t request_bytes = 0;
     uint64_t feedback_bytes = 0;
+    uint64_t new_send_samples = 0;
+    uint64_t new_send_bytes = 0;
+    uint64_t new_ack_samples = 0;
+    uint64_t new_ack_bytes = 0;
+    uint64_t new_ack_dirty_skipped_samples = 0;
+    uint64_t new_ack_dirty_skipped_bytes = 0;
+    uint64_t new_ack_inconclusive_samples = 0;
+    uint64_t new_ack_inconclusive_bytes = 0;
+    uint64_t pending_new_dirty_overflow_samples = 0;
+    uint64_t new_ack_strong_positive_samples = 0;
+    uint64_t new_ack_strong_positive_bytes = 0;
+    uint64_t new_ack_normal_samples = 0;
+    uint64_t new_ack_normal_bytes = 0;
+    uint64_t new_ack_mild_negative_samples = 0;
+    uint64_t new_ack_mild_negative_bytes = 0;
+    uint64_t new_ack_severe_negative_samples = 0;
+    uint64_t new_ack_severe_negative_bytes = 0;
     uint64_t outstanding_changes = 0;
     uint64_t outstanding_bytes = 0;
     uint64_t repair_send_samples = 0;
     uint64_t repair_send_bytes = 0;
+    uint64_t repair_ack_samples = 0;
+    uint64_t repair_ack_bytes = 0;
+    uint64_t repair_ack_strong_positive_samples = 0;
+    uint64_t repair_ack_strong_positive_bytes = 0;
+    uint64_t repair_ack_normal_samples = 0;
+    uint64_t repair_ack_normal_bytes = 0;
+    uint64_t repair_ack_mild_negative_samples = 0;
+    uint64_t repair_ack_mild_negative_bytes = 0;
+    uint64_t repair_ack_severe_negative_samples = 0;
+    uint64_t repair_ack_severe_negative_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t repair_no_ack_timeout_samples = 0;
+    uint64_t repair_no_ack_timeout_bytes = 0;
+    uint64_t repair_late_ack_severe_samples = 0;
+    uint64_t repair_late_ack_severe_bytes = 0;
+    uint64_t repair_attempt_overflow_samples = 0;
+    uint64_t repair_attempt_overflow_bytes = 0;
+    uint64_t repair_unattributed_send_samples = 0;
+    uint64_t repair_unattributed_send_bytes = 0;
     uint64_t feedback_strong_positive_samples = 0;
     uint64_t feedback_strong_positive_bytes = 0;
     uint64_t feedback_normal_samples = 0;
@@ -49,6 +84,8 @@ struct AdaptiveRetransmissionReaderFeedbackSnapshot
     uint64_t feedback_mild_negative_bytes = 0;
     uint64_t feedback_severe_negative_samples = 0;
     uint64_t feedback_severe_negative_bytes = 0;
+    uint64_t origin_saturated_positive_samples = 0;
+    uint64_t origin_saturated_positive_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -63,12 +100,47 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     uint64_t feedback_samples = 0;
     uint64_t request_bytes = 0;
     uint64_t feedback_bytes = 0;
+    uint64_t new_send_samples = 0;
+    uint64_t new_send_bytes = 0;
+    uint64_t new_ack_samples = 0;
+    uint64_t new_ack_bytes = 0;
+    uint64_t new_ack_dirty_skipped_samples = 0;
+    uint64_t new_ack_dirty_skipped_bytes = 0;
+    uint64_t new_ack_inconclusive_samples = 0;
+    uint64_t new_ack_inconclusive_bytes = 0;
+    uint64_t pending_new_dirty_overflow_samples = 0;
+    uint64_t new_ack_strong_positive_samples = 0;
+    uint64_t new_ack_strong_positive_bytes = 0;
+    uint64_t new_ack_normal_samples = 0;
+    uint64_t new_ack_normal_bytes = 0;
+    uint64_t new_ack_mild_negative_samples = 0;
+    uint64_t new_ack_mild_negative_bytes = 0;
+    uint64_t new_ack_severe_negative_samples = 0;
+    uint64_t new_ack_severe_negative_bytes = 0;
     uint64_t outstanding_changes = 0;
     uint64_t outstanding_bytes = 0;
     uint64_t repair_send_samples = 0;
     uint64_t repair_send_bytes = 0;
+    uint64_t repair_ack_samples = 0;
+    uint64_t repair_ack_bytes = 0;
+    uint64_t repair_ack_strong_positive_samples = 0;
+    uint64_t repair_ack_strong_positive_bytes = 0;
+    uint64_t repair_ack_normal_samples = 0;
+    uint64_t repair_ack_normal_bytes = 0;
+    uint64_t repair_ack_mild_negative_samples = 0;
+    uint64_t repair_ack_mild_negative_bytes = 0;
+    uint64_t repair_ack_severe_negative_samples = 0;
+    uint64_t repair_ack_severe_negative_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t repair_no_ack_timeout_samples = 0;
+    uint64_t repair_no_ack_timeout_bytes = 0;
+    uint64_t repair_late_ack_severe_samples = 0;
+    uint64_t repair_late_ack_severe_bytes = 0;
+    uint64_t repair_attempt_overflow_samples = 0;
+    uint64_t repair_attempt_overflow_bytes = 0;
+    uint64_t repair_unattributed_send_samples = 0;
+    uint64_t repair_unattributed_send_bytes = 0;
     uint64_t feedback_strong_positive_samples = 0;
     uint64_t feedback_strong_positive_bytes = 0;
     uint64_t feedback_normal_samples = 0;
@@ -77,6 +149,8 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     uint64_t feedback_mild_negative_bytes = 0;
     uint64_t feedback_severe_negative_samples = 0;
     uint64_t feedback_severe_negative_bytes = 0;
+    uint64_t origin_saturated_positive_samples = 0;
+    uint64_t origin_saturated_positive_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -84,6 +158,25 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     bool stable_feedback_calibrated = false;
     double feedback_slow_ratio = 0.0;
     std::vector<AdaptiveRetransmissionReaderFeedbackSnapshot> reader_paths;
+};
+
+struct AdaptiveRetransmissionPlanEntry
+{
+    AdaptiveRetransmissionPlanEntry() = default;
+
+    AdaptiveRetransmissionPlanEntry(
+            const GUID_t& reader,
+            const SequenceNumber_t& seq,
+            AdaptiveRetransmissionDecision planned_decision)
+        : reader_guid(reader)
+        , sequence(seq)
+        , decision(planned_decision)
+    {
+    }
+
+    GUID_t reader_guid;
+    SequenceNumber_t sequence;
+    AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::DEFER;
 };
 
 class AdaptiveRetransmissionController
@@ -105,16 +198,31 @@ public:
             const CacheChange_t& change,
             bool queued);
 
-    // Records one actual repair send attempt for a requested old sample.
+    void on_initial_old_sample_enqueued(
+            StatefulWriter* writer,
+            const GUID_t& reader_guid,
+            const CacheChange_t& change,
+            bool queued);
+
     void on_repair_sample_sent(
             StatefulWriter* writer,
             const CacheChange_t& change,
-            bool old_sample);
+            bool old_sample,
+            const std::vector<GUID_t>& served_readers,
+            uint64_t send_period_id = 0u);
 
-    void on_async_sample_sent(
+    void on_new_sample_sent(
             StatefulWriter* writer,
             const CacheChange_t& change,
-            bool old_sample);
+            const std::vector<GUID_t>& served_readers,
+            uint64_t send_period_id = 0u);
+
+    void on_async_send_period_sealed(
+            StatefulWriter* writer,
+            uint64_t period_id,
+            uint64_t selected_bytes,
+            uint64_t active_load_floor_bytes,
+            bool saturated);
 
     void begin_admission_cycle(
             StatefulWriter* writer);
@@ -128,13 +236,8 @@ public:
             const CacheChange_t& change,
             bool earliest_requested);
 
-    void finalize_admission_cycle(
+    std::vector<AdaptiveRetransmissionPlanEntry> finalize_admission_cycle(
             StatefulWriter* writer);
-
-    AdaptiveRetransmissionDecision decide_retransmission(
-            StatefulWriter* writer,
-            const GUID_t& reader_guid,
-            const CacheChange_t& change);
 
     void configure_feedback_thresholds(
             StatefulWriter* writer,

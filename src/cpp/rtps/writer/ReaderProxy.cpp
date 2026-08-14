@@ -708,6 +708,35 @@ uint32_t ReaderProxy::perform_acknack_response(
     return changed;
 }
 
+bool ReaderProxy::admit_requested_change(
+        const SequenceNumber_t& sequence,
+        const std::function<void(ChangeForReader_t& change)>& func)
+{
+    for (ChangeForReader_t& change : changes_for_reader_)
+    {
+        if (REQUESTED == change.getStatus() && change.getSequenceNumber() == sequence)
+        {
+            change.setStatus(UNSENT);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            FASTDDS_TRACE_RETRANSMISSION(
+                "READER_PROXY_STATUS",
+                writer_->getGuid(),
+                guid(),
+                change.getSequenceNumber(),
+                nullptr != change.getChange() ? change.getChange()->serializedPayload.length : 0,
+                std::string("from=REQUESTED;to=UNSENT;reason=periodic_admission_tick"));
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            if (func)
+            {
+                func(change);
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
 uint32_t ReaderProxy::convert_status_on_all_changes(
         ChangeForReaderStatus_t previous,
         ChangeForReaderStatus_t next,

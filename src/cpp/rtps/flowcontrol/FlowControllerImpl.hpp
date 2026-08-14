@@ -485,6 +485,11 @@ struct FlowControllerFifoSchedule
         return queue_.next_change_is_old();
     }
 
+    uint64_t selected_send_period_id() const
+    {
+        return 0u;
+    }
+
     /*!
      * Store the sample at the end of the list.
      *
@@ -650,6 +655,11 @@ struct FlowControllerRoundRobinSchedule
         return writers_queue_.end() != next_writer_ && std::get<1>(*next_writer_).next_change_is_old();
     }
 
+    uint64_t selected_send_period_id() const
+    {
+        return 0u;
+    }
+
     void add_interested_changes_to_queue_nts()
     {
         // This function should be called with mutex_  and interested_lock locked, because the queue is changed.
@@ -803,6 +813,11 @@ struct FlowControllerHighPrioritySchedule
         }
 
         return false;
+    }
+
+    uint64_t selected_send_period_id() const
+    {
+        return 0u;
     }
 
     void add_interested_changes_to_queue_nts()
@@ -1039,6 +1054,11 @@ struct FlowControllerPriorityWithReservationSchedule
         return selected_sample_is_old_;
     }
 
+    uint64_t selected_send_period_id() const
+    {
+        return 0u;
+    }
+
     void add_interested_changes_to_queue_nts()
     {
         // This function should be called with mutex_  and interested_lock locked, because the queue is changed.
@@ -1255,6 +1275,13 @@ struct FlowControllerAdaptiveValueUtilitySchedule
         auto it = writers_queue_.find(writer);
         assert(it != writers_queue_.end());
         emit_summary(writer, it->second);
+        auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer);
+        if (nullptr != stateful_writer)
+        {
+            send_period_writers_.erase(
+                std::remove(send_period_writers_.begin(), send_period_writers_.end(), stateful_writer),
+                send_period_writers_.end());
+        }
         int32_t priority = it->second.priority;
         writers_queue_.erase(it);
         auto priority_it = priorities_.find(priority);
@@ -1280,16 +1307,6 @@ struct FlowControllerAdaptiveValueUtilitySchedule
                 trace_selection(writer_being_processed_, change_being_processed_, size_being_processed_,
                         selected_sample_is_old_being_processed_);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-                auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer_being_processed_);
-                if (nullptr != stateful_writer)
-                {
-                    fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_async_sample_sent(
-                        stateful_writer,
-                        *change_being_processed_,
-                        selected_sample_is_old_being_processed_);
-                }
-#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
                 record_send_budget_success(size_being_processed_);
                 record_successful_selection(writer_being_processed_,
                         selected_sample_is_old_being_processed_);
@@ -1301,6 +1318,7 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             utility_being_processed_ = (std::numeric_limits<int32_t>::min)();
             score_being_processed_ = (std::numeric_limits<int32_t>::min)();
             selected_sample_is_old_being_processed_ = false;
+            selected_send_period_id_being_processed_ = 0u;
         }
     }
 
@@ -1368,6 +1386,11 @@ struct FlowControllerAdaptiveValueUtilitySchedule
             utility_being_processed_ = selected.utility;
             score_being_processed_ = selected.score;
             selected_sample_is_old_being_processed_ = selected.sample_is_old;
+            selected_send_period_id_being_processed_ = current_send_period_id_;
+        }
+        else
+        {
+            selected_send_period_id_being_processed_ = 0u;
         }
 
         return selected.change;
@@ -1376,6 +1399,11 @@ struct FlowControllerAdaptiveValueUtilitySchedule
     bool selected_sample_is_old() const
     {
         return selected_sample_is_old_being_processed_;
+    }
+
+    uint64_t selected_send_period_id() const
+    {
+        return selected_send_period_id_being_processed_;
     }
 
     void add_interested_changes_to_queue_nts()
@@ -1485,38 +1513,112 @@ private:
         Summary feedback_window;
         uint64_t previous_link_request_samples = 0;
         uint64_t previous_link_feedback_samples = 0;
+        uint64_t previous_link_new_send_samples = 0;
+        uint64_t previous_link_new_ack_samples = 0;
+        uint64_t previous_link_new_ack_dirty_skipped_samples = 0;
+        uint64_t previous_link_new_ack_inconclusive_samples = 0;
+        uint64_t previous_link_pending_new_dirty_overflow_samples = 0;
+        uint64_t previous_link_new_ack_strong_positive_samples = 0;
+        uint64_t previous_link_new_ack_normal_samples = 0;
+        uint64_t previous_link_new_ack_mild_negative_samples = 0;
+        uint64_t previous_link_new_ack_severe_negative_samples = 0;
         uint64_t previous_link_repair_send_samples = 0;
+        uint64_t previous_link_repair_ack_samples = 0;
+        uint64_t previous_link_repair_ack_strong_positive_samples = 0;
+        uint64_t previous_link_repair_ack_normal_samples = 0;
+        uint64_t previous_link_repair_ack_mild_negative_samples = 0;
+        uint64_t previous_link_repair_ack_severe_negative_samples = 0;
         uint64_t previous_link_repair_timeout_samples = 0;
+        uint64_t previous_link_repair_no_ack_timeout_samples = 0;
+        uint64_t previous_link_repair_late_ack_severe_samples = 0;
+        uint64_t previous_link_repair_attempt_overflow_samples = 0;
+        uint64_t previous_link_repair_unattributed_send_samples = 0;
         uint64_t previous_link_feedback_strong_positive_samples = 0;
         uint64_t previous_link_feedback_normal_samples = 0;
         uint64_t previous_link_feedback_mild_negative_samples = 0;
         uint64_t previous_link_feedback_severe_negative_samples = 0;
+        uint64_t previous_link_origin_saturated_positive_samples = 0;
         uint64_t previous_link_request_bytes = 0;
         uint64_t previous_link_feedback_bytes = 0;
+        uint64_t previous_link_new_send_bytes = 0;
+        uint64_t previous_link_new_ack_bytes = 0;
+        uint64_t previous_link_new_ack_dirty_skipped_bytes = 0;
+        uint64_t previous_link_new_ack_inconclusive_bytes = 0;
+        uint64_t previous_link_new_ack_strong_positive_bytes = 0;
+        uint64_t previous_link_new_ack_normal_bytes = 0;
+        uint64_t previous_link_new_ack_mild_negative_bytes = 0;
+        uint64_t previous_link_new_ack_severe_negative_bytes = 0;
         uint64_t previous_link_repair_send_bytes = 0;
+        uint64_t previous_link_repair_ack_bytes = 0;
+        uint64_t previous_link_repair_ack_strong_positive_bytes = 0;
+        uint64_t previous_link_repair_ack_normal_bytes = 0;
+        uint64_t previous_link_repair_ack_mild_negative_bytes = 0;
+        uint64_t previous_link_repair_ack_severe_negative_bytes = 0;
         uint64_t previous_link_repair_timeout_bytes = 0;
+        uint64_t previous_link_repair_no_ack_timeout_bytes = 0;
+        uint64_t previous_link_repair_late_ack_severe_bytes = 0;
+        uint64_t previous_link_repair_attempt_overflow_bytes = 0;
+        uint64_t previous_link_repair_unattributed_send_bytes = 0;
         uint64_t previous_link_feedback_strong_positive_bytes = 0;
         uint64_t previous_link_feedback_normal_bytes = 0;
         uint64_t previous_link_feedback_mild_negative_bytes = 0;
         uint64_t previous_link_feedback_severe_negative_bytes = 0;
+        uint64_t previous_link_origin_saturated_positive_bytes = 0;
         struct ReaderPathLinkState
         {
             uint64_t previous_request_samples = 0;
             uint64_t previous_feedback_samples = 0;
+            uint64_t previous_new_send_samples = 0;
+            uint64_t previous_new_ack_samples = 0;
+            uint64_t previous_new_ack_dirty_skipped_samples = 0;
+            uint64_t previous_new_ack_inconclusive_samples = 0;
+            uint64_t previous_pending_new_dirty_overflow_samples = 0;
+            uint64_t previous_new_ack_strong_positive_samples = 0;
+            uint64_t previous_new_ack_normal_samples = 0;
+            uint64_t previous_new_ack_mild_negative_samples = 0;
+            uint64_t previous_new_ack_severe_negative_samples = 0;
             uint64_t previous_repair_send_samples = 0;
+            uint64_t previous_repair_ack_samples = 0;
+            uint64_t previous_repair_ack_strong_positive_samples = 0;
+            uint64_t previous_repair_ack_normal_samples = 0;
+            uint64_t previous_repair_ack_mild_negative_samples = 0;
+            uint64_t previous_repair_ack_severe_negative_samples = 0;
             uint64_t previous_repair_timeout_samples = 0;
+            uint64_t previous_repair_no_ack_timeout_samples = 0;
+            uint64_t previous_repair_late_ack_severe_samples = 0;
+            uint64_t previous_repair_attempt_overflow_samples = 0;
+            uint64_t previous_repair_unattributed_send_samples = 0;
             uint64_t previous_feedback_strong_positive_samples = 0;
             uint64_t previous_feedback_normal_samples = 0;
             uint64_t previous_feedback_mild_negative_samples = 0;
             uint64_t previous_feedback_severe_negative_samples = 0;
+            uint64_t previous_origin_saturated_positive_samples = 0;
             uint64_t previous_request_bytes = 0;
             uint64_t previous_feedback_bytes = 0;
+            uint64_t previous_new_send_bytes = 0;
+            uint64_t previous_new_ack_bytes = 0;
+            uint64_t previous_new_ack_dirty_skipped_bytes = 0;
+            uint64_t previous_new_ack_inconclusive_bytes = 0;
+            uint64_t previous_new_ack_strong_positive_bytes = 0;
+            uint64_t previous_new_ack_normal_bytes = 0;
+            uint64_t previous_new_ack_mild_negative_bytes = 0;
+            uint64_t previous_new_ack_severe_negative_bytes = 0;
             uint64_t previous_repair_send_bytes = 0;
+            uint64_t previous_repair_ack_bytes = 0;
+            uint64_t previous_repair_ack_strong_positive_bytes = 0;
+            uint64_t previous_repair_ack_normal_bytes = 0;
+            uint64_t previous_repair_ack_mild_negative_bytes = 0;
+            uint64_t previous_repair_ack_severe_negative_bytes = 0;
             uint64_t previous_repair_timeout_bytes = 0;
+            uint64_t previous_repair_no_ack_timeout_bytes = 0;
+            uint64_t previous_repair_late_ack_severe_bytes = 0;
+            uint64_t previous_repair_attempt_overflow_bytes = 0;
+            uint64_t previous_repair_unattributed_send_bytes = 0;
             uint64_t previous_feedback_strong_positive_bytes = 0;
             uint64_t previous_feedback_normal_bytes = 0;
             uint64_t previous_feedback_mild_negative_bytes = 0;
             uint64_t previous_feedback_severe_negative_bytes = 0;
+            uint64_t previous_origin_saturated_positive_bytes = 0;
         };
         std::map<fastrtps::rtps::GUID_t, ReaderPathLinkState> previous_reader_link_state;
         std::chrono::steady_clock::time_point pending_since;
@@ -1538,20 +1640,33 @@ private:
         uint64_t old_excess = 0;
         uint64_t link_request_samples = 0;
         uint64_t link_feedback_samples = 0;
+        uint64_t link_new_send_samples = 0;
+        uint64_t link_new_ack_samples = 0;
+        uint64_t link_new_ack_dirty_skipped_samples = 0;
+        uint64_t link_new_ack_inconclusive_samples = 0;
+        uint64_t link_pending_new_dirty_overflow_samples = 0;
         uint64_t link_repair_send_samples = 0;
+        uint64_t link_repair_ack_samples = 0;
         uint64_t link_repair_timeout_samples = 0;
         uint64_t link_feedback_strong_positive_samples = 0;
         uint64_t link_feedback_normal_samples = 0;
         uint64_t link_feedback_mild_negative_samples = 0;
         uint64_t link_feedback_severe_negative_samples = 0;
+        uint64_t link_origin_saturated_positive_samples = 0;
         uint64_t link_request_bytes = 0;
         uint64_t link_feedback_bytes = 0;
+        uint64_t link_new_send_bytes = 0;
+        uint64_t link_new_ack_bytes = 0;
+        uint64_t link_new_ack_dirty_skipped_bytes = 0;
+        uint64_t link_new_ack_inconclusive_bytes = 0;
         uint64_t link_repair_send_bytes = 0;
+        uint64_t link_repair_ack_bytes = 0;
         uint64_t link_repair_timeout_bytes = 0;
         uint64_t link_feedback_strong_positive_bytes = 0;
         uint64_t link_feedback_normal_bytes = 0;
         uint64_t link_feedback_mild_negative_bytes = 0;
         uint64_t link_feedback_severe_negative_bytes = 0;
+        uint64_t link_origin_saturated_positive_bytes = 0;
         uint64_t link_outstanding_changes = 0;
         uint64_t link_outstanding_bytes = 0;
         double link_request_interval_ewma_ms = 0.0;
@@ -1650,36 +1765,108 @@ private:
                     stateful_writer);
         queue.previous_link_request_samples = feedback.request_samples;
         queue.previous_link_feedback_samples = feedback.feedback_samples;
+        queue.previous_link_new_send_samples = feedback.new_send_samples;
+        queue.previous_link_new_ack_samples = feedback.new_ack_samples;
+        queue.previous_link_new_ack_dirty_skipped_samples = feedback.new_ack_dirty_skipped_samples;
+        queue.previous_link_new_ack_inconclusive_samples = feedback.new_ack_inconclusive_samples;
+        queue.previous_link_pending_new_dirty_overflow_samples = feedback.pending_new_dirty_overflow_samples;
+        queue.previous_link_new_ack_strong_positive_samples = feedback.new_ack_strong_positive_samples;
+        queue.previous_link_new_ack_normal_samples = feedback.new_ack_normal_samples;
+        queue.previous_link_new_ack_mild_negative_samples = feedback.new_ack_mild_negative_samples;
+        queue.previous_link_new_ack_severe_negative_samples = feedback.new_ack_severe_negative_samples;
         queue.previous_link_repair_send_samples = feedback.repair_send_samples;
+        queue.previous_link_repair_ack_samples = feedback.repair_ack_samples;
+        queue.previous_link_repair_ack_strong_positive_samples = feedback.repair_ack_strong_positive_samples;
+        queue.previous_link_repair_ack_normal_samples = feedback.repair_ack_normal_samples;
+        queue.previous_link_repair_ack_mild_negative_samples = feedback.repair_ack_mild_negative_samples;
+        queue.previous_link_repair_ack_severe_negative_samples = feedback.repair_ack_severe_negative_samples;
         queue.previous_link_repair_timeout_samples = feedback.repair_timeout_samples;
+        queue.previous_link_repair_no_ack_timeout_samples = feedback.repair_no_ack_timeout_samples;
+        queue.previous_link_repair_late_ack_severe_samples = feedback.repair_late_ack_severe_samples;
+        queue.previous_link_repair_attempt_overflow_samples = feedback.repair_attempt_overflow_samples;
+        queue.previous_link_repair_unattributed_send_samples = feedback.repair_unattributed_send_samples;
         queue.previous_link_feedback_strong_positive_samples = feedback.feedback_strong_positive_samples;
         queue.previous_link_feedback_normal_samples = feedback.feedback_normal_samples;
         queue.previous_link_feedback_mild_negative_samples = feedback.feedback_mild_negative_samples;
         queue.previous_link_feedback_severe_negative_samples = feedback.feedback_severe_negative_samples;
+        queue.previous_link_origin_saturated_positive_samples = feedback.origin_saturated_positive_samples;
         queue.previous_link_request_bytes = feedback.request_bytes;
         queue.previous_link_feedback_bytes = feedback.feedback_bytes;
+        queue.previous_link_new_send_bytes = feedback.new_send_bytes;
+        queue.previous_link_new_ack_bytes = feedback.new_ack_bytes;
+        queue.previous_link_new_ack_dirty_skipped_bytes = feedback.new_ack_dirty_skipped_bytes;
+        queue.previous_link_new_ack_inconclusive_bytes = feedback.new_ack_inconclusive_bytes;
+        queue.previous_link_new_ack_strong_positive_bytes = feedback.new_ack_strong_positive_bytes;
+        queue.previous_link_new_ack_normal_bytes = feedback.new_ack_normal_bytes;
+        queue.previous_link_new_ack_mild_negative_bytes = feedback.new_ack_mild_negative_bytes;
+        queue.previous_link_new_ack_severe_negative_bytes = feedback.new_ack_severe_negative_bytes;
         queue.previous_link_repair_send_bytes = feedback.repair_send_bytes;
+        queue.previous_link_repair_ack_bytes = feedback.repair_ack_bytes;
+        queue.previous_link_repair_ack_strong_positive_bytes = feedback.repair_ack_strong_positive_bytes;
+        queue.previous_link_repair_ack_normal_bytes = feedback.repair_ack_normal_bytes;
+        queue.previous_link_repair_ack_mild_negative_bytes = feedback.repair_ack_mild_negative_bytes;
+        queue.previous_link_repair_ack_severe_negative_bytes = feedback.repair_ack_severe_negative_bytes;
         queue.previous_link_repair_timeout_bytes = feedback.repair_timeout_bytes;
+        queue.previous_link_repair_no_ack_timeout_bytes = feedback.repair_no_ack_timeout_bytes;
+        queue.previous_link_repair_late_ack_severe_bytes = feedback.repair_late_ack_severe_bytes;
+        queue.previous_link_repair_attempt_overflow_bytes = feedback.repair_attempt_overflow_bytes;
+        queue.previous_link_repair_unattributed_send_bytes = feedback.repair_unattributed_send_bytes;
         queue.previous_link_feedback_strong_positive_bytes = feedback.feedback_strong_positive_bytes;
         queue.previous_link_feedback_normal_bytes = feedback.feedback_normal_bytes;
         queue.previous_link_feedback_mild_negative_bytes = feedback.feedback_mild_negative_bytes;
         queue.previous_link_feedback_severe_negative_bytes = feedback.feedback_severe_negative_bytes;
+        queue.previous_link_origin_saturated_positive_bytes = feedback.origin_saturated_positive_bytes;
         queue.previous_reader_link_state.clear();
         for (const auto& reader_path : feedback.reader_paths)
         {
             typename WriterQueue::ReaderPathLinkState state;
             state.previous_request_samples = reader_path.request_samples;
             state.previous_feedback_samples = reader_path.feedback_samples;
+            state.previous_new_send_samples = reader_path.new_send_samples;
+            state.previous_new_ack_samples = reader_path.new_ack_samples;
+            state.previous_new_ack_dirty_skipped_samples = reader_path.new_ack_dirty_skipped_samples;
+            state.previous_new_ack_inconclusive_samples = reader_path.new_ack_inconclusive_samples;
+            state.previous_pending_new_dirty_overflow_samples = reader_path.pending_new_dirty_overflow_samples;
+            state.previous_new_ack_strong_positive_samples = reader_path.new_ack_strong_positive_samples;
+            state.previous_new_ack_normal_samples = reader_path.new_ack_normal_samples;
+            state.previous_new_ack_mild_negative_samples = reader_path.new_ack_mild_negative_samples;
+            state.previous_new_ack_severe_negative_samples = reader_path.new_ack_severe_negative_samples;
             state.previous_repair_send_samples = reader_path.repair_send_samples;
+            state.previous_repair_ack_samples = reader_path.repair_ack_samples;
+            state.previous_repair_ack_strong_positive_samples = reader_path.repair_ack_strong_positive_samples;
+            state.previous_repair_ack_normal_samples = reader_path.repair_ack_normal_samples;
+            state.previous_repair_ack_mild_negative_samples = reader_path.repair_ack_mild_negative_samples;
+            state.previous_repair_ack_severe_negative_samples = reader_path.repair_ack_severe_negative_samples;
             state.previous_repair_timeout_samples = reader_path.repair_timeout_samples;
+            state.previous_repair_no_ack_timeout_samples = reader_path.repair_no_ack_timeout_samples;
+            state.previous_repair_late_ack_severe_samples = reader_path.repair_late_ack_severe_samples;
+            state.previous_repair_attempt_overflow_samples = reader_path.repair_attempt_overflow_samples;
+            state.previous_repair_unattributed_send_samples = reader_path.repair_unattributed_send_samples;
             state.previous_feedback_strong_positive_samples = reader_path.feedback_strong_positive_samples;
             state.previous_feedback_normal_samples = reader_path.feedback_normal_samples;
             state.previous_feedback_mild_negative_samples = reader_path.feedback_mild_negative_samples;
             state.previous_feedback_severe_negative_samples = reader_path.feedback_severe_negative_samples;
             state.previous_request_bytes = reader_path.request_bytes;
             state.previous_feedback_bytes = reader_path.feedback_bytes;
+            state.previous_new_send_bytes = reader_path.new_send_bytes;
+            state.previous_new_ack_bytes = reader_path.new_ack_bytes;
+            state.previous_new_ack_dirty_skipped_bytes = reader_path.new_ack_dirty_skipped_bytes;
+            state.previous_new_ack_inconclusive_bytes = reader_path.new_ack_inconclusive_bytes;
+            state.previous_new_ack_strong_positive_bytes = reader_path.new_ack_strong_positive_bytes;
+            state.previous_new_ack_normal_bytes = reader_path.new_ack_normal_bytes;
+            state.previous_new_ack_mild_negative_bytes = reader_path.new_ack_mild_negative_bytes;
+            state.previous_new_ack_severe_negative_bytes = reader_path.new_ack_severe_negative_bytes;
             state.previous_repair_send_bytes = reader_path.repair_send_bytes;
+            state.previous_repair_ack_bytes = reader_path.repair_ack_bytes;
+            state.previous_repair_ack_strong_positive_bytes = reader_path.repair_ack_strong_positive_bytes;
+            state.previous_repair_ack_normal_bytes = reader_path.repair_ack_normal_bytes;
+            state.previous_repair_ack_mild_negative_bytes = reader_path.repair_ack_mild_negative_bytes;
+            state.previous_repair_ack_severe_negative_bytes = reader_path.repair_ack_severe_negative_bytes;
             state.previous_repair_timeout_bytes = reader_path.repair_timeout_bytes;
+            state.previous_repair_no_ack_timeout_bytes = reader_path.repair_no_ack_timeout_bytes;
+            state.previous_repair_late_ack_severe_bytes = reader_path.repair_late_ack_severe_bytes;
+            state.previous_repair_attempt_overflow_bytes = reader_path.repair_attempt_overflow_bytes;
+            state.previous_repair_unattributed_send_bytes = reader_path.repair_unattributed_send_bytes;
             state.previous_feedback_strong_positive_bytes = reader_path.feedback_strong_positive_bytes;
             state.previous_feedback_normal_bytes = reader_path.feedback_normal_bytes;
             state.previous_feedback_mild_negative_bytes = reader_path.feedback_mild_negative_bytes;
@@ -1695,16 +1882,53 @@ private:
     {
         uint64_t request_samples_delta = 0;
         uint64_t feedback_samples_delta = 0;
+        uint64_t new_send_samples_delta = 0;
+        uint64_t new_ack_samples_delta = 0;
+        uint64_t new_ack_dirty_skipped_samples_delta = 0;
+        uint64_t new_ack_inconclusive_samples_delta = 0;
+        uint64_t pending_new_dirty_overflow_samples_delta = 0;
+        uint64_t new_ack_strong_positive_samples_delta = 0;
+        uint64_t new_ack_normal_samples_delta = 0;
+        uint64_t new_ack_mild_negative_samples_delta = 0;
+        uint64_t new_ack_severe_negative_samples_delta = 0;
+        uint64_t origin_saturated_positive_samples_delta = 0;
         uint64_t repair_send_samples_delta = 0;
+        uint64_t repair_ack_samples_delta = 0;
+        uint64_t repair_ack_strong_positive_samples_delta = 0;
+        uint64_t repair_ack_normal_samples_delta = 0;
+        uint64_t repair_ack_mild_negative_samples_delta = 0;
+        uint64_t repair_ack_severe_negative_samples_delta = 0;
         uint64_t repair_timeout_samples_delta = 0;
+        uint64_t repair_no_ack_timeout_samples_delta = 0;
+        uint64_t repair_late_ack_severe_samples_delta = 0;
+        uint64_t repair_attempt_overflow_samples_delta = 0;
+        uint64_t repair_unattributed_send_samples_delta = 0;
         uint64_t strong_positive_samples_delta = 0;
         uint64_t normal_samples_delta = 0;
         uint64_t mild_negative_samples_delta = 0;
         uint64_t severe_negative_samples_delta = 0;
         uint64_t request_bytes_delta = 0;
         uint64_t feedback_bytes_delta = 0;
+        uint64_t new_send_bytes_delta = 0;
+        uint64_t new_ack_bytes_delta = 0;
+        uint64_t new_ack_dirty_skipped_bytes_delta = 0;
+        uint64_t new_ack_inconclusive_bytes_delta = 0;
+        uint64_t new_ack_strong_positive_bytes_delta = 0;
+        uint64_t new_ack_normal_bytes_delta = 0;
+        uint64_t new_ack_mild_negative_bytes_delta = 0;
+        uint64_t new_ack_severe_negative_bytes_delta = 0;
+        uint64_t origin_saturated_positive_bytes_delta = 0;
         uint64_t repair_send_bytes_delta = 0;
+        uint64_t repair_ack_bytes_delta = 0;
+        uint64_t repair_ack_strong_positive_bytes_delta = 0;
+        uint64_t repair_ack_normal_bytes_delta = 0;
+        uint64_t repair_ack_mild_negative_bytes_delta = 0;
+        uint64_t repair_ack_severe_negative_bytes_delta = 0;
         uint64_t repair_timeout_bytes_delta = 0;
+        uint64_t repair_no_ack_timeout_bytes_delta = 0;
+        uint64_t repair_late_ack_severe_bytes_delta = 0;
+        uint64_t repair_attempt_overflow_bytes_delta = 0;
+        uint64_t repair_unattributed_send_bytes_delta = 0;
         uint64_t strong_positive_bytes_delta = 0;
         uint64_t normal_bytes_delta = 0;
         uint64_t mild_negative_bytes_delta = 0;
@@ -1773,9 +1997,12 @@ private:
         NegativeFeedbackKind kind = NegativeFeedbackKind::NONE;
         uint32_t budget_before = 0u;
         uint32_t budget_after = 0u;
+        std::chrono::steady_clock::time_point started;
         uint32_t windows = 0u;
         uint32_t min_windows = 1u;
         uint32_t max_windows = 3u;
+        double min_duration_ms = 0.0;
+        double max_duration_ms = 0.0;
         double before_negative_share = 0.0;
         double before_severe_share = 0.0;
         double before_timeout_share = 0.0;
@@ -1873,17 +2100,21 @@ private:
     static uint64_t repair_active_units(
             const LinkFeedbackWindow& window)
     {
-        return window.repair_active_send_bytes_delta > 0u ?
-               window.repair_active_send_bytes_delta :
-               window.repair_send_samples_delta + window.repair_timeout_samples_delta;
+        const uint64_t repair_completed_bytes =
+                window.repair_ack_bytes_delta + window.repair_no_ack_timeout_bytes_delta;
+        if (repair_completed_bytes > 0u)
+        {
+            return repair_completed_bytes;
+        }
+        return window.repair_ack_samples_delta + window.repair_no_ack_timeout_samples_delta;
     }
 
     static uint64_t timeout_units(
             const LinkFeedbackWindow& window)
     {
-        return window.repair_timeout_bytes_delta_by_path > 0u ?
-               window.repair_timeout_bytes_delta_by_path :
-               window.repair_timeout_samples_delta;
+        return window.repair_no_ack_timeout_bytes_delta > 0u ?
+               window.repair_no_ack_timeout_bytes_delta :
+               window.repair_no_ack_timeout_samples_delta;
     }
 
     static bool share_improved(
@@ -1916,7 +2147,23 @@ private:
 
     double observation_after_timeout_share() const
     {
-        return fraction(budget_decrease_observation_.timeout_units, budget_decrease_observation_.evidence_units);
+        return fraction(budget_decrease_observation_.timeout_units, budget_decrease_observation_.repair_active_units);
+    }
+
+    double observation_elapsed_ms() const
+    {
+        if (std::chrono::steady_clock::time_point() == budget_decrease_observation_.started)
+        {
+            return 0.0;
+        }
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - budget_decrease_observation_.started).count();
+    }
+
+    double repair_feedback_classification_window_ms(
+            const PressureSnapshot& pressure) const
+    {
+        return (std::max)(25.0, pressure.link_stable_feedback_ms * 3.0);
     }
 
     void start_budget_decrease_observation(
@@ -1924,24 +2171,34 @@ private:
             uint32_t budget_before,
             uint32_t budget_after,
             const LinkFeedbackWindow& trigger_window,
-            uint32_t min_windows)
+            uint32_t min_windows,
+            const PressureSnapshot& pressure)
     {
         budget_decrease_observation_ = BudgetDecreaseObservation();
         budget_decrease_observation_.active = true;
         budget_decrease_observation_.kind = kind;
         budget_decrease_observation_.budget_before = budget_before;
         budget_decrease_observation_.budget_after = budget_after;
-        budget_decrease_observation_.min_windows = (std::max)(1u, min_windows);
+        budget_decrease_observation_.started = std::chrono::steady_clock::now();
+        const double classification_window_ms = repair_feedback_classification_window_ms(pressure);
+        const double control_period_ms = static_cast<double>((std::max<int64_t>)(1, control_period_.count()));
+        const uint32_t classification_windows = static_cast<uint32_t>(
+            (std::max)(1.0, std::ceil(classification_window_ms / control_period_ms)));
+        budget_decrease_observation_.min_windows = (std::max)(
+            (std::max)(1u, min_windows),
+            classification_windows);
         budget_decrease_observation_.max_windows =
                 (std::max)(budget_decrease_observation_.min_windows + 1u,
                 budget_decrease_observation_.min_windows * 3u);
+        budget_decrease_observation_.min_duration_ms = classification_window_ms;
+        budget_decrease_observation_.max_duration_ms = classification_window_ms * 3.0;
         const uint64_t trigger_evidence = evidence_units(trigger_window);
         budget_decrease_observation_.before_negative_share =
                 fraction(negative_units(trigger_window), trigger_evidence);
         budget_decrease_observation_.before_severe_share =
                 fraction(severe_units(trigger_window), trigger_evidence);
         budget_decrease_observation_.before_timeout_share =
-                fraction(timeout_units(trigger_window), trigger_evidence);
+                fraction(timeout_units(trigger_window), repair_active_units(trigger_window));
     }
 
     void accumulate_budget_decrease_observation(
@@ -1962,17 +2219,23 @@ private:
             return BudgetObservationResult::ACTIVE;
         }
 
-        if (budget_decrease_observation_.windows < budget_decrease_observation_.min_windows)
+        const double elapsed_ms = observation_elapsed_ms();
+        const bool min_elapsed = budget_decrease_observation_.windows >= budget_decrease_observation_.min_windows &&
+                elapsed_ms >= budget_decrease_observation_.min_duration_ms;
+        const bool max_elapsed = budget_decrease_observation_.windows >= budget_decrease_observation_.max_windows ||
+                (budget_decrease_observation_.max_duration_ms > 0.0 &&
+                elapsed_ms >= budget_decrease_observation_.max_duration_ms);
+
+        if (!min_elapsed && !max_elapsed)
         {
             return BudgetObservationResult::ACTIVE;
         }
 
         const bool has_observation_evidence = budget_decrease_observation_.evidence_units > 0u ||
                 budget_decrease_observation_.timeout_units > 0u;
-        if (!has_observation_evidence &&
-                budget_decrease_observation_.windows < budget_decrease_observation_.max_windows)
+        if (!has_observation_evidence)
         {
-            return BudgetObservationResult::ACTIVE;
+            return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
         }
 
         const double after_negative_share = observation_after_negative_share();
@@ -2037,12 +2300,87 @@ private:
                     feedback.request_samples - queue.previous_link_request_samples : 0u;
             const uint64_t feedback_samples_delta = feedback.feedback_samples > queue.previous_link_feedback_samples ?
                     feedback.feedback_samples - queue.previous_link_feedback_samples : 0u;
+            const uint64_t new_send_samples_delta =
+                    feedback.new_send_samples > queue.previous_link_new_send_samples ?
+                    feedback.new_send_samples - queue.previous_link_new_send_samples : 0u;
+            const uint64_t new_ack_samples_delta =
+                    feedback.new_ack_samples > queue.previous_link_new_ack_samples ?
+                    feedback.new_ack_samples - queue.previous_link_new_ack_samples : 0u;
+            const uint64_t new_ack_dirty_skipped_samples_delta =
+                    feedback.new_ack_dirty_skipped_samples > queue.previous_link_new_ack_dirty_skipped_samples ?
+                    feedback.new_ack_dirty_skipped_samples -
+                    queue.previous_link_new_ack_dirty_skipped_samples : 0u;
+            const uint64_t new_ack_inconclusive_samples_delta =
+                    feedback.new_ack_inconclusive_samples > queue.previous_link_new_ack_inconclusive_samples ?
+                    feedback.new_ack_inconclusive_samples - queue.previous_link_new_ack_inconclusive_samples : 0u;
+            const uint64_t pending_new_dirty_overflow_samples_delta =
+                    feedback.pending_new_dirty_overflow_samples >
+                    queue.previous_link_pending_new_dirty_overflow_samples ?
+                    feedback.pending_new_dirty_overflow_samples -
+                    queue.previous_link_pending_new_dirty_overflow_samples : 0u;
+            const uint64_t new_ack_strong_positive_samples_delta =
+                    feedback.new_ack_strong_positive_samples >
+                    queue.previous_link_new_ack_strong_positive_samples ?
+                    feedback.new_ack_strong_positive_samples -
+                    queue.previous_link_new_ack_strong_positive_samples : 0u;
+            const uint64_t new_ack_normal_samples_delta =
+                    feedback.new_ack_normal_samples > queue.previous_link_new_ack_normal_samples ?
+                    feedback.new_ack_normal_samples - queue.previous_link_new_ack_normal_samples : 0u;
+            const uint64_t new_ack_mild_negative_samples_delta =
+                    feedback.new_ack_mild_negative_samples > queue.previous_link_new_ack_mild_negative_samples ?
+                    feedback.new_ack_mild_negative_samples -
+                    queue.previous_link_new_ack_mild_negative_samples : 0u;
+            const uint64_t new_ack_severe_negative_samples_delta =
+                    feedback.new_ack_severe_negative_samples > queue.previous_link_new_ack_severe_negative_samples ?
+                    feedback.new_ack_severe_negative_samples -
+                    queue.previous_link_new_ack_severe_negative_samples : 0u;
             const uint64_t repair_send_samples_delta =
                     feedback.repair_send_samples > queue.previous_link_repair_send_samples ?
                     feedback.repair_send_samples - queue.previous_link_repair_send_samples : 0u;
+            const uint64_t repair_ack_samples_delta =
+                    feedback.repair_ack_samples > queue.previous_link_repair_ack_samples ?
+                    feedback.repair_ack_samples - queue.previous_link_repair_ack_samples : 0u;
+            const uint64_t repair_ack_strong_positive_samples_delta =
+                    feedback.repair_ack_strong_positive_samples >
+                    queue.previous_link_repair_ack_strong_positive_samples ?
+                    feedback.repair_ack_strong_positive_samples -
+                    queue.previous_link_repair_ack_strong_positive_samples : 0u;
+            const uint64_t repair_ack_normal_samples_delta =
+                    feedback.repair_ack_normal_samples > queue.previous_link_repair_ack_normal_samples ?
+                    feedback.repair_ack_normal_samples - queue.previous_link_repair_ack_normal_samples : 0u;
+            const uint64_t repair_ack_mild_negative_samples_delta =
+                    feedback.repair_ack_mild_negative_samples >
+                    queue.previous_link_repair_ack_mild_negative_samples ?
+                    feedback.repair_ack_mild_negative_samples -
+                    queue.previous_link_repair_ack_mild_negative_samples : 0u;
+            const uint64_t repair_ack_severe_negative_samples_delta =
+                    feedback.repair_ack_severe_negative_samples >
+                    queue.previous_link_repair_ack_severe_negative_samples ?
+                    feedback.repair_ack_severe_negative_samples -
+                    queue.previous_link_repair_ack_severe_negative_samples : 0u;
             const uint64_t repair_timeout_samples_delta =
                     feedback.repair_timeout_samples > queue.previous_link_repair_timeout_samples ?
                     feedback.repair_timeout_samples - queue.previous_link_repair_timeout_samples : 0u;
+            const uint64_t repair_no_ack_timeout_samples_delta =
+                    feedback.repair_no_ack_timeout_samples >
+                    queue.previous_link_repair_no_ack_timeout_samples ?
+                    feedback.repair_no_ack_timeout_samples -
+                    queue.previous_link_repair_no_ack_timeout_samples : 0u;
+            const uint64_t repair_late_ack_severe_samples_delta =
+                    feedback.repair_late_ack_severe_samples >
+                    queue.previous_link_repair_late_ack_severe_samples ?
+                    feedback.repair_late_ack_severe_samples -
+                    queue.previous_link_repair_late_ack_severe_samples : 0u;
+            const uint64_t repair_attempt_overflow_samples_delta =
+                    feedback.repair_attempt_overflow_samples >
+                    queue.previous_link_repair_attempt_overflow_samples ?
+                    feedback.repair_attempt_overflow_samples -
+                    queue.previous_link_repair_attempt_overflow_samples : 0u;
+            const uint64_t repair_unattributed_send_samples_delta =
+                    feedback.repair_unattributed_send_samples >
+                    queue.previous_link_repair_unattributed_send_samples ?
+                    feedback.repair_unattributed_send_samples -
+                    queue.previous_link_repair_unattributed_send_samples : 0u;
             const uint64_t strong_positive_samples_delta =
                     feedback.feedback_strong_positive_samples > queue.previous_link_feedback_strong_positive_samples ?
                     feedback.feedback_strong_positive_samples - queue.previous_link_feedback_strong_positive_samples : 0u;
@@ -2055,15 +2393,80 @@ private:
             const uint64_t severe_negative_samples_delta =
                     feedback.feedback_severe_negative_samples > queue.previous_link_feedback_severe_negative_samples ?
                     feedback.feedback_severe_negative_samples - queue.previous_link_feedback_severe_negative_samples : 0u;
+            const uint64_t origin_saturated_positive_samples_delta =
+                    feedback.origin_saturated_positive_samples >
+                    queue.previous_link_origin_saturated_positive_samples ?
+                    feedback.origin_saturated_positive_samples -
+                    queue.previous_link_origin_saturated_positive_samples : 0u;
             const uint64_t request_bytes_delta = feedback.request_bytes > queue.previous_link_request_bytes ?
                     feedback.request_bytes - queue.previous_link_request_bytes : 0u;
             const uint64_t feedback_bytes_delta = feedback.feedback_bytes > queue.previous_link_feedback_bytes ?
                     feedback.feedback_bytes - queue.previous_link_feedback_bytes : 0u;
+            const uint64_t new_send_bytes_delta = feedback.new_send_bytes > queue.previous_link_new_send_bytes ?
+                    feedback.new_send_bytes - queue.previous_link_new_send_bytes : 0u;
+            const uint64_t new_ack_bytes_delta = feedback.new_ack_bytes > queue.previous_link_new_ack_bytes ?
+                    feedback.new_ack_bytes - queue.previous_link_new_ack_bytes : 0u;
+            const uint64_t new_ack_dirty_skipped_bytes_delta =
+                    feedback.new_ack_dirty_skipped_bytes > queue.previous_link_new_ack_dirty_skipped_bytes ?
+                    feedback.new_ack_dirty_skipped_bytes -
+                    queue.previous_link_new_ack_dirty_skipped_bytes : 0u;
+            const uint64_t new_ack_inconclusive_bytes_delta =
+                    feedback.new_ack_inconclusive_bytes > queue.previous_link_new_ack_inconclusive_bytes ?
+                    feedback.new_ack_inconclusive_bytes - queue.previous_link_new_ack_inconclusive_bytes : 0u;
+            const uint64_t new_ack_strong_positive_bytes_delta =
+                    feedback.new_ack_strong_positive_bytes > queue.previous_link_new_ack_strong_positive_bytes ?
+                    feedback.new_ack_strong_positive_bytes -
+                    queue.previous_link_new_ack_strong_positive_bytes : 0u;
+            const uint64_t new_ack_normal_bytes_delta =
+                    feedback.new_ack_normal_bytes > queue.previous_link_new_ack_normal_bytes ?
+                    feedback.new_ack_normal_bytes - queue.previous_link_new_ack_normal_bytes : 0u;
+            const uint64_t new_ack_mild_negative_bytes_delta =
+                    feedback.new_ack_mild_negative_bytes > queue.previous_link_new_ack_mild_negative_bytes ?
+                    feedback.new_ack_mild_negative_bytes -
+                    queue.previous_link_new_ack_mild_negative_bytes : 0u;
+            const uint64_t new_ack_severe_negative_bytes_delta =
+                    feedback.new_ack_severe_negative_bytes > queue.previous_link_new_ack_severe_negative_bytes ?
+                    feedback.new_ack_severe_negative_bytes -
+                    queue.previous_link_new_ack_severe_negative_bytes : 0u;
             const uint64_t repair_send_bytes_delta = feedback.repair_send_bytes > queue.previous_link_repair_send_bytes ?
                     feedback.repair_send_bytes - queue.previous_link_repair_send_bytes : 0u;
+            const uint64_t repair_ack_bytes_delta = feedback.repair_ack_bytes > queue.previous_link_repair_ack_bytes ?
+                    feedback.repair_ack_bytes - queue.previous_link_repair_ack_bytes : 0u;
+            const uint64_t repair_ack_strong_positive_bytes_delta =
+                    feedback.repair_ack_strong_positive_bytes >
+                    queue.previous_link_repair_ack_strong_positive_bytes ?
+                    feedback.repair_ack_strong_positive_bytes -
+                    queue.previous_link_repair_ack_strong_positive_bytes : 0u;
+            const uint64_t repair_ack_normal_bytes_delta =
+                    feedback.repair_ack_normal_bytes > queue.previous_link_repair_ack_normal_bytes ?
+                    feedback.repair_ack_normal_bytes - queue.previous_link_repair_ack_normal_bytes : 0u;
+            const uint64_t repair_ack_mild_negative_bytes_delta =
+                    feedback.repair_ack_mild_negative_bytes >
+                    queue.previous_link_repair_ack_mild_negative_bytes ?
+                    feedback.repair_ack_mild_negative_bytes -
+                    queue.previous_link_repair_ack_mild_negative_bytes : 0u;
+            const uint64_t repair_ack_severe_negative_bytes_delta =
+                    feedback.repair_ack_severe_negative_bytes >
+                    queue.previous_link_repair_ack_severe_negative_bytes ?
+                    feedback.repair_ack_severe_negative_bytes -
+                    queue.previous_link_repair_ack_severe_negative_bytes : 0u;
             const uint64_t repair_timeout_bytes_delta =
                     feedback.repair_timeout_bytes > queue.previous_link_repair_timeout_bytes ?
                     feedback.repair_timeout_bytes - queue.previous_link_repair_timeout_bytes : 0u;
+            const uint64_t repair_no_ack_timeout_bytes_delta =
+                    feedback.repair_no_ack_timeout_bytes > queue.previous_link_repair_no_ack_timeout_bytes ?
+                    feedback.repair_no_ack_timeout_bytes - queue.previous_link_repair_no_ack_timeout_bytes : 0u;
+            const uint64_t repair_late_ack_severe_bytes_delta =
+                    feedback.repair_late_ack_severe_bytes > queue.previous_link_repair_late_ack_severe_bytes ?
+                    feedback.repair_late_ack_severe_bytes - queue.previous_link_repair_late_ack_severe_bytes : 0u;
+            const uint64_t repair_attempt_overflow_bytes_delta =
+                    feedback.repair_attempt_overflow_bytes > queue.previous_link_repair_attempt_overflow_bytes ?
+                    feedback.repair_attempt_overflow_bytes - queue.previous_link_repair_attempt_overflow_bytes : 0u;
+            const uint64_t repair_unattributed_send_bytes_delta =
+                    feedback.repair_unattributed_send_bytes >
+                    queue.previous_link_repair_unattributed_send_bytes ?
+                    feedback.repair_unattributed_send_bytes -
+                    queue.previous_link_repair_unattributed_send_bytes : 0u;
             const uint64_t strong_positive_bytes_delta =
                     feedback.feedback_strong_positive_bytes > queue.previous_link_feedback_strong_positive_bytes ?
                     feedback.feedback_strong_positive_bytes - queue.previous_link_feedback_strong_positive_bytes : 0u;
@@ -2075,22 +2478,63 @@ private:
             const uint64_t severe_negative_bytes_delta =
                     feedback.feedback_severe_negative_bytes > queue.previous_link_feedback_severe_negative_bytes ?
                     feedback.feedback_severe_negative_bytes - queue.previous_link_feedback_severe_negative_bytes : 0u;
+            const uint64_t origin_saturated_positive_bytes_delta =
+                    feedback.origin_saturated_positive_bytes > queue.previous_link_origin_saturated_positive_bytes ?
+                    feedback.origin_saturated_positive_bytes -
+                    queue.previous_link_origin_saturated_positive_bytes : 0u;
             window.request_samples_delta += request_samples_delta;
             window.feedback_samples_delta += feedback_samples_delta;
+            window.new_send_samples_delta += new_send_samples_delta;
+            window.new_ack_samples_delta += new_ack_samples_delta;
+            window.new_ack_dirty_skipped_samples_delta += new_ack_dirty_skipped_samples_delta;
+            window.new_ack_inconclusive_samples_delta += new_ack_inconclusive_samples_delta;
+            window.pending_new_dirty_overflow_samples_delta += pending_new_dirty_overflow_samples_delta;
+            window.new_ack_strong_positive_samples_delta += new_ack_strong_positive_samples_delta;
+            window.new_ack_normal_samples_delta += new_ack_normal_samples_delta;
+            window.new_ack_mild_negative_samples_delta += new_ack_mild_negative_samples_delta;
+            window.new_ack_severe_negative_samples_delta += new_ack_severe_negative_samples_delta;
             window.repair_send_samples_delta += repair_send_samples_delta;
+            window.repair_ack_samples_delta += repair_ack_samples_delta;
+            window.repair_ack_strong_positive_samples_delta += repair_ack_strong_positive_samples_delta;
+            window.repair_ack_normal_samples_delta += repair_ack_normal_samples_delta;
+            window.repair_ack_mild_negative_samples_delta += repair_ack_mild_negative_samples_delta;
+            window.repair_ack_severe_negative_samples_delta += repair_ack_severe_negative_samples_delta;
             window.repair_timeout_samples_delta += repair_timeout_samples_delta;
+            window.repair_no_ack_timeout_samples_delta += repair_no_ack_timeout_samples_delta;
+            window.repair_late_ack_severe_samples_delta += repair_late_ack_severe_samples_delta;
+            window.repair_attempt_overflow_samples_delta += repair_attempt_overflow_samples_delta;
+            window.repair_unattributed_send_samples_delta += repair_unattributed_send_samples_delta;
             window.strong_positive_samples_delta += strong_positive_samples_delta;
             window.normal_samples_delta += normal_samples_delta;
             window.mild_negative_samples_delta += mild_negative_samples_delta;
             window.severe_negative_samples_delta += severe_negative_samples_delta;
+            window.origin_saturated_positive_samples_delta += origin_saturated_positive_samples_delta;
             window.request_bytes_delta += request_bytes_delta;
             window.feedback_bytes_delta += feedback_bytes_delta;
+            window.new_send_bytes_delta += new_send_bytes_delta;
+            window.new_ack_bytes_delta += new_ack_bytes_delta;
+            window.new_ack_dirty_skipped_bytes_delta += new_ack_dirty_skipped_bytes_delta;
+            window.new_ack_inconclusive_bytes_delta += new_ack_inconclusive_bytes_delta;
+            window.new_ack_strong_positive_bytes_delta += new_ack_strong_positive_bytes_delta;
+            window.new_ack_normal_bytes_delta += new_ack_normal_bytes_delta;
+            window.new_ack_mild_negative_bytes_delta += new_ack_mild_negative_bytes_delta;
+            window.new_ack_severe_negative_bytes_delta += new_ack_severe_negative_bytes_delta;
             window.repair_send_bytes_delta += repair_send_bytes_delta;
+            window.repair_ack_bytes_delta += repair_ack_bytes_delta;
+            window.repair_ack_strong_positive_bytes_delta += repair_ack_strong_positive_bytes_delta;
+            window.repair_ack_normal_bytes_delta += repair_ack_normal_bytes_delta;
+            window.repair_ack_mild_negative_bytes_delta += repair_ack_mild_negative_bytes_delta;
+            window.repair_ack_severe_negative_bytes_delta += repair_ack_severe_negative_bytes_delta;
             window.repair_timeout_bytes_delta += repair_timeout_bytes_delta;
+            window.repair_no_ack_timeout_bytes_delta += repair_no_ack_timeout_bytes_delta;
+            window.repair_late_ack_severe_bytes_delta += repair_late_ack_severe_bytes_delta;
+            window.repair_attempt_overflow_bytes_delta += repair_attempt_overflow_bytes_delta;
+            window.repair_unattributed_send_bytes_delta += repair_unattributed_send_bytes_delta;
             window.strong_positive_bytes_delta += strong_positive_bytes_delta;
             window.normal_bytes_delta += normal_bytes_delta;
             window.mild_negative_bytes_delta += mild_negative_bytes_delta;
             window.severe_negative_bytes_delta += severe_negative_bytes_delta;
+            window.origin_saturated_positive_bytes_delta += origin_saturated_positive_bytes_delta;
             if (feedback_samples_delta > 0u || feedback_bytes_delta > 0u)
             {
                 window.active_feedback_slow_ratio = (std::max)(
@@ -2128,8 +2572,39 @@ private:
                     typename WriterQueue::ReaderPathLinkState initial_state;
                     initial_state.previous_request_samples = reader_path.request_samples;
                     initial_state.previous_feedback_samples = reader_path.feedback_samples;
+                    initial_state.previous_new_send_samples = reader_path.new_send_samples;
+                    initial_state.previous_new_ack_samples = reader_path.new_ack_samples;
+                    initial_state.previous_new_ack_dirty_skipped_samples =
+                            reader_path.new_ack_dirty_skipped_samples;
+                    initial_state.previous_new_ack_inconclusive_samples =
+                            reader_path.new_ack_inconclusive_samples;
+                    initial_state.previous_pending_new_dirty_overflow_samples =
+                            reader_path.pending_new_dirty_overflow_samples;
+                    initial_state.previous_new_ack_strong_positive_samples =
+                            reader_path.new_ack_strong_positive_samples;
+                    initial_state.previous_new_ack_normal_samples = reader_path.new_ack_normal_samples;
+                    initial_state.previous_new_ack_mild_negative_samples =
+                            reader_path.new_ack_mild_negative_samples;
+                    initial_state.previous_new_ack_severe_negative_samples =
+                            reader_path.new_ack_severe_negative_samples;
                     initial_state.previous_repair_send_samples = reader_path.repair_send_samples;
+                    initial_state.previous_repair_ack_samples = reader_path.repair_ack_samples;
+                    initial_state.previous_repair_ack_strong_positive_samples =
+                            reader_path.repair_ack_strong_positive_samples;
+                    initial_state.previous_repair_ack_normal_samples = reader_path.repair_ack_normal_samples;
+                    initial_state.previous_repair_ack_mild_negative_samples =
+                            reader_path.repair_ack_mild_negative_samples;
+                    initial_state.previous_repair_ack_severe_negative_samples =
+                            reader_path.repair_ack_severe_negative_samples;
                     initial_state.previous_repair_timeout_samples = reader_path.repair_timeout_samples;
+                    initial_state.previous_repair_no_ack_timeout_samples =
+                            reader_path.repair_no_ack_timeout_samples;
+                    initial_state.previous_repair_late_ack_severe_samples =
+                            reader_path.repair_late_ack_severe_samples;
+                    initial_state.previous_repair_attempt_overflow_samples =
+                            reader_path.repair_attempt_overflow_samples;
+                    initial_state.previous_repair_unattributed_send_samples =
+                            reader_path.repair_unattributed_send_samples;
                     initial_state.previous_feedback_strong_positive_samples =
                             reader_path.feedback_strong_positive_samples;
                     initial_state.previous_feedback_normal_samples = reader_path.feedback_normal_samples;
@@ -2137,14 +2612,40 @@ private:
                             reader_path.feedback_mild_negative_samples;
                     initial_state.previous_feedback_severe_negative_samples =
                             reader_path.feedback_severe_negative_samples;
+                    initial_state.previous_origin_saturated_positive_samples =
+                            reader_path.origin_saturated_positive_samples;
                     initial_state.previous_request_bytes = reader_path.request_bytes;
                     initial_state.previous_feedback_bytes = reader_path.feedback_bytes;
+                    initial_state.previous_new_send_bytes = reader_path.new_send_bytes;
+                    initial_state.previous_new_ack_bytes = reader_path.new_ack_bytes;
+                    initial_state.previous_new_ack_dirty_skipped_bytes = reader_path.new_ack_dirty_skipped_bytes;
+                    initial_state.previous_new_ack_inconclusive_bytes = reader_path.new_ack_inconclusive_bytes;
+                    initial_state.previous_new_ack_strong_positive_bytes =
+                            reader_path.new_ack_strong_positive_bytes;
+                    initial_state.previous_new_ack_normal_bytes = reader_path.new_ack_normal_bytes;
+                    initial_state.previous_new_ack_mild_negative_bytes = reader_path.new_ack_mild_negative_bytes;
+                    initial_state.previous_new_ack_severe_negative_bytes = reader_path.new_ack_severe_negative_bytes;
                     initial_state.previous_repair_send_bytes = reader_path.repair_send_bytes;
+                    initial_state.previous_repair_ack_bytes = reader_path.repair_ack_bytes;
+                    initial_state.previous_repair_ack_strong_positive_bytes =
+                            reader_path.repair_ack_strong_positive_bytes;
+                    initial_state.previous_repair_ack_normal_bytes = reader_path.repair_ack_normal_bytes;
+                    initial_state.previous_repair_ack_mild_negative_bytes =
+                            reader_path.repair_ack_mild_negative_bytes;
+                    initial_state.previous_repair_ack_severe_negative_bytes =
+                            reader_path.repair_ack_severe_negative_bytes;
                     initial_state.previous_repair_timeout_bytes = reader_path.repair_timeout_bytes;
+                    initial_state.previous_repair_no_ack_timeout_bytes = reader_path.repair_no_ack_timeout_bytes;
+                    initial_state.previous_repair_late_ack_severe_bytes = reader_path.repair_late_ack_severe_bytes;
+                    initial_state.previous_repair_attempt_overflow_bytes = reader_path.repair_attempt_overflow_bytes;
+                    initial_state.previous_repair_unattributed_send_bytes =
+                            reader_path.repair_unattributed_send_bytes;
                     initial_state.previous_feedback_strong_positive_bytes = reader_path.feedback_strong_positive_bytes;
                     initial_state.previous_feedback_normal_bytes = reader_path.feedback_normal_bytes;
                     initial_state.previous_feedback_mild_negative_bytes = reader_path.feedback_mild_negative_bytes;
                     initial_state.previous_feedback_severe_negative_bytes = reader_path.feedback_severe_negative_bytes;
+                    initial_state.previous_origin_saturated_positive_bytes =
+                            reader_path.origin_saturated_positive_bytes;
                     queue.previous_reader_link_state[reader_path.reader_guid] = initial_state;
                     continue;
                 }
@@ -2153,12 +2654,93 @@ private:
                 const uint64_t path_feedback_samples_delta =
                         reader_path.feedback_samples > previous_path.previous_feedback_samples ?
                         reader_path.feedback_samples - previous_path.previous_feedback_samples : 0u;
+                const uint64_t path_new_send_samples_delta =
+                        reader_path.new_send_samples > previous_path.previous_new_send_samples ?
+                        reader_path.new_send_samples - previous_path.previous_new_send_samples : 0u;
+                const uint64_t path_new_ack_samples_delta =
+                        reader_path.new_ack_samples > previous_path.previous_new_ack_samples ?
+                        reader_path.new_ack_samples - previous_path.previous_new_ack_samples : 0u;
+                const uint64_t path_new_ack_dirty_skipped_samples_delta =
+                        reader_path.new_ack_dirty_skipped_samples >
+                        previous_path.previous_new_ack_dirty_skipped_samples ?
+                        reader_path.new_ack_dirty_skipped_samples -
+                        previous_path.previous_new_ack_dirty_skipped_samples : 0u;
+                const uint64_t path_new_ack_inconclusive_samples_delta =
+                        reader_path.new_ack_inconclusive_samples >
+                        previous_path.previous_new_ack_inconclusive_samples ?
+                        reader_path.new_ack_inconclusive_samples -
+                        previous_path.previous_new_ack_inconclusive_samples : 0u;
+                const uint64_t path_pending_new_dirty_overflow_samples_delta =
+                        reader_path.pending_new_dirty_overflow_samples >
+                        previous_path.previous_pending_new_dirty_overflow_samples ?
+                        reader_path.pending_new_dirty_overflow_samples -
+                        previous_path.previous_pending_new_dirty_overflow_samples : 0u;
+                const uint64_t path_new_ack_strong_positive_samples_delta =
+                        reader_path.new_ack_strong_positive_samples >
+                        previous_path.previous_new_ack_strong_positive_samples ?
+                        reader_path.new_ack_strong_positive_samples -
+                        previous_path.previous_new_ack_strong_positive_samples : 0u;
+                const uint64_t path_new_ack_normal_samples_delta =
+                        reader_path.new_ack_normal_samples > previous_path.previous_new_ack_normal_samples ?
+                        reader_path.new_ack_normal_samples - previous_path.previous_new_ack_normal_samples : 0u;
+                const uint64_t path_new_ack_mild_negative_samples_delta =
+                        reader_path.new_ack_mild_negative_samples >
+                        previous_path.previous_new_ack_mild_negative_samples ?
+                        reader_path.new_ack_mild_negative_samples -
+                        previous_path.previous_new_ack_mild_negative_samples : 0u;
+                const uint64_t path_new_ack_severe_negative_samples_delta =
+                        reader_path.new_ack_severe_negative_samples >
+                        previous_path.previous_new_ack_severe_negative_samples ?
+                        reader_path.new_ack_severe_negative_samples -
+                        previous_path.previous_new_ack_severe_negative_samples : 0u;
                 const uint64_t path_repair_send_samples_delta =
                         reader_path.repair_send_samples > previous_path.previous_repair_send_samples ?
                         reader_path.repair_send_samples - previous_path.previous_repair_send_samples : 0u;
+                const uint64_t path_repair_ack_samples_delta =
+                        reader_path.repair_ack_samples > previous_path.previous_repair_ack_samples ?
+                        reader_path.repair_ack_samples - previous_path.previous_repair_ack_samples : 0u;
+                const uint64_t path_repair_ack_strong_positive_samples_delta =
+                        reader_path.repair_ack_strong_positive_samples >
+                        previous_path.previous_repair_ack_strong_positive_samples ?
+                        reader_path.repair_ack_strong_positive_samples -
+                        previous_path.previous_repair_ack_strong_positive_samples : 0u;
+                const uint64_t path_repair_ack_normal_samples_delta =
+                        reader_path.repair_ack_normal_samples > previous_path.previous_repair_ack_normal_samples ?
+                        reader_path.repair_ack_normal_samples -
+                        previous_path.previous_repair_ack_normal_samples : 0u;
+                const uint64_t path_repair_ack_mild_negative_samples_delta =
+                        reader_path.repair_ack_mild_negative_samples >
+                        previous_path.previous_repair_ack_mild_negative_samples ?
+                        reader_path.repair_ack_mild_negative_samples -
+                        previous_path.previous_repair_ack_mild_negative_samples : 0u;
+                const uint64_t path_repair_ack_severe_negative_samples_delta =
+                        reader_path.repair_ack_severe_negative_samples >
+                        previous_path.previous_repair_ack_severe_negative_samples ?
+                        reader_path.repair_ack_severe_negative_samples -
+                        previous_path.previous_repair_ack_severe_negative_samples : 0u;
                 const uint64_t path_repair_timeout_samples_delta =
                         reader_path.repair_timeout_samples > previous_path.previous_repair_timeout_samples ?
                         reader_path.repair_timeout_samples - previous_path.previous_repair_timeout_samples : 0u;
+                const uint64_t path_repair_no_ack_timeout_samples_delta =
+                        reader_path.repair_no_ack_timeout_samples >
+                        previous_path.previous_repair_no_ack_timeout_samples ?
+                        reader_path.repair_no_ack_timeout_samples -
+                        previous_path.previous_repair_no_ack_timeout_samples : 0u;
+                const uint64_t path_repair_late_ack_severe_samples_delta =
+                        reader_path.repair_late_ack_severe_samples >
+                        previous_path.previous_repair_late_ack_severe_samples ?
+                        reader_path.repair_late_ack_severe_samples -
+                        previous_path.previous_repair_late_ack_severe_samples : 0u;
+                const uint64_t path_repair_attempt_overflow_samples_delta =
+                        reader_path.repair_attempt_overflow_samples >
+                        previous_path.previous_repair_attempt_overflow_samples ?
+                        reader_path.repair_attempt_overflow_samples -
+                        previous_path.previous_repair_attempt_overflow_samples : 0u;
+                const uint64_t path_repair_unattributed_send_samples_delta =
+                        reader_path.repair_unattributed_send_samples >
+                        previous_path.previous_repair_unattributed_send_samples ?
+                        reader_path.repair_unattributed_send_samples -
+                        previous_path.previous_repair_unattributed_send_samples : 0u;
                 const uint64_t path_strong_positive_samples_delta =
                         reader_path.feedback_strong_positive_samples >
                         previous_path.previous_feedback_strong_positive_samples ?
@@ -2180,12 +2762,87 @@ private:
                 const uint64_t path_feedback_bytes_delta =
                         reader_path.feedback_bytes > previous_path.previous_feedback_bytes ?
                         reader_path.feedback_bytes - previous_path.previous_feedback_bytes : 0u;
+                const uint64_t path_new_send_bytes_delta =
+                        reader_path.new_send_bytes > previous_path.previous_new_send_bytes ?
+                        reader_path.new_send_bytes - previous_path.previous_new_send_bytes : 0u;
+                const uint64_t path_new_ack_bytes_delta =
+                        reader_path.new_ack_bytes > previous_path.previous_new_ack_bytes ?
+                        reader_path.new_ack_bytes - previous_path.previous_new_ack_bytes : 0u;
+                const uint64_t path_new_ack_dirty_skipped_bytes_delta =
+                        reader_path.new_ack_dirty_skipped_bytes >
+                        previous_path.previous_new_ack_dirty_skipped_bytes ?
+                        reader_path.new_ack_dirty_skipped_bytes -
+                        previous_path.previous_new_ack_dirty_skipped_bytes : 0u;
+                const uint64_t path_new_ack_inconclusive_bytes_delta =
+                        reader_path.new_ack_inconclusive_bytes >
+                        previous_path.previous_new_ack_inconclusive_bytes ?
+                        reader_path.new_ack_inconclusive_bytes -
+                        previous_path.previous_new_ack_inconclusive_bytes : 0u;
+                const uint64_t path_new_ack_strong_positive_bytes_delta =
+                        reader_path.new_ack_strong_positive_bytes >
+                        previous_path.previous_new_ack_strong_positive_bytes ?
+                        reader_path.new_ack_strong_positive_bytes -
+                        previous_path.previous_new_ack_strong_positive_bytes : 0u;
+                const uint64_t path_new_ack_normal_bytes_delta =
+                        reader_path.new_ack_normal_bytes > previous_path.previous_new_ack_normal_bytes ?
+                        reader_path.new_ack_normal_bytes - previous_path.previous_new_ack_normal_bytes : 0u;
+                const uint64_t path_new_ack_mild_negative_bytes_delta =
+                        reader_path.new_ack_mild_negative_bytes >
+                        previous_path.previous_new_ack_mild_negative_bytes ?
+                        reader_path.new_ack_mild_negative_bytes -
+                        previous_path.previous_new_ack_mild_negative_bytes : 0u;
+                const uint64_t path_new_ack_severe_negative_bytes_delta =
+                        reader_path.new_ack_severe_negative_bytes >
+                        previous_path.previous_new_ack_severe_negative_bytes ?
+                        reader_path.new_ack_severe_negative_bytes -
+                        previous_path.previous_new_ack_severe_negative_bytes : 0u;
                 const uint64_t path_repair_send_bytes_delta =
                         reader_path.repair_send_bytes > previous_path.previous_repair_send_bytes ?
                         reader_path.repair_send_bytes - previous_path.previous_repair_send_bytes : 0u;
+                const uint64_t path_repair_ack_bytes_delta =
+                        reader_path.repair_ack_bytes > previous_path.previous_repair_ack_bytes ?
+                        reader_path.repair_ack_bytes - previous_path.previous_repair_ack_bytes : 0u;
+                const uint64_t path_repair_ack_strong_positive_bytes_delta =
+                        reader_path.repair_ack_strong_positive_bytes >
+                        previous_path.previous_repair_ack_strong_positive_bytes ?
+                        reader_path.repair_ack_strong_positive_bytes -
+                        previous_path.previous_repair_ack_strong_positive_bytes : 0u;
+                const uint64_t path_repair_ack_normal_bytes_delta =
+                        reader_path.repair_ack_normal_bytes > previous_path.previous_repair_ack_normal_bytes ?
+                        reader_path.repair_ack_normal_bytes - previous_path.previous_repair_ack_normal_bytes : 0u;
+                const uint64_t path_repair_ack_mild_negative_bytes_delta =
+                        reader_path.repair_ack_mild_negative_bytes >
+                        previous_path.previous_repair_ack_mild_negative_bytes ?
+                        reader_path.repair_ack_mild_negative_bytes -
+                        previous_path.previous_repair_ack_mild_negative_bytes : 0u;
+                const uint64_t path_repair_ack_severe_negative_bytes_delta =
+                        reader_path.repair_ack_severe_negative_bytes >
+                        previous_path.previous_repair_ack_severe_negative_bytes ?
+                        reader_path.repair_ack_severe_negative_bytes -
+                        previous_path.previous_repair_ack_severe_negative_bytes : 0u;
                 const uint64_t path_repair_timeout_bytes_delta =
                         reader_path.repair_timeout_bytes > previous_path.previous_repair_timeout_bytes ?
                         reader_path.repair_timeout_bytes - previous_path.previous_repair_timeout_bytes : 0u;
+                const uint64_t path_repair_no_ack_timeout_bytes_delta =
+                        reader_path.repair_no_ack_timeout_bytes >
+                        previous_path.previous_repair_no_ack_timeout_bytes ?
+                        reader_path.repair_no_ack_timeout_bytes -
+                        previous_path.previous_repair_no_ack_timeout_bytes : 0u;
+                const uint64_t path_repair_late_ack_severe_bytes_delta =
+                        reader_path.repair_late_ack_severe_bytes >
+                        previous_path.previous_repair_late_ack_severe_bytes ?
+                        reader_path.repair_late_ack_severe_bytes -
+                        previous_path.previous_repair_late_ack_severe_bytes : 0u;
+                const uint64_t path_repair_attempt_overflow_bytes_delta =
+                        reader_path.repair_attempt_overflow_bytes >
+                        previous_path.previous_repair_attempt_overflow_bytes ?
+                        reader_path.repair_attempt_overflow_bytes -
+                        previous_path.previous_repair_attempt_overflow_bytes : 0u;
+                const uint64_t path_repair_unattributed_send_bytes_delta =
+                        reader_path.repair_unattributed_send_bytes >
+                        previous_path.previous_repair_unattributed_send_bytes ?
+                        reader_path.repair_unattributed_send_bytes -
+                        previous_path.previous_repair_unattributed_send_bytes : 0u;
                 const uint64_t path_strong_positive_bytes_delta =
                         reader_path.feedback_strong_positive_bytes >
                         previous_path.previous_feedback_strong_positive_bytes ?
@@ -2204,10 +2861,45 @@ private:
                         previous_path.previous_feedback_severe_negative_bytes ?
                         reader_path.feedback_severe_negative_bytes -
                         previous_path.previous_feedback_severe_negative_bytes : 0u;
-                const bool path_active = path_repair_send_samples_delta > 0u ||
+                const uint64_t path_source_diagnostic_samples_delta =
+                        path_new_ack_dirty_skipped_samples_delta +
+                        path_new_ack_inconclusive_samples_delta +
+                        path_pending_new_dirty_overflow_samples_delta +
+                        path_new_ack_strong_positive_samples_delta +
+                        path_new_ack_normal_samples_delta +
+                        path_new_ack_mild_negative_samples_delta +
+                        path_new_ack_severe_negative_samples_delta +
+                        path_repair_ack_strong_positive_samples_delta +
+                        path_repair_ack_normal_samples_delta +
+                        path_repair_ack_mild_negative_samples_delta +
+                        path_repair_ack_severe_negative_samples_delta +
+                        path_repair_no_ack_timeout_samples_delta +
+                        path_repair_late_ack_severe_samples_delta +
+                        path_repair_attempt_overflow_samples_delta +
+                        path_repair_unattributed_send_samples_delta;
+                const uint64_t path_source_diagnostic_bytes_delta =
+                        path_new_ack_dirty_skipped_bytes_delta +
+                        path_new_ack_inconclusive_bytes_delta +
+                        path_new_ack_strong_positive_bytes_delta +
+                        path_new_ack_normal_bytes_delta +
+                        path_new_ack_mild_negative_bytes_delta +
+                        path_new_ack_severe_negative_bytes_delta +
+                        path_repair_ack_strong_positive_bytes_delta +
+                        path_repair_ack_normal_bytes_delta +
+                        path_repair_ack_mild_negative_bytes_delta +
+                        path_repair_ack_severe_negative_bytes_delta +
+                        path_repair_no_ack_timeout_bytes_delta +
+                        path_repair_late_ack_severe_bytes_delta +
+                        path_repair_attempt_overflow_bytes_delta +
+                        path_repair_unattributed_send_bytes_delta;
+                const bool path_active = path_new_send_samples_delta > 0u || path_new_ack_samples_delta > 0u ||
+                        path_repair_send_samples_delta > 0u || path_repair_ack_samples_delta > 0u ||
                         path_feedback_samples_delta > 0u || path_repair_timeout_samples_delta > 0u ||
-                        path_repair_send_bytes_delta > 0u || path_feedback_bytes_delta > 0u ||
-                        path_repair_timeout_bytes_delta > 0u;
+                        path_new_send_bytes_delta > 0u || path_new_ack_bytes_delta > 0u ||
+                        path_repair_send_bytes_delta > 0u || path_repair_ack_bytes_delta > 0u ||
+                        path_feedback_bytes_delta > 0u || path_repair_timeout_bytes_delta > 0u ||
+                        path_source_diagnostic_samples_delta > 0u ||
+                        path_source_diagnostic_bytes_delta > 0u;
                 const uint64_t path_evidence_bytes = path_strong_positive_bytes_delta + path_normal_bytes_delta +
                         path_mild_negative_bytes_delta + path_severe_negative_bytes_delta;
                 const uint64_t path_negative_bytes = path_mild_negative_bytes_delta + path_severe_negative_bytes_delta;
@@ -2246,8 +2938,8 @@ private:
                     ++writer_active_reader_paths;
                     ++window.active_reader_paths;
                     const uint64_t path_observed_send_bytes =
-                            path_repair_send_bytes_delta + path_feedback_bytes_delta +
-                            path_repair_timeout_bytes_delta;
+                            path_new_send_bytes_delta + path_repair_send_bytes_delta +
+                            path_feedback_bytes_delta + path_repair_timeout_bytes_delta;
                     writer_active_request_bytes_delta += path_observed_send_bytes;
                     window.active_request_bytes_delta += path_observed_send_bytes;
                     if (path_slow)
@@ -2305,14 +2997,15 @@ private:
                         window.feedback_slow_request_bytes_delta += path_feedback_bytes_delta;
                     }
                 }
-                if (path_repair_send_samples_delta > 0u || path_repair_timeout_samples_delta > 0u ||
-                        path_repair_send_bytes_delta > 0u || path_repair_timeout_bytes_delta > 0u)
+                if (path_repair_ack_samples_delta > 0u || path_repair_no_ack_timeout_samples_delta > 0u ||
+                        path_repair_ack_bytes_delta > 0u || path_repair_no_ack_timeout_bytes_delta > 0u)
                 {
                     ++writer_repair_active_reader_paths;
                     ++window.repair_active_reader_paths;
-                    writer_repair_active_send_bytes += path_repair_send_bytes_delta + path_repair_timeout_bytes_delta;
+                    writer_repair_active_send_bytes +=
+                            path_repair_ack_bytes_delta + path_repair_no_ack_timeout_bytes_delta;
                     window.repair_active_send_bytes_delta +=
-                            path_repair_send_bytes_delta + path_repair_timeout_bytes_delta;
+                            path_repair_ack_bytes_delta + path_repair_no_ack_timeout_bytes_delta;
                     if (path_repair_timeout)
                     {
                         ++writer_repair_timeout_reader_paths;
@@ -2324,20 +3017,68 @@ private:
 
                 previous_path.previous_request_samples = reader_path.request_samples;
                 previous_path.previous_feedback_samples = reader_path.feedback_samples;
+                previous_path.previous_new_send_samples = reader_path.new_send_samples;
+                previous_path.previous_new_ack_samples = reader_path.new_ack_samples;
+                previous_path.previous_new_ack_dirty_skipped_samples = reader_path.new_ack_dirty_skipped_samples;
+                previous_path.previous_new_ack_inconclusive_samples = reader_path.new_ack_inconclusive_samples;
+                previous_path.previous_pending_new_dirty_overflow_samples =
+                        reader_path.pending_new_dirty_overflow_samples;
+                previous_path.previous_new_ack_strong_positive_samples =
+                        reader_path.new_ack_strong_positive_samples;
+                previous_path.previous_new_ack_normal_samples = reader_path.new_ack_normal_samples;
+                previous_path.previous_new_ack_mild_negative_samples = reader_path.new_ack_mild_negative_samples;
+                previous_path.previous_new_ack_severe_negative_samples = reader_path.new_ack_severe_negative_samples;
                 previous_path.previous_repair_send_samples = reader_path.repair_send_samples;
+                previous_path.previous_repair_ack_samples = reader_path.repair_ack_samples;
+                previous_path.previous_repair_ack_strong_positive_samples =
+                        reader_path.repair_ack_strong_positive_samples;
+                previous_path.previous_repair_ack_normal_samples = reader_path.repair_ack_normal_samples;
+                previous_path.previous_repair_ack_mild_negative_samples =
+                        reader_path.repair_ack_mild_negative_samples;
+                previous_path.previous_repair_ack_severe_negative_samples =
+                        reader_path.repair_ack_severe_negative_samples;
                 previous_path.previous_repair_timeout_samples = reader_path.repair_timeout_samples;
+                previous_path.previous_repair_no_ack_timeout_samples = reader_path.repair_no_ack_timeout_samples;
+                previous_path.previous_repair_late_ack_severe_samples = reader_path.repair_late_ack_severe_samples;
+                previous_path.previous_repair_attempt_overflow_samples = reader_path.repair_attempt_overflow_samples;
+                previous_path.previous_repair_unattributed_send_samples =
+                        reader_path.repair_unattributed_send_samples;
                 previous_path.previous_feedback_strong_positive_samples = reader_path.feedback_strong_positive_samples;
                 previous_path.previous_feedback_normal_samples = reader_path.feedback_normal_samples;
                 previous_path.previous_feedback_mild_negative_samples = reader_path.feedback_mild_negative_samples;
                 previous_path.previous_feedback_severe_negative_samples = reader_path.feedback_severe_negative_samples;
+                previous_path.previous_origin_saturated_positive_samples =
+                        reader_path.origin_saturated_positive_samples;
                 previous_path.previous_request_bytes = reader_path.request_bytes;
                 previous_path.previous_feedback_bytes = reader_path.feedback_bytes;
+                previous_path.previous_new_send_bytes = reader_path.new_send_bytes;
+                previous_path.previous_new_ack_bytes = reader_path.new_ack_bytes;
+                previous_path.previous_new_ack_dirty_skipped_bytes = reader_path.new_ack_dirty_skipped_bytes;
+                previous_path.previous_new_ack_inconclusive_bytes = reader_path.new_ack_inconclusive_bytes;
+                previous_path.previous_new_ack_strong_positive_bytes = reader_path.new_ack_strong_positive_bytes;
+                previous_path.previous_new_ack_normal_bytes = reader_path.new_ack_normal_bytes;
+                previous_path.previous_new_ack_mild_negative_bytes = reader_path.new_ack_mild_negative_bytes;
+                previous_path.previous_new_ack_severe_negative_bytes = reader_path.new_ack_severe_negative_bytes;
                 previous_path.previous_repair_send_bytes = reader_path.repair_send_bytes;
+                previous_path.previous_repair_ack_bytes = reader_path.repair_ack_bytes;
+                previous_path.previous_repair_ack_strong_positive_bytes =
+                        reader_path.repair_ack_strong_positive_bytes;
+                previous_path.previous_repair_ack_normal_bytes = reader_path.repair_ack_normal_bytes;
+                previous_path.previous_repair_ack_mild_negative_bytes =
+                        reader_path.repair_ack_mild_negative_bytes;
+                previous_path.previous_repair_ack_severe_negative_bytes =
+                        reader_path.repair_ack_severe_negative_bytes;
                 previous_path.previous_repair_timeout_bytes = reader_path.repair_timeout_bytes;
+                previous_path.previous_repair_no_ack_timeout_bytes = reader_path.repair_no_ack_timeout_bytes;
+                previous_path.previous_repair_late_ack_severe_bytes = reader_path.repair_late_ack_severe_bytes;
+                previous_path.previous_repair_attempt_overflow_bytes = reader_path.repair_attempt_overflow_bytes;
+                previous_path.previous_repair_unattributed_send_bytes = reader_path.repair_unattributed_send_bytes;
                 previous_path.previous_feedback_strong_positive_bytes = reader_path.feedback_strong_positive_bytes;
                 previous_path.previous_feedback_normal_bytes = reader_path.feedback_normal_bytes;
                 previous_path.previous_feedback_mild_negative_bytes = reader_path.feedback_mild_negative_bytes;
                 previous_path.previous_feedback_severe_negative_bytes = reader_path.feedback_severe_negative_bytes;
+                previous_path.previous_origin_saturated_positive_bytes =
+                        reader_path.origin_saturated_positive_bytes;
             }
 
             for (auto reader_it = queue.previous_reader_link_state.begin();
@@ -2425,20 +3166,57 @@ private:
 
             queue.previous_link_request_samples = feedback.request_samples;
             queue.previous_link_feedback_samples = feedback.feedback_samples;
+            queue.previous_link_new_send_samples = feedback.new_send_samples;
+            queue.previous_link_new_ack_samples = feedback.new_ack_samples;
+            queue.previous_link_new_ack_dirty_skipped_samples = feedback.new_ack_dirty_skipped_samples;
+            queue.previous_link_new_ack_inconclusive_samples = feedback.new_ack_inconclusive_samples;
+            queue.previous_link_pending_new_dirty_overflow_samples = feedback.pending_new_dirty_overflow_samples;
+            queue.previous_link_new_ack_strong_positive_samples = feedback.new_ack_strong_positive_samples;
+            queue.previous_link_new_ack_normal_samples = feedback.new_ack_normal_samples;
+            queue.previous_link_new_ack_mild_negative_samples = feedback.new_ack_mild_negative_samples;
+            queue.previous_link_new_ack_severe_negative_samples = feedback.new_ack_severe_negative_samples;
             queue.previous_link_repair_send_samples = feedback.repair_send_samples;
+            queue.previous_link_repair_ack_samples = feedback.repair_ack_samples;
+            queue.previous_link_repair_ack_strong_positive_samples = feedback.repair_ack_strong_positive_samples;
+            queue.previous_link_repair_ack_normal_samples = feedback.repair_ack_normal_samples;
+            queue.previous_link_repair_ack_mild_negative_samples = feedback.repair_ack_mild_negative_samples;
+            queue.previous_link_repair_ack_severe_negative_samples = feedback.repair_ack_severe_negative_samples;
             queue.previous_link_repair_timeout_samples = feedback.repair_timeout_samples;
+            queue.previous_link_repair_no_ack_timeout_samples = feedback.repair_no_ack_timeout_samples;
+            queue.previous_link_repair_late_ack_severe_samples = feedback.repair_late_ack_severe_samples;
+            queue.previous_link_repair_attempt_overflow_samples = feedback.repair_attempt_overflow_samples;
+            queue.previous_link_repair_unattributed_send_samples = feedback.repair_unattributed_send_samples;
             queue.previous_link_feedback_strong_positive_samples = feedback.feedback_strong_positive_samples;
             queue.previous_link_feedback_normal_samples = feedback.feedback_normal_samples;
             queue.previous_link_feedback_mild_negative_samples = feedback.feedback_mild_negative_samples;
             queue.previous_link_feedback_severe_negative_samples = feedback.feedback_severe_negative_samples;
+            queue.previous_link_origin_saturated_positive_samples = feedback.origin_saturated_positive_samples;
             queue.previous_link_request_bytes = feedback.request_bytes;
             queue.previous_link_feedback_bytes = feedback.feedback_bytes;
+            queue.previous_link_new_send_bytes = feedback.new_send_bytes;
+            queue.previous_link_new_ack_bytes = feedback.new_ack_bytes;
+            queue.previous_link_new_ack_dirty_skipped_bytes = feedback.new_ack_dirty_skipped_bytes;
+            queue.previous_link_new_ack_inconclusive_bytes = feedback.new_ack_inconclusive_bytes;
+            queue.previous_link_new_ack_strong_positive_bytes = feedback.new_ack_strong_positive_bytes;
+            queue.previous_link_new_ack_normal_bytes = feedback.new_ack_normal_bytes;
+            queue.previous_link_new_ack_mild_negative_bytes = feedback.new_ack_mild_negative_bytes;
+            queue.previous_link_new_ack_severe_negative_bytes = feedback.new_ack_severe_negative_bytes;
             queue.previous_link_repair_send_bytes = feedback.repair_send_bytes;
+            queue.previous_link_repair_ack_bytes = feedback.repair_ack_bytes;
+            queue.previous_link_repair_ack_strong_positive_bytes = feedback.repair_ack_strong_positive_bytes;
+            queue.previous_link_repair_ack_normal_bytes = feedback.repair_ack_normal_bytes;
+            queue.previous_link_repair_ack_mild_negative_bytes = feedback.repair_ack_mild_negative_bytes;
+            queue.previous_link_repair_ack_severe_negative_bytes = feedback.repair_ack_severe_negative_bytes;
             queue.previous_link_repair_timeout_bytes = feedback.repair_timeout_bytes;
+            queue.previous_link_repair_no_ack_timeout_bytes = feedback.repair_no_ack_timeout_bytes;
+            queue.previous_link_repair_late_ack_severe_bytes = feedback.repair_late_ack_severe_bytes;
+            queue.previous_link_repair_attempt_overflow_bytes = feedback.repair_attempt_overflow_bytes;
+            queue.previous_link_repair_unattributed_send_bytes = feedback.repair_unattributed_send_bytes;
             queue.previous_link_feedback_strong_positive_bytes = feedback.feedback_strong_positive_bytes;
             queue.previous_link_feedback_normal_bytes = feedback.feedback_normal_bytes;
             queue.previous_link_feedback_mild_negative_bytes = feedback.feedback_mild_negative_bytes;
             queue.previous_link_feedback_severe_negative_bytes = feedback.feedback_severe_negative_bytes;
+            queue.previous_link_origin_saturated_positive_bytes = feedback.origin_saturated_positive_bytes;
         }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
         window.slow_reader_share = fraction(window.slow_reader_paths, window.active_reader_paths);
@@ -2835,20 +3613,33 @@ private:
                             stateful_writer);
                 pressure.link_request_samples += feedback.request_samples;
                 pressure.link_feedback_samples += feedback.feedback_samples;
+                pressure.link_new_send_samples += feedback.new_send_samples;
+                pressure.link_new_ack_samples += feedback.new_ack_samples;
+                pressure.link_new_ack_dirty_skipped_samples += feedback.new_ack_dirty_skipped_samples;
+                pressure.link_new_ack_inconclusive_samples += feedback.new_ack_inconclusive_samples;
+                pressure.link_pending_new_dirty_overflow_samples += feedback.pending_new_dirty_overflow_samples;
                 pressure.link_repair_send_samples += feedback.repair_send_samples;
+                pressure.link_repair_ack_samples += feedback.repair_ack_samples;
                 pressure.link_repair_timeout_samples += feedback.repair_timeout_samples;
                 pressure.link_feedback_strong_positive_samples += feedback.feedback_strong_positive_samples;
                 pressure.link_feedback_normal_samples += feedback.feedback_normal_samples;
                 pressure.link_feedback_mild_negative_samples += feedback.feedback_mild_negative_samples;
                 pressure.link_feedback_severe_negative_samples += feedback.feedback_severe_negative_samples;
+                pressure.link_origin_saturated_positive_samples += feedback.origin_saturated_positive_samples;
                 pressure.link_request_bytes += feedback.request_bytes;
                 pressure.link_feedback_bytes += feedback.feedback_bytes;
+                pressure.link_new_send_bytes += feedback.new_send_bytes;
+                pressure.link_new_ack_bytes += feedback.new_ack_bytes;
+                pressure.link_new_ack_dirty_skipped_bytes += feedback.new_ack_dirty_skipped_bytes;
+                pressure.link_new_ack_inconclusive_bytes += feedback.new_ack_inconclusive_bytes;
                 pressure.link_repair_send_bytes += feedback.repair_send_bytes;
+                pressure.link_repair_ack_bytes += feedback.repair_ack_bytes;
                 pressure.link_repair_timeout_bytes += feedback.repair_timeout_bytes;
                 pressure.link_feedback_strong_positive_bytes += feedback.feedback_strong_positive_bytes;
                 pressure.link_feedback_normal_bytes += feedback.feedback_normal_bytes;
                 pressure.link_feedback_mild_negative_bytes += feedback.feedback_mild_negative_bytes;
                 pressure.link_feedback_severe_negative_bytes += feedback.feedback_severe_negative_bytes;
+                pressure.link_origin_saturated_positive_bytes += feedback.origin_saturated_positive_bytes;
                 pressure.link_outstanding_changes += feedback.outstanding_changes;
                 pressure.link_outstanding_bytes += feedback.outstanding_bytes;
                 pressure.link_request_interval_ewma_ms = (std::max)(
@@ -2890,9 +3681,15 @@ private:
                         ++pressure.link_calibrated_reader_paths;
                     }
                     const bool path_seen = reader_path.request_samples > 0u || reader_path.feedback_samples > 0u ||
-                            reader_path.repair_send_samples > 0u || reader_path.repair_timeout_samples > 0u ||
-                            reader_path.request_bytes > 0u || reader_path.feedback_bytes > 0u ||
-                            reader_path.repair_send_bytes > 0u || reader_path.repair_timeout_bytes > 0u;
+                            reader_path.new_send_samples > 0u || reader_path.new_ack_samples > 0u ||
+                            reader_path.new_ack_dirty_skipped_samples > 0u ||
+                            reader_path.new_ack_inconclusive_samples > 0u ||
+                            reader_path.repair_send_samples > 0u || reader_path.repair_ack_samples > 0u ||
+                            reader_path.repair_timeout_samples > 0u || reader_path.request_bytes > 0u ||
+                            reader_path.feedback_bytes > 0u || reader_path.new_send_bytes > 0u ||
+                            reader_path.new_ack_bytes > 0u || reader_path.new_ack_dirty_skipped_bytes > 0u ||
+                            reader_path.new_ack_inconclusive_bytes > 0u || reader_path.repair_send_bytes > 0u ||
+                            reader_path.repair_ack_bytes > 0u || reader_path.repair_timeout_bytes > 0u;
                     if (path_seen && reader_path.stable_feedback_calibrated)
                     {
                         ++writer_active_reader_paths;
@@ -3385,6 +4182,14 @@ private:
         const int64_t charge = static_cast<int64_t>((std::max)(1u, selected_size));
         send_balance_bytes_ -= charge;
         control_window_.selected_bytes += charge;
+        if (nullptr != writer_being_processed_)
+        {
+            auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer_being_processed_);
+            if (nullptr != stateful_writer)
+            {
+                send_period_writers_.push_back(stateful_writer);
+            }
+        }
         if (selected_sample_is_old_being_processed_)
         {
             ++control_window_.selected_old;
@@ -3421,12 +4226,45 @@ private:
         while (last_send_budget_refill_ + control_period_ <= now)
         {
             const auto boundary = last_send_budget_refill_ + control_period_;
+            seal_current_send_period();
             update_send_budget_from_window();
             replenish_balance_for_period();
             maybe_decay_feedback_windows();
             control_window_.reset();
             last_send_budget_refill_ = boundary;
+            ++current_send_period_id_;
         }
+    }
+
+    void seal_current_send_period()
+    {
+        if (send_period_writers_.empty())
+        {
+            return;
+        }
+
+        std::sort(send_period_writers_.begin(), send_period_writers_.end());
+        send_period_writers_.erase(
+            std::unique(send_period_writers_.begin(), send_period_writers_.end()),
+            send_period_writers_.end());
+
+#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        const bool saturated = control_window_.selected_bytes >= active_send_load_floor_bytes();
+        for (auto* writer : send_period_writers_)
+        {
+            if (nullptr == writer)
+            {
+                continue;
+            }
+            fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_async_send_period_sealed(
+                writer,
+                current_send_period_id_,
+                control_window_.selected_bytes,
+                active_send_load_floor_bytes(),
+                saturated);
+        }
+#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+        send_period_writers_.clear();
     }
 
     void replenish_balance_for_period()
@@ -3487,6 +4325,9 @@ private:
         const bool queued_demand = pressure.pending_writers > 0u ||
                 control_window_.new_enqueue > 0u || control_window_.old_enqueue > 0u ||
                 pressure.link_outstanding_changes > 0u;
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+        static_cast<void>(recovery_active_send_load);
+#endif // FASTDDS_RETRANSMISSION_TRACE
         const LinkFeedbackWindow feedback_window = capture_link_feedback_window();
         const uint64_t request_delta = feedback_window.request_samples_delta;
         const uint64_t feedback_delta = feedback_window.feedback_samples_delta;
@@ -3507,6 +4348,9 @@ private:
         const bool feedback_calibrated = pressure.link_stable_feedback_calibrated;
         const bool classified_feedback_activity = classified_feedback_samples_delta > 0u ||
                 classified_feedback_bytes_delta > 0u;
+        const bool origin_saturated_positive_activity =
+                feedback_window.origin_saturated_positive_samples_delta > 0u ||
+                feedback_window.origin_saturated_positive_bytes_delta > 0u;
         const bool flow_severe_negative = feedback_window.evidence_reader_paths > 0u &&
                 (feedback_window.severe_negative_reader_share > 0.5 ||
                 feedback_window.severe_negative_writer_share > 0.5 ||
@@ -3564,7 +4408,7 @@ private:
                 request_bytes_delta > 0u;
         const bool negative_feedback = negative_feedback_activity && link_negative_signal;
         const bool positive_feedback_candidate = feedback_calibrated &&
-                recovery_active_send_load &&
+                origin_saturated_positive_activity &&
                 classified_feedback_activity &&
                 (flow_strong_positive || flow_normal);
         const bool positive_feedback = positive_feedback_candidate &&
@@ -3597,12 +4441,22 @@ private:
             {
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_budget_update("observation_active", previous_budget, previous_state, pressure,
+                        feedback_window,
                         recovery_active_send_load, negative_feedback_activity, queued_demand,
                         blocked_demand,
                         negative_feedback, positive_feedback, false,
                         request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
                         request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
-                        repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta,
+                        repair_timeout_bytes_delta,
+                        feedback_window.repair_no_ack_timeout_samples_delta,
+                        feedback_window.repair_late_ack_severe_samples_delta,
+                        feedback_window.repair_attempt_overflow_samples_delta,
+                        feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+                        feedback_window.repair_late_ack_severe_bytes_delta,
+                        feedback_window.repair_attempt_overflow_bytes_delta,
+                        feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta,
                         feedback_window.active_feedback_slow_ratio,
                         feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
                         feedback_window.active_writers, feedback_window.slow_writers,
@@ -3649,12 +4503,22 @@ private:
                     (BudgetObservationResult::COMMIT_WORSENED == observation_result ?
                     "observation_commit_worsened" : "observation_commit_improved"),
                     previous_budget, previous_state, pressure,
+                    feedback_window,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     blocked_demand,
                     negative_feedback, positive_feedback, false,
                     request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
                     request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
-                    repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta,
+                    repair_timeout_bytes_delta,
+                    feedback_window.repair_no_ack_timeout_samples_delta,
+                    feedback_window.repair_late_ack_severe_samples_delta,
+                    feedback_window.repair_attempt_overflow_samples_delta,
+                    feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+                    feedback_window.repair_late_ack_severe_bytes_delta,
+                    feedback_window.repair_attempt_overflow_bytes_delta,
+                    feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta,
                     feedback_window.active_feedback_slow_ratio,
                     feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
                     feedback_window.active_writers, feedback_window.slow_writers,
@@ -3705,18 +4569,29 @@ private:
                 budget_before_decrease,
                 current_send_budget_bytes_,
                 feedback_window,
-                negative_feedback_window_threshold);
+                negative_feedback_window_threshold,
+                pressure);
             send_balance_bytes_ = (std::min)(
                 send_balance_bytes_, static_cast<int64_t>(current_send_budget_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update(repair_timeout ? "severe_negative_tentative" : "mild_negative_tentative",
                     previous_budget, previous_state, pressure,
+                    feedback_window,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     blocked_demand,
                     negative_feedback, positive_feedback, false,
                     request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
                     request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
-                    repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
+                    repair_timeout_bytes_delta,
+                    feedback_window.repair_no_ack_timeout_samples_delta,
+                    feedback_window.repair_late_ack_severe_samples_delta,
+                    feedback_window.repair_attempt_overflow_samples_delta,
+                    feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+                    feedback_window.repair_late_ack_severe_bytes_delta,
+                    feedback_window.repair_attempt_overflow_bytes_delta,
+                    feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
                     feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
                     feedback_window.active_writers, feedback_window.slow_writers,
                     feedback_window.slow_reader_share, feedback_window.slow_writer_share,
@@ -3750,12 +4625,22 @@ private:
             current_send_budget_bytes_ = clamp_budget(current_send_budget_bytes_ + positive_step);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
             trace_budget_update("positive", previous_budget, previous_state, pressure,
+                    feedback_window,
                     recovery_active_send_load, negative_feedback_activity, queued_demand,
                     blocked_demand,
                     negative_feedback, positive_feedback, false,
                     request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
                     request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
-                    repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
+                    repair_timeout_bytes_delta,
+                    feedback_window.repair_no_ack_timeout_samples_delta,
+                    feedback_window.repair_late_ack_severe_samples_delta,
+                    feedback_window.repair_attempt_overflow_samples_delta,
+                    feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+                    feedback_window.repair_late_ack_severe_bytes_delta,
+                    feedback_window.repair_attempt_overflow_bytes_delta,
+                    feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
                     feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
                     feedback_window.active_writers, feedback_window.slow_writers,
                     feedback_window.slow_reader_share, feedback_window.slow_writer_share,
@@ -3786,12 +4671,22 @@ private:
                     clamp_budget(current_send_budget_bytes_ + recovery_step_bytes_));
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 trace_budget_update("probe_recovery", previous_budget, previous_state, pressure,
+                        feedback_window,
                         recovery_active_send_load, negative_feedback_activity, queued_demand,
                         blocked_demand,
                         negative_feedback, positive_feedback, true,
                         request_delta, feedback_delta, repair_send_delta, repair_timeout_delta,
                         request_bytes_delta, feedback_bytes_delta, repair_send_bytes_delta,
-                        repair_timeout_bytes_delta, repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
+                        repair_timeout_bytes_delta,
+                        feedback_window.repair_no_ack_timeout_samples_delta,
+                        feedback_window.repair_late_ack_severe_samples_delta,
+                        feedback_window.repair_attempt_overflow_samples_delta,
+                        feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+                        feedback_window.repair_late_ack_severe_bytes_delta,
+                        feedback_window.repair_attempt_overflow_bytes_delta,
+                        feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta, feedback_window.active_feedback_slow_ratio,
                         feedback_window.active_reader_paths, feedback_window.slow_reader_paths,
                         feedback_window.active_writers, feedback_window.slow_writers,
                         feedback_window.slow_reader_share, feedback_window.slow_writer_share,
@@ -3820,6 +4715,7 @@ private:
             previous_budget,
             previous_state,
             pressure,
+            feedback_window,
             recovery_active_send_load,
             negative_feedback_activity,
             queued_demand,
@@ -3835,7 +4731,15 @@ private:
             feedback_bytes_delta,
             repair_send_bytes_delta,
             repair_timeout_bytes_delta,
-            repair_demand_uncovered_bytes_delta,
+            feedback_window.repair_no_ack_timeout_samples_delta,
+            feedback_window.repair_late_ack_severe_samples_delta,
+            feedback_window.repair_attempt_overflow_samples_delta,
+            feedback_window.repair_unattributed_send_samples_delta,
+                        feedback_window.repair_no_ack_timeout_bytes_delta,
+            feedback_window.repair_late_ack_severe_bytes_delta,
+            feedback_window.repair_attempt_overflow_bytes_delta,
+            feedback_window.repair_unattributed_send_bytes_delta,
+                        repair_demand_uncovered_bytes_delta,
             feedback_window.active_feedback_slow_ratio,
             feedback_window.active_reader_paths,
             feedback_window.slow_reader_paths,
@@ -4299,8 +5203,28 @@ private:
                << ";old_excess=" << pressure.old_excess
                << ";link_request_samples=" << pressure.link_request_samples
                << ";link_feedback_samples=" << pressure.link_feedback_samples
+               << ";link_new_send_samples=" << pressure.link_new_send_samples
+               << ";link_new_ack_samples=" << pressure.link_new_ack_samples
+               << ";link_new_ack_dirty_skipped_samples=" <<
+                pressure.link_new_ack_dirty_skipped_samples
+               << ";link_new_ack_inconclusive_samples=" <<
+                pressure.link_new_ack_inconclusive_samples
+               << ";link_pending_new_dirty_overflow_samples=" <<
+                pressure.link_pending_new_dirty_overflow_samples
+               << ";link_repair_send_samples=" << pressure.link_repair_send_samples
+               << ";link_repair_ack_samples=" << pressure.link_repair_ack_samples
+               << ";link_repair_timeout_samples=" << pressure.link_repair_timeout_samples
                << ";link_request_bytes=" << pressure.link_request_bytes
                << ";link_feedback_bytes=" << pressure.link_feedback_bytes
+               << ";link_new_send_bytes=" << pressure.link_new_send_bytes
+               << ";link_new_ack_bytes=" << pressure.link_new_ack_bytes
+               << ";link_new_ack_dirty_skipped_bytes=" <<
+                pressure.link_new_ack_dirty_skipped_bytes
+               << ";link_new_ack_inconclusive_bytes=" <<
+                pressure.link_new_ack_inconclusive_bytes
+               << ";link_repair_send_bytes=" << pressure.link_repair_send_bytes
+               << ";link_repair_ack_bytes=" << pressure.link_repair_ack_bytes
+               << ";link_repair_timeout_bytes=" << pressure.link_repair_timeout_bytes
                << ";link_outstanding_changes=" << pressure.link_outstanding_changes
                << ";link_outstanding_bytes=" << pressure.link_outstanding_bytes
                << ";link_request_interval_ewma_ms=" << pressure.link_request_interval_ewma_ms
@@ -4431,6 +5355,7 @@ private:
             uint32_t previous_budget,
             SendLoadState previous_state,
             const PressureSnapshot& pressure,
+            const LinkFeedbackWindow& feedback_window,
             bool recovery_active_send_load,
             bool negative_feedback_activity,
             bool queued_demand,
@@ -4446,6 +5371,14 @@ private:
             uint64_t feedback_bytes_delta,
             uint64_t repair_send_bytes_delta,
             uint64_t repair_timeout_bytes_delta,
+            uint64_t repair_no_ack_timeout_delta,
+            uint64_t repair_late_ack_severe_delta,
+            uint64_t repair_attempt_overflow_delta,
+            uint64_t repair_unattributed_send_delta,
+            uint64_t repair_no_ack_timeout_bytes_delta,
+            uint64_t repair_late_ack_severe_bytes_delta,
+            uint64_t repair_attempt_overflow_bytes_delta,
+            uint64_t repair_unattributed_send_bytes_delta,
             uint64_t repair_demand_uncovered_bytes_delta,
             double active_feedback_slow_ratio,
             uint64_t active_reader_paths,
@@ -4508,6 +5441,9 @@ private:
                << ";observation_windows=" << budget_decrease_observation_.windows
                << ";observation_min_windows=" << budget_decrease_observation_.min_windows
                << ";observation_max_windows=" << budget_decrease_observation_.max_windows
+               << ";observation_elapsed_ms=" << observation_elapsed_ms()
+               << ";observation_min_duration_ms=" << budget_decrease_observation_.min_duration_ms
+               << ";observation_max_duration_ms=" << budget_decrease_observation_.max_duration_ms
                << ";observation_budget_before=" << budget_decrease_observation_.budget_before
                << ";observation_budget_after=" << budget_decrease_observation_.budget_after
                << ";observation_before_negative_share=" <<
@@ -4541,10 +5477,67 @@ private:
                << ";feedback_delta=" << feedback_delta
                << ";repair_send_delta=" << repair_send_delta
                << ";repair_timeout_delta=" << repair_timeout_delta
+               << ";new_send_delta=" << feedback_window.new_send_samples_delta
+               << ";new_ack_delta=" << feedback_window.new_ack_samples_delta
+               << ";new_ack_dirty_skipped_delta=" <<
+                feedback_window.new_ack_dirty_skipped_samples_delta
+               << ";new_ack_inconclusive_delta=" <<
+                feedback_window.new_ack_inconclusive_samples_delta
+               << ";pending_new_dirty_overflow_delta=" <<
+                feedback_window.pending_new_dirty_overflow_samples_delta
+               << ";new_ack_strong_positive_delta=" <<
+                feedback_window.new_ack_strong_positive_samples_delta
+               << ";new_ack_normal_delta=" << feedback_window.new_ack_normal_samples_delta
+               << ";new_ack_mild_negative_delta=" <<
+                feedback_window.new_ack_mild_negative_samples_delta
+               << ";new_ack_severe_negative_delta=" <<
+                feedback_window.new_ack_severe_negative_samples_delta
+               << ";origin_saturated_positive_delta=" <<
+                feedback_window.origin_saturated_positive_samples_delta
+               << ";repair_ack_delta=" << feedback_window.repair_ack_samples_delta
+               << ";repair_ack_strong_positive_delta=" <<
+                feedback_window.repair_ack_strong_positive_samples_delta
+               << ";repair_ack_normal_delta=" << feedback_window.repair_ack_normal_samples_delta
+               << ";repair_ack_mild_negative_delta=" <<
+                feedback_window.repair_ack_mild_negative_samples_delta
+               << ";repair_ack_severe_negative_delta=" <<
+                feedback_window.repair_ack_severe_negative_samples_delta
+               << ";repair_no_ack_timeout_delta=" << repair_no_ack_timeout_delta
+               << ";repair_late_ack_severe_delta=" << repair_late_ack_severe_delta
+               << ";repair_attempt_overflow_delta=" << repair_attempt_overflow_delta
+               << ";repair_unattributed_send_delta=" << repair_unattributed_send_delta
                << ";request_bytes_delta=" << request_bytes_delta
                << ";feedback_bytes_delta=" << feedback_bytes_delta
                << ";repair_send_bytes_delta=" << repair_send_bytes_delta
                << ";repair_timeout_bytes_delta=" << repair_timeout_bytes_delta
+               << ";new_send_bytes_delta=" << feedback_window.new_send_bytes_delta
+               << ";new_ack_bytes_delta=" << feedback_window.new_ack_bytes_delta
+               << ";new_ack_dirty_skipped_bytes_delta=" <<
+                feedback_window.new_ack_dirty_skipped_bytes_delta
+               << ";new_ack_inconclusive_bytes_delta=" <<
+                feedback_window.new_ack_inconclusive_bytes_delta
+               << ";new_ack_strong_positive_bytes_delta=" <<
+                feedback_window.new_ack_strong_positive_bytes_delta
+               << ";new_ack_normal_bytes_delta=" << feedback_window.new_ack_normal_bytes_delta
+               << ";new_ack_mild_negative_bytes_delta=" <<
+                feedback_window.new_ack_mild_negative_bytes_delta
+               << ";new_ack_severe_negative_bytes_delta=" <<
+                feedback_window.new_ack_severe_negative_bytes_delta
+               << ";origin_saturated_positive_bytes_delta=" <<
+                feedback_window.origin_saturated_positive_bytes_delta
+               << ";repair_ack_bytes_delta=" << feedback_window.repair_ack_bytes_delta
+               << ";repair_ack_strong_positive_bytes_delta=" <<
+                feedback_window.repair_ack_strong_positive_bytes_delta
+               << ";repair_ack_normal_bytes_delta=" <<
+                feedback_window.repair_ack_normal_bytes_delta
+               << ";repair_ack_mild_negative_bytes_delta=" <<
+                feedback_window.repair_ack_mild_negative_bytes_delta
+               << ";repair_ack_severe_negative_bytes_delta=" <<
+                feedback_window.repair_ack_severe_negative_bytes_delta
+               << ";repair_no_ack_timeout_bytes_delta=" << repair_no_ack_timeout_bytes_delta
+               << ";repair_late_ack_severe_bytes_delta=" << repair_late_ack_severe_bytes_delta
+               << ";repair_attempt_overflow_bytes_delta=" << repair_attempt_overflow_bytes_delta
+               << ";repair_unattributed_send_bytes_delta=" << repair_unattributed_send_bytes_delta
                << ";repair_demand_uncovered_bytes_delta=" << repair_demand_uncovered_bytes_delta
                << ";active_feedback_slow_ratio=" << active_feedback_slow_ratio
                << ";active_reader_paths=" << active_reader_paths
@@ -4563,6 +5556,7 @@ private:
                << ";recovery_step_bytes=" << recovery_step_bytes_
                << ";decrease_percent=" << decrease_percent_
                << ";control_period_ms=" << control_period_.count()
+               << ";current_send_period_id=" << current_send_period_id_
                << ";balance_refill_mode=period_boundary"
                << ";control_window_selected_bytes=" << control_window_.selected_bytes
                << ";control_window_selected_old=" << control_window_.selected_old
@@ -4741,6 +5735,12 @@ private:
     int32_t score_being_processed_ = (std::numeric_limits<int32_t>::min)();
 
     bool selected_sample_is_old_being_processed_ = false;
+
+    uint64_t selected_send_period_id_being_processed_ = 0u;
+
+    uint64_t current_send_period_id_ = 1u;
+
+    std::vector<fastrtps::rtps::StatefulWriter*> send_period_writers_;
 
     uint32_t feedback_decay_counter_ = 0;
 
@@ -4984,22 +5984,26 @@ private:
         fastrtps::rtps::LocatorSelectorSender& locator_selector = writer->get_general_locator_selector();
         std::lock_guard<fastrtps::rtps::LocatorSelectorSender> lock(locator_selector);
         fastrtps::rtps::RTPSMessageGroup group(participant_, writer, &locator_selector);
-        if (fastrtps::rtps::DeliveryRetCode::DELIVERED !=
-                writer->deliver_sample_nts(change, group, locator_selector, max_blocking_time))
-        {
-            return enqueue_new_sample_impl(writer, change, max_blocking_time);
-        }
-
-#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
+        fastrtps::rtps::DeliveryRetCode delivery_ret =
+                fastrtps::rtps::DeliveryRetCode::NOT_DELIVERED;
         auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(writer);
         if (nullptr != stateful_writer)
         {
-            fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
-                stateful_writer,
-                *change,
+            delivery_ret = stateful_writer->deliver_sample_nts_with_sample_kind(
+                change,
+                group,
+                locator_selector,
+                max_blocking_time,
                 false);
         }
-#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
+        else
+        {
+            delivery_ret = writer->deliver_sample_nts(change, group, locator_selector, max_blocking_time);
+        }
+        if (fastrtps::rtps::DeliveryRetCode::DELIVERED != delivery_ret)
+        {
+            return enqueue_new_sample_impl(writer, change, max_blocking_time);
+        }
 
         return true;
     }
@@ -5134,6 +6138,7 @@ private:
             std::unique_lock<std::mutex> lock(mutex_);
             fastrtps::rtps::CacheChange_t* change_to_process = nullptr;
             bool change_to_process_is_old = false;
+            uint64_t change_to_process_send_period_id = 0u;
 
             //Check if we have to sleep.
             {
@@ -5169,6 +6174,7 @@ private:
                 if (nullptr != change_to_process)
                 {
                     change_to_process_is_old = sched.selected_sample_is_old();
+                    change_to_process_send_period_id = sched.selected_send_period_id();
                 }
             }
 
@@ -5208,9 +6214,26 @@ private:
                 change_to_process->writer_info.previous = nullptr;
                 change_to_process->writer_info.next = nullptr;
 
-                fastrtps::rtps::DeliveryRetCode ret_delivery = current_writer->deliver_sample_nts(
-                    change_to_process, async_mode.group, locator_selector,
-                    std::chrono::steady_clock::now() + std::chrono::hours(24));
+                fastrtps::rtps::DeliveryRetCode ret_delivery;
+                auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(current_writer);
+                if (nullptr != stateful_writer)
+                {
+                    ret_delivery = stateful_writer->deliver_sample_nts_with_sample_kind(
+                        change_to_process,
+                        async_mode.group,
+                        locator_selector,
+                        std::chrono::steady_clock::now() + std::chrono::hours(24),
+                        change_to_process_is_old,
+                        change_to_process_send_period_id);
+                }
+                else
+                {
+                    ret_delivery = current_writer->deliver_sample_nts(
+                        change_to_process,
+                        async_mode.group,
+                        locator_selector,
+                        std::chrono::steady_clock::now() + std::chrono::hours(24));
+                }
 
                 if (fastrtps::rtps::DeliveryRetCode::DELIVERED != ret_delivery)
                 {
@@ -5231,20 +6254,6 @@ private:
                 locator_selector.unlock();
                 current_writer->getMutex().unlock();
 
-#ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-                if (std::is_same<FlowControllerSyncPublishMode, PublishMode>::value)
-                {
-                    auto stateful_writer = dynamic_cast<fastrtps::rtps::StatefulWriter*>(current_writer);
-                    if (nullptr != stateful_writer)
-                    {
-                        fastrtps::rtps::detail::AdaptiveRetransmissionController::instance().on_repair_sample_sent(
-                            stateful_writer,
-                            *change_to_process,
-                            change_to_process_is_old);
-                    }
-                }
-#endif // FASTDDS_ADAPTIVE_RETRANSMISSION
-
                 {
                     std::unique_lock<std::mutex> in_lock(async_mode.changes_interested_mutex);
                     sched.work_done();
@@ -5262,6 +6271,8 @@ private:
                     sched.add_interested_changes_to_queue_nts();
                     change_to_process = sched.get_next_change_nts();
                     change_to_process_is_old = nullptr != change_to_process && sched.selected_sample_is_old();
+                    change_to_process_send_period_id = nullptr != change_to_process ?
+                            sched.selected_send_period_id() : 0u;
                 }
             }
 

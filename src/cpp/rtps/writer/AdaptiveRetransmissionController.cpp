@@ -38,17 +38,14 @@ constexpr const char* async_observe_property = "fastdds.adaptive_async.observe_o
 // Provisional safety defaults. These are experiment inputs, not calibrated link classifications.
 constexpr uint32_t stable_feedback_calibration_min_samples = 16;
 constexpr auto stable_feedback_calibration_min_duration = std::chrono::seconds(5);
-constexpr std::size_t max_sent_ack_tracking_per_writer = 8192;
-constexpr std::size_t max_repair_send_attempts_per_change = 8;
+constexpr std::size_t max_pending_new_dirty_sequences_per_reader = 8192;
 constexpr double repair_timeout_baseline_multiplier = 3.0;
 constexpr double min_repair_timeout_ms = 25.0;
 constexpr double repair_timeout_request_interval_multiplier = 1.5;
 constexpr double max_repair_timeout_request_interval_ms = 200.0;
+constexpr double no_ack_episode_window_multiplier = 2.0;
 constexpr double default_feedback_strong_positive_ratio = 1.0;
 constexpr double default_feedback_slow_ratio = 1.5;
-constexpr uint32_t pressure_feedback_min_samples = 3;
-constexpr uint32_t pressure_request_count = 4;
-constexpr uint32_t max_changes_per_cycle = 2;
 constexpr uint32_t max_planned_changes_per_cycle = 32;
 constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
 constexpr uint32_t default_hard_max_defer_ms = 50;
@@ -57,6 +54,7 @@ constexpr double slow_feedback_ms = 25.0;
 constexpr uint64_t min_dynamic_bytes_per_cycle = 16 * 1024;
 constexpr uint64_t max_dynamic_bytes_per_cycle = 256 * 1024;
 constexpr uint64_t additive_budget_step = 8 * 1024;
+constexpr uint64_t max_tracked_send_periods_per_writer = 2048;
 
 struct ReaderKey
 {
@@ -90,16 +88,65 @@ struct ChangeKey
     }
 };
 
+struct DeliveryEpisode
+{
+    steady_clock::time_point first_send_time;
+    steady_clock::time_point first_repair_send_time;
+    steady_clock::time_point last_send_time;
+    uint64_t last_send_period_id = 0u;
+    uint32_t estimated_bytes = 0;
+    uint32_t send_count = 0;
+    uint64_t generation = 0;
+    bool has_new_send = false;
+    bool has_repair_send = false;
+    bool dirty = false;
+};
+
 struct ReaderState
 {
     uint32_t request_samples = 0;
     uint32_t feedback_samples = 0;
     uint64_t request_bytes = 0;
     uint64_t feedback_bytes = 0;
+    uint64_t new_send_samples = 0;
+    uint64_t new_send_bytes = 0;
+    uint64_t new_ack_samples = 0;
+    uint64_t new_ack_bytes = 0;
+    uint64_t new_ack_dirty_skipped_samples = 0;
+    uint64_t new_ack_dirty_skipped_bytes = 0;
+    uint64_t new_ack_inconclusive_samples = 0;
+    uint64_t new_ack_inconclusive_bytes = 0;
+    uint64_t pending_new_dirty_overflow_samples = 0;
+    uint64_t new_ack_strong_positive_samples = 0;
+    uint64_t new_ack_strong_positive_bytes = 0;
+    uint64_t new_ack_normal_samples = 0;
+    uint64_t new_ack_normal_bytes = 0;
+    uint64_t new_ack_mild_negative_samples = 0;
+    uint64_t new_ack_mild_negative_bytes = 0;
+    uint64_t new_ack_severe_negative_samples = 0;
+    uint64_t new_ack_severe_negative_bytes = 0;
     uint64_t repair_send_samples = 0;
     uint64_t repair_send_bytes = 0;
+    uint64_t repair_ack_samples = 0;
+    uint64_t repair_ack_bytes = 0;
+    uint64_t repair_ack_strong_positive_samples = 0;
+    uint64_t repair_ack_strong_positive_bytes = 0;
+    uint64_t repair_ack_normal_samples = 0;
+    uint64_t repair_ack_normal_bytes = 0;
+    uint64_t repair_ack_mild_negative_samples = 0;
+    uint64_t repair_ack_mild_negative_bytes = 0;
+    uint64_t repair_ack_severe_negative_samples = 0;
+    uint64_t repair_ack_severe_negative_bytes = 0;
     uint64_t repair_timeout_samples = 0;
     uint64_t repair_timeout_bytes = 0;
+    uint64_t repair_no_ack_timeout_samples = 0;
+    uint64_t repair_no_ack_timeout_bytes = 0;
+    uint64_t repair_late_ack_severe_samples = 0;
+    uint64_t repair_late_ack_severe_bytes = 0;
+    uint64_t repair_attempt_overflow_samples = 0;
+    uint64_t repair_attempt_overflow_bytes = 0;
+    uint64_t repair_unattributed_send_samples = 0;
+    uint64_t repair_unattributed_send_bytes = 0;
     uint64_t feedback_strong_positive_samples = 0;
     uint64_t feedback_strong_positive_bytes = 0;
     uint64_t feedback_normal_samples = 0;
@@ -108,6 +155,8 @@ struct ReaderState
     uint64_t feedback_mild_negative_bytes = 0;
     uint64_t feedback_severe_negative_samples = 0;
     uint64_t feedback_severe_negative_bytes = 0;
+    uint64_t origin_saturated_positive_samples = 0;
+    uint64_t origin_saturated_positive_bytes = 0;
     double request_interval_ewma_ms = 0.0;
     double recovery_feedback_ewma_ms = 0.0;
     double stable_feedback_ms = 0.0;
@@ -117,26 +166,73 @@ struct ReaderState
     bool stable_feedback_calibrated = false;
     SequenceNumber_t last_ack_base = SequenceNumber_t();
     bool ack_progress_tracking_started = false;
-    steady_clock::time_point ack_progress_tracking_start_time;
     steady_clock::time_point last_request;
-    std::set<SequenceNumber_t> repair_tainted_sequences;
-    uint32_t admitted_changes_in_cycle = 0;
-    uint64_t admitted_bytes_in_cycle = 0;
+    std::set<SequenceNumber_t> pending_new_dirty_sequences;
 };
 
-struct SentChangeState
+struct SendPeriodKey
 {
-    steady_clock::time_point sent_time;
-    uint32_t estimated_bytes = 0;
-    bool old_sample = false;
+    SendPeriodKey() = default;
+
+    SendPeriodKey(
+            const GUID_t& writer_guid,
+            uint64_t send_period_id)
+        : writer(writer_guid)
+        , period_id(send_period_id)
+    {
+    }
+
+    GUID_t writer;
+    uint64_t period_id = 0u;
+
+    bool operator <(
+            const SendPeriodKey& other) const
+    {
+        if (writer < other.writer)
+        {
+            return true;
+        }
+        if (other.writer < writer)
+        {
+            return false;
+        }
+        return period_id < other.period_id;
+    }
 };
 
-struct RepairSendAttempt
+struct SendPeriodSeal
 {
-    steady_clock::time_point sent_time;
-    uint32_t estimated_bytes = 0;
-    bool timeout_reported = false;
-    bool feedback_classified = false;
+    SendPeriodSeal() = default;
+
+    SendPeriodSeal(
+            uint64_t selected,
+            uint64_t active_load_floor,
+            bool period_saturated)
+        : selected_bytes(selected)
+        , active_load_floor_bytes(active_load_floor)
+        , saturated(period_saturated)
+    {
+    }
+
+    uint64_t selected_bytes = 0u;
+    uint64_t active_load_floor_bytes = 0u;
+    bool saturated = false;
+};
+
+struct PendingOriginPositiveFeedback
+{
+    PendingOriginPositiveFeedback() = default;
+
+    PendingOriginPositiveFeedback(
+            const ReaderKey& reader_key,
+            uint32_t bytes)
+        : reader(reader_key)
+        , estimated_bytes(bytes)
+    {
+    }
+
+    ReaderKey reader;
+    uint32_t estimated_bytes = 0u;
 };
 
 struct ChangeState
@@ -148,12 +244,6 @@ struct ChangeState
     steady_clock::time_point last_request;
     steady_clock::time_point last_interest;
     steady_clock::time_point defer_cooldown_until;
-    std::vector<RepairSendAttempt> repair_send_attempts;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-    bool admission_trace_initialized = false;
-    AdaptiveRetransmissionDecision admission_trace_decision =
-            AdaptiveRetransmissionDecision::SEND_NOW;
-#endif // FASTDDS_RETRANSMISSION_TRACE
 };
 
 enum class RecoveryState
@@ -232,8 +322,20 @@ struct WriterState
     uint64_t byte_budget = max_bytes_per_cycle;
     uint64_t previous_repair_send_samples = 0;
     uint64_t previous_repair_timeout_samples = 0;
+    uint64_t previous_repair_no_ack_timeout_samples = 0;
+    uint64_t previous_repair_late_ack_severe_samples = 0;
+    uint64_t previous_repair_attempt_overflow_samples = 0;
+    uint64_t previous_repair_unattributed_send_samples = 0;
     uint64_t previous_repair_send_bytes = 0;
     uint64_t previous_repair_timeout_bytes = 0;
+    uint64_t previous_repair_no_ack_timeout_bytes = 0;
+    uint64_t previous_repair_late_ack_severe_bytes = 0;
+    uint64_t previous_repair_attempt_overflow_bytes = 0;
+    uint64_t previous_repair_unattributed_send_bytes = 0;
+    uint64_t previous_repair_ack_samples = 0;
+    uint64_t previous_repair_ack_bytes = 0;
+    uint64_t repair_unattributed_send_samples = 0;
+    uint64_t repair_unattributed_send_bytes = 0;
     uint64_t previous_feedback_strong_positive_samples = 0;
     uint64_t previous_feedback_normal_samples = 0;
     uint64_t previous_feedback_mild_negative_samples = 0;
@@ -244,7 +346,6 @@ struct WriterState
     uint64_t previous_feedback_severe_negative_bytes = 0;
     double stable_feedback_ms = 0.0;
     uint32_t stable_feedback_calibration_samples = 0;
-    double stable_feedback_calibration_sum_ms = 0.0;
     steady_clock::time_point stable_feedback_calibration_started;
     bool stable_feedback_calibrated = false;
     RecoveryState recovery_state = RecoveryState::NORMAL;
@@ -254,7 +355,6 @@ struct WriterState
     BudgetDecreaseObservation budget_observation;
     double feedback_strong_positive_ratio = default_feedback_strong_positive_ratio;
     double feedback_slow_ratio = default_feedback_slow_ratio;
-    std::map<SequenceNumber_t, SentChangeState> sent_changes;
 };
 
 enum class RepairFeedbackClass
@@ -263,6 +363,12 @@ enum class RepairFeedbackClass
     NORMAL,
     MILD_NEGATIVE,
     SEVERE_NEGATIVE
+};
+
+enum class SevereRepairReason
+{
+    NO_ACK_TIMEOUT,
+    LATE_ACK
 };
 
 struct AdmissionCandidate
@@ -346,10 +452,10 @@ double update_calibrated_feedback_baseline_from_ack_progress(
         }
         return current;
     }
-    if (sample < current && sample * 4.0 >= current * 3.0)
-    {
-        return update_ewma(current, sample);
-    }
+
+    // Stable feedback baseline is a warmup reference. Once calibrated, keep it
+    // fixed so later pressure/recovery phases do not move the classification
+    // threshold.
     return current;
 }
 
@@ -369,12 +475,34 @@ double repair_timeout_window_ms(
     return timeout_ms;
 }
 
+double no_ack_episode_window_ms(
+        const ReaderState& reader)
+{
+    return repair_timeout_window_ms(reader) * no_ack_episode_window_multiplier;
+}
+
+double feedback_classification_window_ms(
+        const ReaderState& reader)
+{
+    return (std::max)(
+        min_repair_timeout_ms,
+        reader.stable_feedback_ms * repair_timeout_baseline_multiplier);
+}
+
+double writer_repair_classification_window_ms(
+        double stable_feedback_ms)
+{
+    return (std::max)(
+        min_repair_timeout_ms,
+        stable_feedback_ms * repair_timeout_baseline_multiplier);
+}
+
 RepairFeedbackClass classify_repair_feedback(
         const ReaderState& reader,
         const WriterState& writer,
         double feedback_ms)
 {
-    const double timeout_ms = repair_timeout_window_ms(reader);
+    const double timeout_ms = feedback_classification_window_ms(reader);
     if (feedback_ms >= timeout_ms)
     {
         return RepairFeedbackClass::SEVERE_NEGATIVE;
@@ -392,7 +520,7 @@ RepairFeedbackClass classify_repair_feedback(
     return RepairFeedbackClass::MILD_NEGATIVE;
 }
 
-void record_classified_repair_feedback(
+void record_classified_feedback(
         ReaderState& reader,
         RepairFeedbackClass feedback_class,
         uint32_t estimated_bytes)
@@ -415,6 +543,135 @@ void record_classified_repair_feedback(
             ++reader.feedback_severe_negative_samples;
             reader.feedback_severe_negative_bytes += estimated_bytes;
             break;
+    }
+}
+
+bool is_positive_feedback_class(
+        RepairFeedbackClass feedback_class)
+{
+    return RepairFeedbackClass::STRONG_POSITIVE == feedback_class ||
+           RepairFeedbackClass::NORMAL == feedback_class;
+}
+
+void record_origin_saturated_positive_feedback(
+        ReaderState& reader,
+        uint32_t estimated_bytes)
+{
+    ++reader.origin_saturated_positive_samples;
+    reader.origin_saturated_positive_bytes += estimated_bytes;
+}
+
+void record_classified_new_feedback(
+        ReaderState& reader,
+        double feedback_ms,
+        RepairFeedbackClass feedback_class,
+        uint32_t estimated_bytes,
+        bool control_evidence)
+{
+    ++reader.new_ack_samples;
+    reader.new_ack_bytes += estimated_bytes;
+    switch (feedback_class)
+    {
+        case RepairFeedbackClass::STRONG_POSITIVE:
+            ++reader.new_ack_strong_positive_samples;
+            reader.new_ack_strong_positive_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::NORMAL:
+            ++reader.new_ack_normal_samples;
+            reader.new_ack_normal_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::MILD_NEGATIVE:
+            ++reader.new_ack_mild_negative_samples;
+            reader.new_ack_mild_negative_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::SEVERE_NEGATIVE:
+            ++reader.new_ack_severe_negative_samples;
+            reader.new_ack_severe_negative_bytes += estimated_bytes;
+            break;
+    }
+    if (control_evidence)
+    {
+        reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms,
+                        feedback_ms);
+        ++reader.feedback_samples;
+        reader.feedback_bytes += estimated_bytes;
+        record_classified_feedback(reader, feedback_class, estimated_bytes);
+    }
+}
+
+void record_classified_repair_feedback(
+        ReaderState& reader,
+        double feedback_ms,
+        RepairFeedbackClass feedback_class,
+        uint32_t estimated_bytes)
+{
+    reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms,
+                    feedback_ms);
+    ++reader.feedback_samples;
+    reader.feedback_bytes += estimated_bytes;
+    ++reader.repair_ack_samples;
+    reader.repair_ack_bytes += estimated_bytes;
+    switch (feedback_class)
+    {
+        case RepairFeedbackClass::STRONG_POSITIVE:
+            ++reader.repair_ack_strong_positive_samples;
+            reader.repair_ack_strong_positive_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::NORMAL:
+            ++reader.repair_ack_normal_samples;
+            reader.repair_ack_normal_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::MILD_NEGATIVE:
+            ++reader.repair_ack_mild_negative_samples;
+            reader.repair_ack_mild_negative_bytes += estimated_bytes;
+            break;
+        case RepairFeedbackClass::SEVERE_NEGATIVE:
+            ++reader.repair_ack_severe_negative_samples;
+            reader.repair_ack_severe_negative_bytes += estimated_bytes;
+            break;
+    }
+    record_classified_feedback(reader, feedback_class, estimated_bytes);
+}
+
+void record_severe_repair_evidence(
+        ReaderState& reader,
+        SevereRepairReason reason,
+        uint32_t estimated_bytes)
+{
+    ++reader.repair_timeout_samples;
+    reader.repair_timeout_bytes += estimated_bytes;
+    if (SevereRepairReason::NO_ACK_TIMEOUT == reason)
+    {
+        ++reader.repair_no_ack_timeout_samples;
+        reader.repair_no_ack_timeout_bytes += estimated_bytes;
+        ++reader.feedback_samples;
+        reader.feedback_bytes += estimated_bytes;
+        record_classified_feedback(
+            reader,
+            RepairFeedbackClass::SEVERE_NEGATIVE,
+            estimated_bytes);
+    }
+    else
+    {
+        ++reader.repair_late_ack_severe_samples;
+        reader.repair_late_ack_severe_bytes += estimated_bytes;
+    }
+}
+
+void mark_pending_new_dirty(
+        ReaderState& reader,
+        const SequenceNumber_t& sequence)
+{
+    if (reader.ack_progress_tracking_started && sequence < reader.last_ack_base)
+    {
+        return;
+    }
+
+    reader.pending_new_dirty_sequences.insert(sequence);
+    while (reader.pending_new_dirty_sequences.size() > max_pending_new_dirty_sequences_per_reader)
+    {
+        reader.pending_new_dirty_sequences.erase(reader.pending_new_dirty_sequences.begin());
+        ++reader.pending_new_dirty_overflow_samples;
     }
 }
 
@@ -524,7 +781,7 @@ double observation_after_severe_share(
 double observation_after_timeout_share(
         const BudgetDecreaseObservation& observation)
 {
-    return ratio(observation.timeout_units, observation.evidence_units);
+    return ratio(observation.timeout_units, observation.repair_active_units);
 }
 
 void start_budget_observation(
@@ -550,8 +807,7 @@ void start_budget_observation(
     writer.budget_observation.max_duration_ms = writer.budget_observation.min_duration_ms * 3.0;
     writer.budget_observation.before_negative_share = ratio(negative_units, evidence_units);
     writer.budget_observation.before_severe_share = ratio(severe_units, evidence_units);
-    writer.budget_observation.before_timeout_share = ratio(timeout_units, evidence_units);
-    static_cast<void>(repair_active_units);
+    writer.budget_observation.before_timeout_share = ratio(timeout_units, repair_active_units);
 }
 
 void accumulate_budget_observation(
@@ -927,9 +1183,11 @@ struct AdaptiveRetransmissionController::Implementation
     std::mutex mutex;
     std::map<ReaderKey, ReaderState> readers;
     std::map<ChangeKey, ChangeState> changes;
+    std::map<ChangeKey, DeliveryEpisode> episodes;
     std::map<GUID_t, WriterState> writers;
     std::map<GUID_t, std::vector<AdmissionCandidate>> cycle_candidates;
-    std::map<ChangeKey, AdaptiveRetransmissionDecision> cycle_plan;
+    std::map<SendPeriodKey, SendPeriodSeal> send_period_seals;
+    std::map<SendPeriodKey, std::vector<PendingOriginPositiveFeedback>> pending_origin_positive_feedback;
 
     size_t outstanding_changes(
             const ReaderKey& key) const
@@ -959,6 +1217,78 @@ struct AdaptiveRetransmissionController::Implementation
         return bytes;
     }
 };
+
+namespace {
+
+void prune_send_period_tracking_locked(
+        std::map<SendPeriodKey, SendPeriodSeal>& send_period_seals,
+        std::map<SendPeriodKey, std::vector<PendingOriginPositiveFeedback>>& pending_origin_positive_feedback,
+        const GUID_t& writer_guid,
+        uint64_t newest_period_id)
+{
+    if (newest_period_id <= max_tracked_send_periods_per_writer)
+    {
+        return;
+    }
+
+    const uint64_t oldest_kept_period_id = newest_period_id - max_tracked_send_periods_per_writer;
+    for (auto it = send_period_seals.begin(); it != send_period_seals.end(); )
+    {
+        if (!(it->first.writer < writer_guid) && !(writer_guid < it->first.writer) &&
+                it->first.period_id < oldest_kept_period_id)
+        {
+            it = send_period_seals.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (auto it = pending_origin_positive_feedback.begin();
+            it != pending_origin_positive_feedback.end(); )
+    {
+        if (!(it->first.writer < writer_guid) && !(writer_guid < it->first.writer) &&
+                it->first.period_id < oldest_kept_period_id)
+        {
+            it = pending_origin_positive_feedback.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+void record_origin_positive_feedback_locked(
+        std::map<ReaderKey, ReaderState>& readers,
+        std::map<SendPeriodKey, SendPeriodSeal>& send_period_seals,
+        std::map<SendPeriodKey, std::vector<PendingOriginPositiveFeedback>>& pending_origin_positive_feedback,
+        const ReaderKey& reader_key,
+        uint64_t period_id,
+        RepairFeedbackClass feedback_class,
+        uint32_t estimated_bytes)
+{
+    if (0u == period_id || !is_positive_feedback_class(feedback_class))
+    {
+        return;
+    }
+
+    const SendPeriodKey period_key {reader_key.writer, period_id};
+    const auto seal = send_period_seals.find(period_key);
+    if (seal != send_period_seals.end())
+    {
+        if (seal->second.saturated)
+        {
+            record_origin_saturated_positive_feedback(readers[reader_key], estimated_bytes);
+        }
+        return;
+    }
+
+    pending_origin_positive_feedback[period_key].push_back(
+        PendingOriginPositiveFeedback {reader_key, estimated_bytes});
+}
+
+} // namespace
 
 AdaptiveRetransmissionController& AdaptiveRetransmissionController::instance()
 {
@@ -1013,68 +1343,74 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
 
     const GUID_t writer_guid = writer->getGuid();
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto now = steady_clock::now();
-    for (auto& item : impl_->changes)
+    const auto writer_it = impl_->writers.find(writer_guid);
+    if (writer_it != impl_->writers.end())
     {
-        if (item.first.path.writer != writer_guid ||
-                item.second.repair_send_attempts.empty())
+        snapshot.repair_unattributed_send_samples = writer_it->second.repair_unattributed_send_samples;
+        snapshot.repair_unattributed_send_bytes = writer_it->second.repair_unattributed_send_bytes;
+    }
+    const auto now = steady_clock::now();
+    for (auto it = impl_->episodes.begin(); it != impl_->episodes.end(); )
+    {
+        if (it->first.path.writer != writer_guid ||
+                !it->second.has_repair_send)
         {
+            ++it;
             continue;
         }
 
-        auto reader_it = impl_->readers.find(item.first.path);
+        auto reader_it = impl_->readers.find(it->first.path);
         if (reader_it == impl_->readers.end() ||
                 !reader_it->second.stable_feedback_calibrated ||
                 reader_it->second.stable_feedback_ms <= 0.0)
         {
+            ++it;
             continue;
         }
 
         const double timeout_ms = repair_timeout_window_ms(reader_it->second);
-        for (RepairSendAttempt& attempt : item.second.repair_send_attempts)
+        const double episode_timeout_ms = no_ack_episode_window_ms(reader_it->second);
+        const steady_clock::time_point first_repair_send_time =
+                it->second.first_repair_send_time == steady_clock::time_point() ?
+                it->second.first_send_time : it->second.first_repair_send_time;
+        const double pending_since_last_ms = std::chrono::duration<double, std::milli>(
+            now - it->second.last_send_time).count();
+        const double pending_since_first_ms = std::chrono::duration<double, std::milli>(
+            now - first_repair_send_time).count();
+        if (pending_since_last_ms < timeout_ms && pending_since_first_ms < episode_timeout_ms)
         {
-            if (attempt.feedback_classified)
-            {
-                continue;
-            }
-
-            const double pending_ms = std::chrono::duration<double, std::milli>(
-                now - attempt.sent_time).count();
-            if (pending_ms < timeout_ms)
-            {
-                continue;
-            }
-
-            const uint32_t timeout_bytes = attempt.estimated_bytes > 0u ?
-                    attempt.estimated_bytes : item.second.estimated_bytes;
-            attempt.timeout_reported = true;
-            attempt.feedback_classified = true;
-            ++reader_it->second.repair_timeout_samples;
-            reader_it->second.repair_timeout_bytes += timeout_bytes;
-            record_classified_repair_feedback(
-                reader_it->second,
-                RepairFeedbackClass::SEVERE_NEGATIVE,
-                timeout_bytes);
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            std::ostringstream detail;
-            detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
-                   << ";source=repair_timeout"
-                   << ";pending_ms=" << pending_ms
-                   << ";timeout_ms=" << timeout_ms
-                   << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
-                   << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
-                   << ";feedback_class=severe_negative"
-                   << ";repair_send_attempts=" << item.second.repair_send_attempts.size()
-                   << ";attempt_send_bytes=" << attempt.estimated_bytes;
-            FASTDDS_TRACE_RETRANSMISSION(
-                writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
-                writer->getGuid(),
-                item.first.path.reader,
-                item.first.sequence,
-                item.second.estimated_bytes,
-                detail.str());
-#endif // FASTDDS_RETRANSMISSION_TRACE
+            ++it;
+            continue;
         }
+
+        const uint32_t timeout_bytes = it->second.estimated_bytes;
+        record_severe_repair_evidence(
+            reader_it->second,
+            SevereRepairReason::NO_ACK_TIMEOUT,
+            timeout_bytes);
+        reader_it->second.pending_new_dirty_sequences.erase(it->first.sequence);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        std::ostringstream detail;
+        detail << "mode=" << controller_mode_name(const_cast<StatefulWriter&>(*writer))
+               << ";source=delivery_episode_timeout"
+               << ";pending_since_last_ms=" << pending_since_last_ms
+               << ";pending_since_first_ms=" << pending_since_first_ms
+               << ";no_ack_timeout_ms=" << timeout_ms
+               << ";no_ack_episode_window_ms=" << episode_timeout_ms
+               << ";stable_feedback_ms=" << reader_it->second.stable_feedback_ms
+               << ";request_interval_ewma_ms=" << reader_it->second.request_interval_ewma_ms
+               << ";feedback_class=severe_negative"
+               << ";episode_send_count=" << it->second.send_count
+               << ";episode_generation=" << it->second.generation;
+        FASTDDS_TRACE_RETRANSMISSION(
+            writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
+            writer->getGuid(),
+            it->first.path.reader,
+            it->first.sequence,
+            timeout_bytes,
+            detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        it = impl_->episodes.erase(it);
     }
 
     std::map<GUID_t, std::size_t> reader_path_indices;
@@ -1088,10 +1424,47 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             reader_snapshot.feedback_samples = item.second.feedback_samples;
             reader_snapshot.request_bytes = item.second.request_bytes;
             reader_snapshot.feedback_bytes = item.second.feedback_bytes;
+            reader_snapshot.new_send_samples = item.second.new_send_samples;
+            reader_snapshot.new_send_bytes = item.second.new_send_bytes;
+            reader_snapshot.new_ack_samples = item.second.new_ack_samples;
+            reader_snapshot.new_ack_bytes = item.second.new_ack_bytes;
+            reader_snapshot.new_ack_dirty_skipped_samples = item.second.new_ack_dirty_skipped_samples;
+            reader_snapshot.new_ack_dirty_skipped_bytes = item.second.new_ack_dirty_skipped_bytes;
+            reader_snapshot.new_ack_inconclusive_samples = item.second.new_ack_inconclusive_samples;
+            reader_snapshot.new_ack_inconclusive_bytes = item.second.new_ack_inconclusive_bytes;
+            reader_snapshot.pending_new_dirty_overflow_samples = item.second.pending_new_dirty_overflow_samples;
+            reader_snapshot.new_ack_strong_positive_samples = item.second.new_ack_strong_positive_samples;
+            reader_snapshot.new_ack_strong_positive_bytes = item.second.new_ack_strong_positive_bytes;
+            reader_snapshot.new_ack_normal_samples = item.second.new_ack_normal_samples;
+            reader_snapshot.new_ack_normal_bytes = item.second.new_ack_normal_bytes;
+            reader_snapshot.new_ack_mild_negative_samples = item.second.new_ack_mild_negative_samples;
+            reader_snapshot.new_ack_mild_negative_bytes = item.second.new_ack_mild_negative_bytes;
+            reader_snapshot.new_ack_severe_negative_samples = item.second.new_ack_severe_negative_samples;
+            reader_snapshot.new_ack_severe_negative_bytes = item.second.new_ack_severe_negative_bytes;
             reader_snapshot.repair_send_samples = item.second.repair_send_samples;
             reader_snapshot.repair_send_bytes = item.second.repair_send_bytes;
+            reader_snapshot.repair_ack_samples = item.second.repair_ack_samples;
+            reader_snapshot.repair_ack_bytes = item.second.repair_ack_bytes;
+            reader_snapshot.repair_ack_strong_positive_samples = item.second.repair_ack_strong_positive_samples;
+            reader_snapshot.repair_ack_strong_positive_bytes = item.second.repair_ack_strong_positive_bytes;
+            reader_snapshot.repair_ack_normal_samples = item.second.repair_ack_normal_samples;
+            reader_snapshot.repair_ack_normal_bytes = item.second.repair_ack_normal_bytes;
+            reader_snapshot.repair_ack_mild_negative_samples = item.second.repair_ack_mild_negative_samples;
+            reader_snapshot.repair_ack_mild_negative_bytes = item.second.repair_ack_mild_negative_bytes;
+            reader_snapshot.repair_ack_severe_negative_samples = item.second.repair_ack_severe_negative_samples;
+            reader_snapshot.repair_ack_severe_negative_bytes = item.second.repair_ack_severe_negative_bytes;
             reader_snapshot.repair_timeout_samples = item.second.repair_timeout_samples;
             reader_snapshot.repair_timeout_bytes = item.second.repair_timeout_bytes;
+            reader_snapshot.repair_no_ack_timeout_samples = item.second.repair_no_ack_timeout_samples;
+            reader_snapshot.repair_no_ack_timeout_bytes = item.second.repair_no_ack_timeout_bytes;
+            reader_snapshot.repair_late_ack_severe_samples = item.second.repair_late_ack_severe_samples;
+            reader_snapshot.repair_late_ack_severe_bytes = item.second.repair_late_ack_severe_bytes;
+            reader_snapshot.repair_attempt_overflow_samples = item.second.repair_attempt_overflow_samples;
+            reader_snapshot.repair_attempt_overflow_bytes = item.second.repair_attempt_overflow_bytes;
+            reader_snapshot.repair_unattributed_send_samples =
+                    item.second.repair_unattributed_send_samples;
+            reader_snapshot.repair_unattributed_send_bytes =
+                    item.second.repair_unattributed_send_bytes;
             reader_snapshot.feedback_strong_positive_samples = item.second.feedback_strong_positive_samples;
             reader_snapshot.feedback_strong_positive_bytes = item.second.feedback_strong_positive_bytes;
             reader_snapshot.feedback_normal_samples = item.second.feedback_normal_samples;
@@ -1100,6 +1473,8 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             reader_snapshot.feedback_mild_negative_bytes = item.second.feedback_mild_negative_bytes;
             reader_snapshot.feedback_severe_negative_samples = item.second.feedback_severe_negative_samples;
             reader_snapshot.feedback_severe_negative_bytes = item.second.feedback_severe_negative_bytes;
+            reader_snapshot.origin_saturated_positive_samples = item.second.origin_saturated_positive_samples;
+            reader_snapshot.origin_saturated_positive_bytes = item.second.origin_saturated_positive_bytes;
             reader_snapshot.request_interval_ewma_ms = item.second.request_interval_ewma_ms;
             reader_snapshot.recovery_feedback_ewma_ms = item.second.recovery_feedback_ewma_ms;
             reader_snapshot.stable_feedback_ms = item.second.stable_feedback_ms;
@@ -1118,10 +1493,45 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             snapshot.feedback_samples += item.second.feedback_samples;
             snapshot.request_bytes += item.second.request_bytes;
             snapshot.feedback_bytes += item.second.feedback_bytes;
+            snapshot.new_send_samples += item.second.new_send_samples;
+            snapshot.new_send_bytes += item.second.new_send_bytes;
+            snapshot.new_ack_samples += item.second.new_ack_samples;
+            snapshot.new_ack_bytes += item.second.new_ack_bytes;
+            snapshot.new_ack_dirty_skipped_samples += item.second.new_ack_dirty_skipped_samples;
+            snapshot.new_ack_dirty_skipped_bytes += item.second.new_ack_dirty_skipped_bytes;
+            snapshot.new_ack_inconclusive_samples += item.second.new_ack_inconclusive_samples;
+            snapshot.new_ack_inconclusive_bytes += item.second.new_ack_inconclusive_bytes;
+            snapshot.pending_new_dirty_overflow_samples += item.second.pending_new_dirty_overflow_samples;
+            snapshot.new_ack_strong_positive_samples += item.second.new_ack_strong_positive_samples;
+            snapshot.new_ack_strong_positive_bytes += item.second.new_ack_strong_positive_bytes;
+            snapshot.new_ack_normal_samples += item.second.new_ack_normal_samples;
+            snapshot.new_ack_normal_bytes += item.second.new_ack_normal_bytes;
+            snapshot.new_ack_mild_negative_samples += item.second.new_ack_mild_negative_samples;
+            snapshot.new_ack_mild_negative_bytes += item.second.new_ack_mild_negative_bytes;
+            snapshot.new_ack_severe_negative_samples += item.second.new_ack_severe_negative_samples;
+            snapshot.new_ack_severe_negative_bytes += item.second.new_ack_severe_negative_bytes;
             snapshot.repair_send_samples += item.second.repair_send_samples;
             snapshot.repair_send_bytes += item.second.repair_send_bytes;
+            snapshot.repair_ack_samples += item.second.repair_ack_samples;
+            snapshot.repair_ack_bytes += item.second.repair_ack_bytes;
+            snapshot.repair_ack_strong_positive_samples += item.second.repair_ack_strong_positive_samples;
+            snapshot.repair_ack_strong_positive_bytes += item.second.repair_ack_strong_positive_bytes;
+            snapshot.repair_ack_normal_samples += item.second.repair_ack_normal_samples;
+            snapshot.repair_ack_normal_bytes += item.second.repair_ack_normal_bytes;
+            snapshot.repair_ack_mild_negative_samples += item.second.repair_ack_mild_negative_samples;
+            snapshot.repair_ack_mild_negative_bytes += item.second.repair_ack_mild_negative_bytes;
+            snapshot.repair_ack_severe_negative_samples += item.second.repair_ack_severe_negative_samples;
+            snapshot.repair_ack_severe_negative_bytes += item.second.repair_ack_severe_negative_bytes;
             snapshot.repair_timeout_samples += item.second.repair_timeout_samples;
             snapshot.repair_timeout_bytes += item.second.repair_timeout_bytes;
+            snapshot.repair_no_ack_timeout_samples += item.second.repair_no_ack_timeout_samples;
+            snapshot.repair_no_ack_timeout_bytes += item.second.repair_no_ack_timeout_bytes;
+            snapshot.repair_late_ack_severe_samples += item.second.repair_late_ack_severe_samples;
+            snapshot.repair_late_ack_severe_bytes += item.second.repair_late_ack_severe_bytes;
+            snapshot.repair_attempt_overflow_samples += item.second.repair_attempt_overflow_samples;
+            snapshot.repair_attempt_overflow_bytes += item.second.repair_attempt_overflow_bytes;
+            snapshot.repair_unattributed_send_samples += item.second.repair_unattributed_send_samples;
+            snapshot.repair_unattributed_send_bytes += item.second.repair_unattributed_send_bytes;
             snapshot.feedback_strong_positive_samples += item.second.feedback_strong_positive_samples;
             snapshot.feedback_strong_positive_bytes += item.second.feedback_strong_positive_bytes;
             snapshot.feedback_normal_samples += item.second.feedback_normal_samples;
@@ -1130,6 +1540,8 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
             snapshot.feedback_mild_negative_bytes += item.second.feedback_mild_negative_bytes;
             snapshot.feedback_severe_negative_samples += item.second.feedback_severe_negative_samples;
             snapshot.feedback_severe_negative_bytes += item.second.feedback_severe_negative_bytes;
+            snapshot.origin_saturated_positive_samples += item.second.origin_saturated_positive_samples;
+            snapshot.origin_saturated_positive_bytes += item.second.origin_saturated_positive_bytes;
             snapshot.request_interval_ewma_ms = std::max(
                 snapshot.request_interval_ewma_ms,
                 item.second.request_interval_ewma_ms);
@@ -1213,7 +1625,12 @@ void AdaptiveRetransmissionController::on_requested(
         ++reader.request_samples;
         reader.request_bytes += estimated_bytes;
         reader.last_request = now;
-        reader.repair_tainted_sequences.insert(change.sequenceNumber);
+        mark_pending_new_dirty(reader, change.sequenceNumber);
+        auto episode = impl_->episodes.find(change_key);
+        if (episode != impl_->episodes.end())
+        {
+            episode->second.dirty = true;
+        }
 
         ChangeState& observed = impl_->changes[change_key];
         if (0 == observed.requests)
@@ -1277,7 +1694,12 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         ReaderState& reader = impl_->readers[reader_key];
-        reader.repair_tainted_sequences.insert(change.sequenceNumber);
+        mark_pending_new_dirty(reader, change.sequenceNumber);
+        auto episode = impl_->episodes.find(change_key);
+        if (episode != impl_->episodes.end())
+        {
+            episode->second.dirty = true;
+        }
         ChangeState& observed = impl_->changes[change_key];
         if (0 == observed.requests)
         {
@@ -1313,10 +1735,77 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
         trace_detail);
 }
 
+void AdaptiveRetransmissionController::on_initial_old_sample_enqueued(
+        StatefulWriter* writer,
+        const GUID_t& reader_guid,
+        const CacheChange_t& change,
+        bool queued)
+{
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+    static_cast<void>(queued);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+    if (nullptr == writer)
+    {
+        return;
+    }
+
+    const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
+    const bool sync_admission = admission_enabled(*writer);
+    if (!sync_admission && !async_feedback_accounting)
+    {
+        return;
+    }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    bool dirty_pending_new = false;
+    std::size_t open_delivery_episodes = 0u;
+    std::size_t pending_new_dirty_sequences = 0u;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const ReaderKey reader_key {writer->getGuid(), reader_guid};
+        const ChangeKey change_key {reader_key, change.sequenceNumber};
+        ReaderState& reader = impl_->readers[reader_key];
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        dirty_pending_new = impl_->episodes.find(change_key) != impl_->episodes.end();
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        mark_pending_new_dirty(reader, change.sequenceNumber);
+        auto episode = impl_->episodes.find(change_key);
+        if (episode != impl_->episodes.end())
+        {
+            episode->second.dirty = true;
+        }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+        open_delivery_episodes = impl_->episodes.size();
+        pending_new_dirty_sequences = reader.pending_new_dirty_sequences.size();
+#endif // FASTDDS_RETRANSMISSION_TRACE
+    }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::ostringstream detail;
+    detail << "mode=" << controller_mode_name(*writer)
+           << ";queued=" << queued
+           << ";reason=INITIAL_ACKNACK"
+           << ";evidence=out_of_scope"
+           << ";dirty_pending_new=" << dirty_pending_new
+           << ";open_delivery_episodes=" << open_delivery_episodes
+           << ";pending_new_dirty_sequences=" << pending_new_dirty_sequences;
+    FASTDDS_TRACE_RETRANSMISSION(
+        writer->isAsync() ? "ADAPT_ASYNC_INITIAL_OLD_SAMPLE_ENQUEUED" : "INITIAL_OLD_SAMPLE_ENQUEUED_PROXY",
+        writer->getGuid(),
+        reader_guid,
+        change.sequenceNumber,
+        change.serializedPayload.length,
+        detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
+}
+
 void AdaptiveRetransmissionController::on_repair_sample_sent(
         StatefulWriter* writer,
         const CacheChange_t& change,
-        bool old_sample)
+        bool old_sample,
+        const std::vector<GUID_t>& served_readers,
+        uint64_t send_period_id)
 {
     if (nullptr == writer)
     {
@@ -1340,82 +1829,139 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
         uint32_t estimated_bytes;
         std::string detail;
     };
+    struct NewSendTrace
+    {
+        GUID_t reader;
+        SequenceNumber_t sequence;
+        uint32_t estimated_bytes;
+        std::string detail;
+    };
     std::vector<RepairSendTrace> repair_send_traces;
+    std::vector<NewSendTrace> new_send_traces;
+    bool unattributed_old_send = false;
+    bool unattributed_new_send = false;
+    uint32_t unattributed_old_reader_paths = 0u;
+    const char* unattributed_old_reason = "no_served_reader_set";
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        WriterState& writer_state = impl_->writers[writer->getGuid()];
-        const bool track_clean_new_send = !old_sample && (async_feedback_accounting || sync_admission);
-        const bool track_async_old_send = old_sample && async_feedback_accounting &&
-                writer_state.sent_changes.find(change.sequenceNumber) == writer_state.sent_changes.end();
-        if (track_clean_new_send || track_async_old_send)
-        {
-            SentChangeState& sent = writer_state.sent_changes[change.sequenceNumber];
-            sent.sent_time = now;
-            sent.estimated_bytes = change.serializedPayload.length;
-            sent.old_sample = old_sample;
-        }
+        const GUID_t writer_guid = writer->getGuid();
+        WriterState& writer_state = impl_->writers[writer_guid];
+        std::vector<GUID_t> unique_served_readers = served_readers;
+        std::sort(unique_served_readers.begin(), unique_served_readers.end());
+        unique_served_readers.erase(
+            std::unique(unique_served_readers.begin(), unique_served_readers.end()),
+            unique_served_readers.end());
 
-        while ((async_feedback_accounting || sync_admission) &&
-                writer_state.sent_changes.size() > max_sent_ack_tracking_per_writer)
+        if (!old_sample)
         {
-            writer_state.sent_changes.erase(writer_state.sent_changes.begin());
+            if (unique_served_readers.empty())
+            {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                unattributed_new_send = true;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            }
+            for (const GUID_t& reader_guid : unique_served_readers)
+            {
+                const ReaderKey reader_key {writer_guid, reader_guid};
+                const ChangeKey change_key {reader_key, change.sequenceNumber};
+                ReaderState& reader = impl_->readers[reader_key];
+                DeliveryEpisode& episode = impl_->episodes[change_key];
+                if (0u == episode.send_count)
+                {
+                    episode.first_send_time = now;
+                    episode.generation++;
+                }
+                episode.last_send_time = now;
+                episode.last_send_period_id = send_period_id;
+                episode.estimated_bytes = change.serializedPayload.length;
+                episode.has_new_send = true;
+                episode.dirty = episode.dirty ||
+                        reader.pending_new_dirty_sequences.find(change.sequenceNumber) !=
+                        reader.pending_new_dirty_sequences.end();
+                ++episode.send_count;
+                reader.pending_new_dirty_sequences.erase(change.sequenceNumber);
+                ++reader.new_send_samples;
+                reader.new_send_bytes += change.serializedPayload.length;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                std::ostringstream detail;
+                detail << "mode=" << controller_mode_name(*writer)
+                       << ";source=actual_new_send"
+                       << ";old_sample=" << old_sample
+                       << ";episode_send_count=" << episode.send_count
+                       << ";send_period_id=" << send_period_id
+                       << ";episode_dirty=" << episode.dirty
+                       << ";episode_generation=" << episode.generation
+                       << ";estimated_bytes=" << change.serializedPayload.length
+                       << ";stable_feedback_ms=" << reader.stable_feedback_ms
+                       << ";stable_feedback_calibrated=" << reader.stable_feedback_calibrated;
+                new_send_traces.push_back(
+                    NewSendTrace
+                    {
+                        reader_guid,
+                        change.sequenceNumber,
+                        change.serializedPayload.length,
+                        detail.str()
+                    });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            }
         }
-
-        if (old_sample)
+        else if (unique_served_readers.empty())
         {
+            ++writer_state.repair_unattributed_send_samples;
+            writer_state.repair_unattributed_send_bytes += change.serializedPayload.length;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            unattributed_old_send = true;
+            unattributed_old_reader_paths = 1u;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+        }
+        else if (old_sample)
+        {
+            std::set<GUID_t> accounted_readers;
             for (auto& item : impl_->changes)
             {
                 if (item.first.path.writer != writer->getGuid() ||
                         item.first.sequence != change.sequenceNumber ||
-                        item.second.last_interest == steady_clock::time_point())
+                        item.second.last_interest == steady_clock::time_point() ||
+                        std::find(unique_served_readers.begin(), unique_served_readers.end(), item.first.path.reader) ==
+                        unique_served_readers.end())
                 {
                     continue;
                 }
 
                 ReaderState& reader = impl_->readers[item.first.path];
-                ChangeState& observed = item.second;
-                while (observed.repair_send_attempts.size() >= max_repair_send_attempts_per_change)
+                mark_pending_new_dirty(reader, item.first.sequence);
+                DeliveryEpisode& episode = impl_->episodes[item.first];
+                if (0u == episode.send_count)
                 {
-                    RepairSendAttempt& evicted_attempt = observed.repair_send_attempts.front();
-                    if (!evicted_attempt.feedback_classified &&
-                            reader.stable_feedback_calibrated &&
-                            reader.stable_feedback_ms > 0.0)
-                    {
-                        const double timeout_ms = repair_timeout_window_ms(reader);
-                        const double pending_ms = std::chrono::duration<double, std::milli>(
-                            now - evicted_attempt.sent_time).count();
-                        if (pending_ms >= timeout_ms)
-                        {
-                            const uint32_t timeout_bytes = evicted_attempt.estimated_bytes > 0u ?
-                                    evicted_attempt.estimated_bytes : observed.estimated_bytes;
-                            ++reader.repair_timeout_samples;
-                            reader.repair_timeout_bytes += timeout_bytes;
-                            record_classified_repair_feedback(
-                                reader,
-                                RepairFeedbackClass::SEVERE_NEGATIVE,
-                                timeout_bytes);
-                        }
-                    }
-                    observed.repair_send_attempts.erase(observed.repair_send_attempts.begin());
+                    episode.first_send_time = now;
+                    episode.generation++;
                 }
+                episode.last_send_time = now;
+                episode.last_send_period_id = send_period_id;
+                episode.estimated_bytes = change.serializedPayload.length;
+                if (!episode.has_repair_send)
+                {
+                    episode.first_repair_send_time = now;
+                }
+                episode.has_repair_send = true;
+                episode.dirty = true;
+                ++episode.send_count;
 
-                RepairSendAttempt attempt;
-                attempt.sent_time = now;
-                attempt.estimated_bytes = change.serializedPayload.length;
-                observed.repair_send_attempts.push_back(attempt);
-
-                reader.repair_tainted_sequences.insert(item.first.sequence);
                 ++reader.repair_send_samples;
                 reader.repair_send_bytes += change.serializedPayload.length;
+                accounted_readers.insert(item.first.path.reader);
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
                 std::ostringstream detail;
                 detail << "mode=" << controller_mode_name(*writer)
                        << ";source=actual_repair_send"
                        << ";old_sample=" << old_sample
-                       << ";repair_send_attempts=" << observed.repair_send_attempts.size()
+                       << ";episode_send_count=" << episode.send_count
+                       << ";send_period_id=" << send_period_id
+                       << ";episode_generation=" << episode.generation
+                       << ";episode_had_new_send=" << episode.has_new_send
                        << ";estimated_bytes=" << change.serializedPayload.length
                        << ";path_outstanding_changes=" << impl_->outstanding_changes(item.first.path)
                        << ";path_outstanding_bytes=" << impl_->outstanding_bytes(item.first.path)
@@ -1431,10 +1977,68 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                     });
 #endif // FASTDDS_RETRANSMISSION_TRACE
             }
+            for (const GUID_t& reader_guid : unique_served_readers)
+            {
+                if (accounted_readers.find(reader_guid) == accounted_readers.end())
+                {
+                    ++writer_state.repair_unattributed_send_samples;
+                    writer_state.repair_unattributed_send_bytes += change.serializedPayload.length;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    unattributed_old_send = true;
+                    ++unattributed_old_reader_paths;
+                    unattributed_old_reason = "no_matching_interest";
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+            }
         }
     }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
+    if (unattributed_old_send)
+    {
+        std::ostringstream detail;
+        detail << "mode=" << controller_mode_name(*writer)
+               << ";source=actual_repair_send"
+               << ";old_sample=" << old_sample
+               << ";served_readers=0"
+               << ";evidence=out_of_scope"
+               << ";reason=" << unattributed_old_reason
+               << ";unattributed_reader_paths=" << unattributed_old_reader_paths;
+        FASTDDS_TRACE_RETRANSMISSION(
+            writer->isAsync() ? "ADAPT_ASYNC_REPAIR_SAMPLE_UNATTRIBUTED" : "REPAIR_SAMPLE_UNATTRIBUTED_PROXY",
+            writer->getGuid(),
+            GUID_t::unknown(),
+            change.sequenceNumber,
+            change.serializedPayload.length,
+            detail.str());
+    }
+    if (unattributed_new_send)
+    {
+        std::ostringstream detail;
+        detail << "mode=" << controller_mode_name(*writer)
+               << ";source=actual_new_send"
+               << ";old_sample=" << old_sample
+               << ";served_readers=0"
+               << ";evidence=out_of_scope"
+               << ";reason=no_served_reader_set";
+        FASTDDS_TRACE_RETRANSMISSION(
+            writer->isAsync() ? "ADAPT_ASYNC_NEW_SAMPLE_UNATTRIBUTED" : "NEW_SAMPLE_UNATTRIBUTED_PROXY",
+            writer->getGuid(),
+            GUID_t::unknown(),
+            change.sequenceNumber,
+            change.serializedPayload.length,
+            detail.str());
+    }
+    for (const NewSendTrace& trace : new_send_traces)
+    {
+        FASTDDS_TRACE_RETRANSMISSION(
+            writer->isAsync() ? "ADAPT_ASYNC_NEW_SAMPLE_SENT" : "NEW_SAMPLE_SENT_PROXY",
+            writer->getGuid(),
+            trace.reader,
+            trace.sequence,
+            trace.estimated_bytes,
+            trace.detail);
+    }
     for (const RepairSendTrace& trace : repair_send_traces)
     {
         FASTDDS_TRACE_RETRANSMISSION(
@@ -1448,12 +2052,84 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
-void AdaptiveRetransmissionController::on_async_sample_sent(
+void AdaptiveRetransmissionController::on_new_sample_sent(
         StatefulWriter* writer,
         const CacheChange_t& change,
-        bool old_sample)
+        const std::vector<GUID_t>& served_readers,
+        uint64_t send_period_id)
 {
-    on_repair_sample_sent(writer, change, old_sample);
+    on_repair_sample_sent(writer, change, false, served_readers, send_period_id);
+}
+
+void AdaptiveRetransmissionController::on_async_send_period_sealed(
+        StatefulWriter* writer,
+        uint64_t period_id,
+        uint64_t selected_bytes,
+        uint64_t active_load_floor_bytes,
+        bool saturated)
+{
+    if (nullptr == writer || 0u == period_id || !async_feedback_accounting_enabled(*writer))
+    {
+        return;
+    }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    uint64_t released_positive_samples = 0u;
+    uint64_t released_positive_bytes = 0u;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        const SendPeriodKey period_key {writer->getGuid(), period_id};
+        impl_->send_period_seals[period_key] = SendPeriodSeal {
+            selected_bytes,
+            active_load_floor_bytes,
+            saturated
+        };
+
+        auto pending = impl_->pending_origin_positive_feedback.find(period_key);
+        if (pending != impl_->pending_origin_positive_feedback.end())
+        {
+            if (saturated)
+            {
+                for (const PendingOriginPositiveFeedback& feedback : pending->second)
+                {
+                    record_origin_saturated_positive_feedback(
+                        impl_->readers[feedback.reader],
+                        feedback.estimated_bytes);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    ++released_positive_samples;
+                    released_positive_bytes += feedback.estimated_bytes;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+            }
+            impl_->pending_origin_positive_feedback.erase(pending);
+        }
+
+        prune_send_period_tracking_locked(
+            impl_->send_period_seals,
+            impl_->pending_origin_positive_feedback,
+            writer->getGuid(),
+            period_id);
+    }
+
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::ostringstream detail;
+    detail << "mode=" << controller_mode_name(*writer)
+           << ";period_id=" << period_id
+           << ";selected_bytes=" << selected_bytes
+           << ";active_load_floor_bytes=" << active_load_floor_bytes
+           << ";saturated=" << saturated
+           << ";released_origin_saturated_positive_samples=" << released_positive_samples
+           << ";released_origin_saturated_positive_bytes=" << released_positive_bytes;
+    FASTDDS_TRACE_RETRANSMISSION(
+        "ADAPT_ASYNC_SEND_PERIOD_SEALED",
+        writer->getGuid(),
+        GUID_t::unknown(),
+        SequenceNumber_t::unknown(),
+        0,
+        detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 void AdaptiveRetransmissionController::begin_admission_cycle(
@@ -1466,25 +2142,6 @@ void AdaptiveRetransmissionController::begin_admission_cycle(
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->cycle_candidates[writer->getGuid()].clear();
-    for (auto it = impl_->cycle_plan.begin(); it != impl_->cycle_plan.end(); )
-    {
-        if (it->first.path.writer == writer->getGuid())
-        {
-            it = impl_->cycle_plan.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
-    for (auto& item : impl_->readers)
-    {
-        if (item.first.writer == writer->getGuid())
-        {
-            item.second.admitted_changes_in_cycle = 0;
-            item.second.admitted_bytes_in_cycle = 0;
-        }
-    }
 }
 
 bool AdaptiveRetransmissionController::admission_planning_enabled(
@@ -1528,12 +2185,13 @@ void AdaptiveRetransmissionController::add_admission_candidate(
     impl_->cycle_candidates[writer->getGuid()].push_back(candidate);
 }
 
-void AdaptiveRetransmissionController::finalize_admission_cycle(
+std::vector<AdaptiveRetransmissionPlanEntry> AdaptiveRetransmissionController::finalize_admission_cycle(
         StatefulWriter* writer)
 {
+    std::vector<AdaptiveRetransmissionPlanEntry> plan;
     if (nullptr == writer || !admission_enabled(*writer))
     {
-        return;
+        return plan;
     }
 
     feedback_snapshot(writer);
@@ -1591,7 +2249,13 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     now < observed.defer_cooldown_until;
             if (cooldown_active)
             {
-                impl_->cycle_plan[candidate.key] = AdaptiveRetransmissionDecision::DEFER;
+                plan.push_back(
+                    AdaptiveRetransmissionPlanEntry
+                    {
+                        candidate.key.path.reader,
+                        candidate.key.sequence,
+                        AdaptiveRetransmissionDecision::DEFER
+                    });
                 ++cooldown_skipped_changes;
                 cooldown_skipped_bytes += candidate.estimated_bytes;
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -1630,9 +2294,19 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
 
         WriterState& writer_state = impl_->writers[writer->getGuid()];
         uint64_t repair_send_samples = 0;
+        uint64_t repair_ack_samples = 0;
         uint64_t repair_timeout_samples = 0;
+        uint64_t repair_no_ack_timeout_samples = 0;
+        uint64_t repair_late_ack_severe_samples = 0;
+        uint64_t repair_attempt_overflow_samples = 0;
+        uint64_t repair_unattributed_send_samples = 0;
         uint64_t repair_send_bytes = 0;
+        uint64_t repair_ack_bytes = 0;
         uint64_t repair_timeout_bytes = 0;
+        uint64_t repair_no_ack_timeout_bytes = 0;
+        uint64_t repair_late_ack_severe_bytes = 0;
+        uint64_t repair_attempt_overflow_bytes = 0;
+        uint64_t repair_unattributed_send_bytes = 0;
         uint64_t strong_positive_samples = 0;
         uint64_t normal_samples = 0;
         uint64_t mild_negative_samples = 0;
@@ -1643,14 +2317,26 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         uint64_t severe_negative_bytes = 0;
         bool calibrated_feedback_available = false;
         double calibrated_feedback_ms = 0.0;
+        repair_unattributed_send_samples = writer_state.repair_unattributed_send_samples;
+        repair_unattributed_send_bytes = writer_state.repair_unattributed_send_bytes;
         for (const auto& item : impl_->readers)
         {
             if (item.first.writer == writer->getGuid())
             {
                 repair_send_samples += item.second.repair_send_samples;
+                repair_ack_samples += item.second.repair_ack_samples;
                 repair_timeout_samples += item.second.repair_timeout_samples;
+                repair_no_ack_timeout_samples += item.second.repair_no_ack_timeout_samples;
+                repair_late_ack_severe_samples += item.second.repair_late_ack_severe_samples;
+                repair_attempt_overflow_samples += item.second.repair_attempt_overflow_samples;
+                repair_unattributed_send_samples += item.second.repair_unattributed_send_samples;
                 repair_send_bytes += item.second.repair_send_bytes;
+                repair_ack_bytes += item.second.repair_ack_bytes;
                 repair_timeout_bytes += item.second.repair_timeout_bytes;
+                repair_no_ack_timeout_bytes += item.second.repair_no_ack_timeout_bytes;
+                repair_late_ack_severe_bytes += item.second.repair_late_ack_severe_bytes;
+                repair_attempt_overflow_bytes += item.second.repair_attempt_overflow_bytes;
+                repair_unattributed_send_bytes += item.second.repair_unattributed_send_bytes;
                 strong_positive_samples += item.second.feedback_strong_positive_samples;
                 normal_samples += item.second.feedback_normal_samples;
                 mild_negative_samples += item.second.feedback_mild_negative_samples;
@@ -1671,16 +2357,10 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
 
         if (calibrated_feedback_available && calibrated_feedback_ms > 0.0)
         {
-            writer_state.stable_feedback_calibrated = true;
-            if (0.0 == writer_state.stable_feedback_ms)
+            if (!writer_state.stable_feedback_calibrated || 0.0 == writer_state.stable_feedback_ms)
             {
+                writer_state.stable_feedback_calibrated = true;
                 writer_state.stable_feedback_ms = calibrated_feedback_ms;
-            }
-            else if (RecoveryState::NORMAL == writer_state.recovery_state)
-            {
-                writer_state.stable_feedback_ms = update_ewma(
-                    writer_state.stable_feedback_ms,
-                    calibrated_feedback_ms);
             }
         }
 
@@ -1690,12 +2370,46 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 };
         const uint64_t repair_send_samples_delta = counter_delta(
             repair_send_samples, writer_state.previous_repair_send_samples);
+        const uint64_t repair_ack_samples_delta = counter_delta(
+            repair_ack_samples, writer_state.previous_repair_ack_samples);
         const uint64_t repair_timeout_samples_delta = counter_delta(
             repair_timeout_samples, writer_state.previous_repair_timeout_samples);
+        const uint64_t repair_no_ack_timeout_samples_delta = counter_delta(
+            repair_no_ack_timeout_samples, writer_state.previous_repair_no_ack_timeout_samples);
+        const uint64_t repair_late_ack_severe_samples_delta = counter_delta(
+            repair_late_ack_severe_samples, writer_state.previous_repair_late_ack_severe_samples);
+        const uint64_t repair_attempt_overflow_samples_delta = counter_delta(
+            repair_attempt_overflow_samples, writer_state.previous_repair_attempt_overflow_samples);
+        const uint64_t repair_unattributed_send_samples_delta = counter_delta(
+            repair_unattributed_send_samples, writer_state.previous_repair_unattributed_send_samples);
         const uint64_t repair_send_bytes_delta = counter_delta(
             repair_send_bytes, writer_state.previous_repair_send_bytes);
+        const uint64_t repair_ack_bytes_delta = counter_delta(
+            repair_ack_bytes, writer_state.previous_repair_ack_bytes);
         const uint64_t repair_timeout_bytes_delta = counter_delta(
             repair_timeout_bytes, writer_state.previous_repair_timeout_bytes);
+        const uint64_t repair_no_ack_timeout_bytes_delta = counter_delta(
+            repair_no_ack_timeout_bytes, writer_state.previous_repair_no_ack_timeout_bytes);
+        const uint64_t repair_late_ack_severe_bytes_delta = counter_delta(
+            repair_late_ack_severe_bytes, writer_state.previous_repair_late_ack_severe_bytes);
+        const uint64_t repair_attempt_overflow_bytes_delta = counter_delta(
+            repair_attempt_overflow_bytes, writer_state.previous_repair_attempt_overflow_bytes);
+        const uint64_t repair_unattributed_send_bytes_delta = counter_delta(
+            repair_unattributed_send_bytes, writer_state.previous_repair_unattributed_send_bytes);
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+        static_cast<void>(repair_send_samples_delta);
+        static_cast<void>(repair_timeout_samples_delta);
+        static_cast<void>(repair_no_ack_timeout_samples_delta);
+        static_cast<void>(repair_late_ack_severe_samples_delta);
+        static_cast<void>(repair_attempt_overflow_samples_delta);
+        static_cast<void>(repair_unattributed_send_samples_delta);
+        static_cast<void>(repair_send_bytes_delta);
+        static_cast<void>(repair_timeout_bytes_delta);
+        static_cast<void>(repair_no_ack_timeout_bytes_delta);
+        static_cast<void>(repair_late_ack_severe_bytes_delta);
+        static_cast<void>(repair_attempt_overflow_bytes_delta);
+        static_cast<void>(repair_unattributed_send_bytes_delta);
+#endif // FASTDDS_RETRANSMISSION_TRACE
         const uint64_t strong_positive_samples_delta = counter_delta(
             strong_positive_samples, writer_state.previous_feedback_strong_positive_samples);
         const uint64_t normal_samples_delta = counter_delta(
@@ -1714,9 +2428,19 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             severe_negative_bytes, writer_state.previous_feedback_severe_negative_bytes);
 
         writer_state.previous_repair_send_samples = repair_send_samples;
+        writer_state.previous_repair_ack_samples = repair_ack_samples;
         writer_state.previous_repair_timeout_samples = repair_timeout_samples;
+        writer_state.previous_repair_no_ack_timeout_samples = repair_no_ack_timeout_samples;
+        writer_state.previous_repair_late_ack_severe_samples = repair_late_ack_severe_samples;
+        writer_state.previous_repair_attempt_overflow_samples = repair_attempt_overflow_samples;
+        writer_state.previous_repair_unattributed_send_samples = repair_unattributed_send_samples;
         writer_state.previous_repair_send_bytes = repair_send_bytes;
+        writer_state.previous_repair_ack_bytes = repair_ack_bytes;
         writer_state.previous_repair_timeout_bytes = repair_timeout_bytes;
+        writer_state.previous_repair_no_ack_timeout_bytes = repair_no_ack_timeout_bytes;
+        writer_state.previous_repair_late_ack_severe_bytes = repair_late_ack_severe_bytes;
+        writer_state.previous_repair_attempt_overflow_bytes = repair_attempt_overflow_bytes;
+        writer_state.previous_repair_unattributed_send_bytes = repair_unattributed_send_bytes;
         writer_state.previous_feedback_strong_positive_samples = strong_positive_samples;
         writer_state.previous_feedback_normal_samples = normal_samples;
         writer_state.previous_feedback_mild_negative_samples = mild_negative_samples;
@@ -1741,11 +2465,14 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
         const uint64_t strong_positive_weight = evidence_bytes_delta > 0u ?
                 strong_positive_bytes_delta : strong_positive_samples_delta;
         const bool classified_feedback_activity = evidence_weight > 0u;
-        const uint64_t repair_active_weight = repair_send_bytes_delta + repair_timeout_bytes_delta > 0u ?
-                repair_send_bytes_delta + repair_timeout_bytes_delta :
-                repair_send_samples_delta + repair_timeout_samples_delta;
-        const uint64_t timeout_weight = repair_send_bytes_delta + repair_timeout_bytes_delta > 0u ?
-                repair_timeout_bytes_delta : repair_timeout_samples_delta;
+        const uint64_t repair_completed_bytes_delta =
+                repair_ack_bytes_delta + repair_no_ack_timeout_bytes_delta;
+        const uint64_t repair_completed_samples_delta =
+                repair_ack_samples_delta + repair_no_ack_timeout_samples_delta;
+        const uint64_t repair_completed_weight = repair_completed_bytes_delta > 0u ?
+                repair_completed_bytes_delta : repair_completed_samples_delta;
+        const uint64_t timeout_weight = repair_no_ack_timeout_bytes_delta > 0u ?
+                repair_no_ack_timeout_bytes_delta : repair_no_ack_timeout_samples_delta;
         const bool severe_negative_feedback = strict_majority_count(severe_weight, evidence_weight);
         const bool mild_negative_feedback =
                 !severe_negative_feedback && strict_majority_count(negative_weight, evidence_weight);
@@ -1802,7 +2529,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 evidence_weight,
                 negative_weight,
                 severe_weight,
-                repair_active_weight,
+                repair_completed_weight,
                 timeout_weight);
             const BudgetObservationResult result = evaluate_budget_observation(
                 writer_state.budget_observation,
@@ -1863,7 +2590,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             writer_state.byte_budget = std::max(
                 min_dynamic_bytes_per_cycle, writer_state.byte_budget / 2);
             const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
-                    writer_state.stable_feedback_ms * repair_timeout_baseline_multiplier : min_repair_timeout_ms;
+                    writer_repair_classification_window_ms(writer_state.stable_feedback_ms) :
+                    min_repair_timeout_ms;
             start_budget_observation(
                 writer_state,
                 SyncNegativeFeedbackKind::SEVERE,
@@ -1874,7 +2602,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 evidence_weight,
                 negative_weight,
                 severe_weight,
-                repair_active_weight,
+                repair_completed_weight,
                 timeout_weight);
         }
         else if (mild_negative_feedback)
@@ -1895,7 +2623,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                 writer_state.byte_budget = std::max(
                     min_dynamic_bytes_per_cycle, decreased_budget);
                 const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
-                        writer_state.stable_feedback_ms * repair_timeout_baseline_multiplier : min_repair_timeout_ms;
+                        writer_repair_classification_window_ms(writer_state.stable_feedback_ms) :
+                        min_repair_timeout_ms;
                 start_budget_observation(
                     writer_state,
                     SyncNegativeFeedbackKind::MILD,
@@ -1906,7 +2635,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                     evidence_weight,
                     negative_weight,
                     severe_weight,
-                    repair_active_weight,
+                repair_completed_weight,
                     timeout_weight);
             }
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -1986,10 +2715,20 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                    << ";mild_negative_bytes_delta=" << mild_negative_bytes_delta
                    << ";severe_negative_bytes_delta=" << severe_negative_bytes_delta
                    << ";repair_send_samples_delta=" << repair_send_samples_delta
+                   << ";repair_ack_samples_delta=" << repair_ack_samples_delta
                    << ";repair_timeout_samples_delta=" << repair_timeout_samples_delta
+                   << ";repair_no_ack_timeout_samples_delta=" << repair_no_ack_timeout_samples_delta
+                   << ";repair_late_ack_severe_samples_delta=" << repair_late_ack_severe_samples_delta
+                   << ";repair_attempt_overflow_samples_delta=" << repair_attempt_overflow_samples_delta
+                   << ";repair_unattributed_send_samples_delta=" << repair_unattributed_send_samples_delta
                    << ";repair_send_bytes_delta=" << repair_send_bytes_delta
+                   << ";repair_ack_bytes_delta=" << repair_ack_bytes_delta
                    << ";repair_timeout_bytes_delta=" << repair_timeout_bytes_delta
-                   << ";repair_active_weight=" << repair_active_weight
+                   << ";repair_no_ack_timeout_bytes_delta=" << repair_no_ack_timeout_bytes_delta
+                   << ";repair_late_ack_severe_bytes_delta=" << repair_late_ack_severe_bytes_delta
+                   << ";repair_attempt_overflow_bytes_delta=" << repair_attempt_overflow_bytes_delta
+                   << ";repair_unattributed_send_bytes_delta=" << repair_unattributed_send_bytes_delta
+                   << ";repair_completed_weight=" << repair_completed_weight
                    << ";timeout_weight=" << timeout_weight
                    << ";observation_active=" << writer_state.budget_observation.active
                    << ";observation_kind=" << sync_negative_kind_name(writer_state.budget_observation.kind)
@@ -2035,6 +2774,8 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                    << ";mild_episode_clear_windows=" << writer_state.negative_episode.mild_clear_windows
                    << ";stable_feedback_ms=" << writer_state.stable_feedback_ms
                    << ";stable_feedback_calibrated=" << writer_state.stable_feedback_calibrated
+                   << ";classification_window_ms=" << writer_repair_classification_window_ms(
+                        writer_state.stable_feedback_ms)
                    << ";pressure_cycles=" << writer_state.pressure_cycles
                    << ";improving_cycles=" << writer_state.improving_cycles;
             budget_traces.push_back(BudgetTrace {detail.str()});
@@ -2119,7 +2860,13 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
                         (candidate_force_due ?
                         AdaptiveRetransmissionDecision::FORCE_SEND :
                         AdaptiveRetransmissionDecision::SEND_NOW);
-                impl_->cycle_plan[candidate.key] = decision;
+                plan.push_back(
+                    AdaptiveRetransmissionPlanEntry
+                    {
+                        candidate.key.path.reader,
+                        candidate.key.sequence,
+                        decision
+                    });
                 if (AdaptiveRetransmissionDecision::DEFER != decision)
                 {
                     impl_->changes[candidate.key].last_interest = steady_clock::now();
@@ -2209,160 +2956,7 @@ void AdaptiveRetransmissionController::finalize_admission_cycle(
             detail.str());
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
-}
-
-AdaptiveRetransmissionDecision AdaptiveRetransmissionController::decide_retransmission(
-        StatefulWriter* writer,
-        const GUID_t& reader_guid,
-        const CacheChange_t& change)
-{
-    if (nullptr == writer || !admission_enabled(*writer))
-    {
-        return AdaptiveRetransmissionDecision::SEND_NOW;
-    }
-
-    AdaptiveRetransmissionDecision planned_decision = AdaptiveRetransmissionDecision::SEND_NOW;
-    bool has_planned_decision = false;
-    const ChangeKey key {{writer->getGuid(), reader_guid}, change.sequenceNumber};
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        auto planned = impl_->cycle_plan.find(key);
-        if (planned != impl_->cycle_plan.end())
-        {
-            planned_decision = planned->second;
-            has_planned_decision = true;
-        }
-    }
-    if (has_planned_decision)
-    {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        bool emit_trace = false;
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            ChangeState& observed = impl_->changes[key];
-            emit_trace = !observed.admission_trace_initialized ||
-                    observed.admission_trace_decision != planned_decision;
-            if (emit_trace)
-            {
-                observed.admission_trace_initialized = true;
-                observed.admission_trace_decision = planned_decision;
-            }
-        }
-        if (emit_trace)
-        {
-            const char* action = AdaptiveRetransmissionDecision::DEFER == planned_decision ? "DEFER" :
-                    (AdaptiveRetransmissionDecision::FORCE_SEND == planned_decision ? "FORCE_SEND" : "SEND_NOW");
-            FASTDDS_TRACE_RETRANSMISSION(
-                "ADAPT_ADMISSION_DECISION",
-                writer->getGuid(),
-                reader_guid,
-                change.sequenceNumber,
-                change.serializedPayload.length,
-                std::string("mode=") + controller_mode_name(*writer) +
-                        ";state=V2_PLANNED;decision=" + action +
-                        ";reason=ADMISSION_PLAN;trace_transition=1");
-        }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        return planned_decision;
-    }
-
-    const auto now = steady_clock::now();
-    const ReaderKey reader_key {writer->getGuid(), reader_guid};
-    const ChangeKey change_key {reader_key, change.sequenceNumber};
-
-    AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::SEND_NOW;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-    std::string trace_detail;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        ReaderState& reader = impl_->readers[reader_key];
-        ChangeState& observed = impl_->changes[change_key];
-        if (0 == observed.requests)
-        {
-            observed.first_request = now;
-        }
-        if (0 == observed.estimated_bytes)
-        {
-            observed.estimated_bytes = change.serializedPayload.length;
-        }
-
-        const size_t pending = impl_->outstanding_changes(reader_key);
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        const uint64_t pending_bytes = impl_->outstanding_bytes(reader_key);
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        const double age_ms = std::chrono::duration<double, std::milli>(now - observed.first_request).count();
-        const double hard_max_defer = hard_max_defer_or(*writer);
-        const bool feedback_pressure = reader.stable_feedback_calibrated &&
-                reader.feedback_samples >= pressure_feedback_min_samples &&
-                reader.recovery_feedback_ewma_ms > slow_feedback_ms;
-        const bool recovery_pressure = pending >= pressure_request_count ||
-                observed.requests >= pressure_request_count || feedback_pressure;
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        const char* state = recovery_pressure ? "RECOVERY_PRESSURE" : "SPARSE_REQUESTS";
-        const char* action = "SEND_NOW";
-        const char* reason = recovery_pressure ? "WITHIN_BUDGET" : "NO_PRESSURE";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        if (recovery_pressure)
-        {
-            if (age_ms >= hard_max_defer)
-            {
-                decision = AdaptiveRetransmissionDecision::FORCE_SEND;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                action = "FORCE_SEND";
-                reason = "MAX_DEFER_REACHED";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-            else if (reader.admitted_changes_in_cycle >= max_changes_per_cycle ||
-                    (reader.admitted_changes_in_cycle > 0 &&
-                    reader.admitted_bytes_in_cycle + observed.estimated_bytes > max_bytes_per_cycle))
-            {
-                decision = AdaptiveRetransmissionDecision::DEFER;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                action = "DEFER";
-                reason = "CYCLE_BUDGET_EXHAUSTED";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-        }
-
-        if (AdaptiveRetransmissionDecision::DEFER != decision)
-        {
-            ++reader.admitted_changes_in_cycle;
-            reader.admitted_bytes_in_cycle += observed.estimated_bytes;
-            observed.last_interest = now;
-        }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        std::ostringstream detail;
-        detail << "mode=" << controller_mode_name(*writer)
-               << ";state=" << state
-               << ";decision=" << action
-               << ";reason=" << reason
-               << ";requests=" << observed.requests
-               << ";age_ms=" << age_ms
-               << ";path_outstanding_changes=" << pending
-               << ";path_outstanding_bytes=" << pending_bytes
-               << ";cycle_admitted_changes=" << reader.admitted_changes_in_cycle
-               << ";cycle_admitted_bytes=" << reader.admitted_bytes_in_cycle
-               << ";cycle_change_budget=" << max_changes_per_cycle
-               << ";cycle_byte_budget=" << max_bytes_per_cycle
-               << ";hard_max_defer_ms=" << hard_max_defer
-               << ";feedback_samples=" << reader.feedback_samples
-               << ";recovery_feedback_ewma_ms=" << reader.recovery_feedback_ewma_ms;
-        trace_detail = detail.str();
-#endif // FASTDDS_RETRANSMISSION_TRACE
-    }
-
-    FASTDDS_TRACE_RETRANSMISSION(
-        "ADAPT_ADMISSION_DECISION",
-        writer->getGuid(),
-        reader_guid,
-        change.sequenceNumber,
-        change.serializedPayload.length,
-        trace_detail);
-
-    return decision;
+    return plan;
 }
 
 void AdaptiveRetransmissionController::on_acknowledged_before(
@@ -2387,6 +2981,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
 #ifdef FASTDDS_RETRANSMISSION_TRACE
     struct AckTrace
     {
+        bool new_sample;
         SequenceNumber_t sequence;
         uint32_t estimated_bytes;
         double feedback_ms;
@@ -2394,21 +2989,10 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         double feedback_ratio;
         double timeout_ms;
         bool classified;
+        bool control_evidence;
         RepairFeedbackClass feedback_class;
     };
-    struct TimeoutAckTrace
-    {
-        SequenceNumber_t sequence;
-        uint32_t estimated_bytes;
-        double feedback_ms;
-        double stable_feedback_ms;
-        double feedback_ratio;
-        double timeout_ms;
-        std::size_t repair_send_attempts;
-        uint32_t timeout_reported_attempts;
-    };
     std::vector<AckTrace> ack_traces;
-    std::vector<TimeoutAckTrace> timeout_ack_traces;
 #endif // FASTDDS_RETRANSMISSION_TRACE
 
     {
@@ -2421,21 +3005,50 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
             if (!reader.ack_progress_tracking_started)
             {
                 reader.ack_progress_tracking_started = true;
-                reader.ack_progress_tracking_start_time = now;
             }
-            else
+            for (auto episode = impl_->episodes.begin(); episode != impl_->episodes.end(); )
             {
-                for (auto sent_it = writer_state.sent_changes.lower_bound(reader.last_ack_base);
-                        sent_it != writer_state.sent_changes.end() && sent_it->first < sequence_number; ++sent_it)
+                const bool same_reader = !(episode->first.path < reader_key) && !(reader_key < episode->first.path);
+                if (!same_reader || !(episode->first.sequence < sequence_number))
                 {
-                    if (!sent_it->second.old_sample &&
-                            reader.repair_tainted_sequences.find(sent_it->first) ==
-                            reader.repair_tainted_sequences.end() &&
-                            sent_it->second.sent_time != steady_clock::time_point() &&
-                            sent_it->second.sent_time >= reader.ack_progress_tracking_start_time)
+                    ++episode;
+                    continue;
+                }
+
+                const uint32_t feedback_bytes = episode->second.estimated_bytes;
+                const bool mixed_or_repair = episode->second.dirty || episode->second.has_repair_send;
+                if (mixed_or_repair && !episode->second.has_repair_send)
+                {
+                    ++reader.new_ack_dirty_skipped_samples;
+                    reader.new_ack_dirty_skipped_bytes += feedback_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    ack_traces.push_back(
+                        AckTrace
+                        {
+                            true,
+                            episode->first.sequence,
+                            feedback_bytes,
+                            0.0,
+                            reader.stable_feedback_ms,
+                            0.0,
+                            reader.stable_feedback_ms > 0.0 ? feedback_classification_window_ms(reader) : 0.0,
+                            false,
+                            false,
+                            RepairFeedbackClass::NORMAL
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                else if (episode->second.last_send_time == steady_clock::time_point())
+                {
+                    ++reader.new_ack_inconclusive_samples;
+                    reader.new_ack_inconclusive_bytes += feedback_bytes;
+                }
+                else if (!mixed_or_repair)
+                {
+                    const double feedback_ms = std::chrono::duration<double, std::milli>(
+                        now - episode->second.last_send_time).count();
+                    if (!reader.stable_feedback_calibrated)
                     {
-                        const double ack_progress_ms =
-                                std::chrono::duration<double, std::milli>(now - sent_it->second.sent_time).count();
                         reader.stable_feedback_ms = update_calibrated_feedback_baseline_from_ack_progress(
                             reader.stable_feedback_ms,
                             reader.stable_feedback_calibration_samples,
@@ -2443,15 +3056,113 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                             reader.stable_feedback_calibration_started,
                             reader.stable_feedback_calibrated,
                             now,
-                            ack_progress_ms);
+                            feedback_ms);
+                    }
+                    else if (reader.stable_feedback_ms > 0.0)
+                    {
+                        const RepairFeedbackClass feedback_class = classify_repair_feedback(
+                            reader,
+                            writer_state,
+                            feedback_ms);
+                        const bool new_feedback_controls_budget = writer->isAsync() &&
+                                writer->uses_adaptive_value_flow_controller();
+                        record_classified_new_feedback(
+                            reader,
+                            feedback_ms,
+                            feedback_class,
+                            feedback_bytes,
+                            new_feedback_controls_budget);
+                        if (new_feedback_controls_budget)
+                        {
+                            record_origin_positive_feedback_locked(
+                                impl_->readers,
+                                impl_->send_period_seals,
+                                impl_->pending_origin_positive_feedback,
+                                reader_key,
+                                episode->second.last_send_period_id,
+                                feedback_class,
+                                feedback_bytes);
+                        }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                        ack_traces.push_back(
+                            AckTrace
+                            {
+                                true,
+                                episode->first.sequence,
+                                feedback_bytes,
+                                feedback_ms,
+                                reader.stable_feedback_ms,
+                                reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
+                                feedback_classification_window_ms(reader),
+                                true,
+                                new_feedback_controls_budget,
+                                feedback_class
+                            });
+#endif // FASTDDS_RETRANSMISSION_TRACE
                     }
                 }
+                else
+                {
+                    const bool classified = reader.stable_feedback_calibrated && reader.stable_feedback_ms > 0.0;
+                    const double feedback_ms = std::chrono::duration<double, std::milli>(
+                        now - episode->second.last_send_time).count();
+                    const double feedback_timeout_ms = classified ? feedback_classification_window_ms(reader) : 0.0;
+#ifndef FASTDDS_RETRANSMISSION_TRACE
+                    static_cast<void>(feedback_timeout_ms);
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                    RepairFeedbackClass feedback_class = RepairFeedbackClass::NORMAL;
+                    if (classified)
+                    {
+                        feedback_class = classify_repair_feedback(reader, writer_state, feedback_ms);
+                        record_classified_repair_feedback(
+                            reader,
+                            feedback_ms,
+                            feedback_class,
+                            feedback_bytes);
+                        if (writer->isAsync() && writer->uses_adaptive_value_flow_controller())
+                        {
+                            record_origin_positive_feedback_locked(
+                                impl_->readers,
+                                impl_->send_period_seals,
+                                impl_->pending_origin_positive_feedback,
+                                reader_key,
+                                episode->second.last_send_period_id,
+                                feedback_class,
+                                feedback_bytes);
+                        }
+                        if (RepairFeedbackClass::SEVERE_NEGATIVE == feedback_class)
+                        {
+                            record_severe_repair_evidence(
+                                reader,
+                                SevereRepairReason::LATE_ACK,
+                                feedback_bytes);
+                        }
+                    }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    ack_traces.push_back(
+                        AckTrace
+                        {
+                            false,
+                            episode->first.sequence,
+                            feedback_bytes,
+                            feedback_ms,
+                            reader.stable_feedback_ms,
+                            reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
+                            feedback_timeout_ms,
+                            classified,
+                            classified,
+                            feedback_class
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                reader.pending_new_dirty_sequences.erase(episode->first.sequence);
+                episode = impl_->episodes.erase(episode);
             }
             reader.last_ack_base = sequence_number;
-            for (auto tainted = reader.repair_tainted_sequences.begin();
-                    tainted != reader.repair_tainted_sequences.end() && *tainted < sequence_number; )
+            for (auto dirty = reader.pending_new_dirty_sequences.begin();
+                    dirty != reader.pending_new_dirty_sequences.end() && *dirty < sequence_number; )
             {
-                tainted = reader.repair_tainted_sequences.erase(tainted);
+                dirty = reader.pending_new_dirty_sequences.erase(dirty);
             }
         }
 
@@ -2460,123 +3171,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
             const bool same_reader = !(it->first.path < reader_key) && !(reader_key < it->first.path);
             if (same_reader && it->first.sequence < sequence_number)
             {
-                if (it->second.last_interest != steady_clock::time_point() &&
-                        !it->second.repair_send_attempts.empty())
-                {
-                    bool classified = reader.stable_feedback_calibrated && reader.stable_feedback_ms > 0.0;
-                    auto latest_unclassified = it->second.repair_send_attempts.end();
-                    for (auto attempt_it = it->second.repair_send_attempts.begin();
-                            attempt_it != it->second.repair_send_attempts.end(); ++attempt_it)
-                    {
-                        if (!attempt_it->feedback_classified)
-                        {
-                            latest_unclassified = attempt_it;
-                        }
-                    }
-
-                    if (latest_unclassified != it->second.repair_send_attempts.end())
-                    {
-                        const double feedback_ms =
-                                std::chrono::duration<double, std::milli>(
-                            now - latest_unclassified->sent_time).count();
-                        const double timeout_ms = classified ? repair_timeout_window_ms(reader) : 0.0;
-                        for (auto attempt_it = it->second.repair_send_attempts.begin();
-                                attempt_it != latest_unclassified; ++attempt_it)
-                        {
-                            if (attempt_it->feedback_classified)
-                            {
-                                continue;
-                            }
-                            if (classified)
-                            {
-                                const double pending_ms = std::chrono::duration<double, std::milli>(
-                                    now - attempt_it->sent_time).count();
-                                if (pending_ms >= timeout_ms)
-                                {
-                                    const uint32_t timeout_bytes = attempt_it->estimated_bytes > 0u ?
-                                            attempt_it->estimated_bytes : it->second.estimated_bytes;
-                                    attempt_it->timeout_reported = true;
-                                    ++reader.repair_timeout_samples;
-                                    reader.repair_timeout_bytes += timeout_bytes;
-                                    record_classified_repair_feedback(
-                                        reader,
-                                        RepairFeedbackClass::SEVERE_NEGATIVE,
-                                        timeout_bytes);
-                                }
-                            }
-                            attempt_it->feedback_classified = true;
-                        }
-
-                        const uint32_t feedback_bytes = latest_unclassified->estimated_bytes > 0u ?
-                                latest_unclassified->estimated_bytes : it->second.estimated_bytes;
-                        reader.recovery_feedback_ewma_ms = update_ewma(reader.recovery_feedback_ewma_ms, feedback_ms);
-                        ++reader.feedback_samples;
-                        reader.feedback_bytes += feedback_bytes;
-                        RepairFeedbackClass feedback_class = RepairFeedbackClass::NORMAL;
-                        if (classified)
-                        {
-                            feedback_class = classify_repair_feedback(reader, writer_state, feedback_ms);
-                            record_classified_repair_feedback(reader, feedback_class, feedback_bytes);
-                            latest_unclassified->feedback_classified = true;
-                            if (RepairFeedbackClass::SEVERE_NEGATIVE == feedback_class)
-                            {
-                                latest_unclassified->timeout_reported = true;
-                                ++reader.repair_timeout_samples;
-                                reader.repair_timeout_bytes += feedback_bytes;
-                            }
-                        }
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                        ack_traces.push_back(
-                            AckTrace
-                            {
-                                it->first.sequence,
-                                feedback_bytes,
-                                feedback_ms,
-                                reader.stable_feedback_ms,
-                                reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
-                                timeout_ms,
-                                classified,
-                                feedback_class
-                            });
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                    }
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    else
-                    {
-                        uint32_t timeout_reported_attempts = 0;
-                        const RepairSendAttempt* latest_timeout_attempt = nullptr;
-                        for (const RepairSendAttempt& attempt : it->second.repair_send_attempts)
-                        {
-                            if (attempt.timeout_reported)
-                            {
-                                ++timeout_reported_attempts;
-                                latest_timeout_attempt = &attempt;
-                            }
-                        }
-                        if (nullptr != latest_timeout_attempt)
-                        {
-                            const double timeout_ms = classified ? repair_timeout_window_ms(reader) : 0.0;
-                            const double feedback_ms = std::chrono::duration<double, std::milli>(
-                                now - latest_timeout_attempt->sent_time).count();
-                            const uint32_t feedback_bytes = latest_timeout_attempt->estimated_bytes > 0u ?
-                                    latest_timeout_attempt->estimated_bytes : it->second.estimated_bytes;
-                            timeout_ack_traces.push_back(
-                                TimeoutAckTrace
-                                {
-                                    it->first.sequence,
-                                    feedback_bytes,
-                                    feedback_ms,
-                                    reader.stable_feedback_ms,
-                                    reader.stable_feedback_ms > 0.0 ? feedback_ms / reader.stable_feedback_ms : 0.0,
-                                    timeout_ms,
-                                    it->second.repair_send_attempts.size(),
-                                    timeout_reported_attempts
-                                });
-                        }
-                    }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-                reader.repair_tainted_sequences.erase(it->first.sequence);
+                reader.pending_new_dirty_sequences.erase(it->first.sequence);
                 it = impl_->changes.erase(it);
             }
             else
@@ -2591,38 +3186,19 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
     {
         std::ostringstream detail;
         detail << "mode=" << controller_mode_name(*writer)
-               << ";source=repair_send_ack"
+               << ";source=" << (trace.new_sample ? "clean_new_ack" : "repair_send_ack")
                << ";ack_base=" << sequence_number
                << ";feedback_ms=" << trace.feedback_ms
                << ";stable_feedback_ms=" << trace.stable_feedback_ms
                << ";feedback_ratio=" << trace.feedback_ratio
                << ";timeout_ms=" << trace.timeout_ms
                << ";classified=" << trace.classified
+               << ";control_evidence=" << trace.control_evidence
                << ";feedback_class=" << repair_feedback_class_name(trace.feedback_class);
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_ACK_CONFIRMED" : "ACK_CONFIRMED_PROXY",
-            writer->getGuid(),
-            reader_guid,
-            trace.sequence,
-            trace.estimated_bytes,
-            detail.str());
-    }
-    for (const TimeoutAckTrace& trace : timeout_ack_traces)
-    {
-        std::ostringstream detail;
-        detail << "mode=" << controller_mode_name(*writer)
-               << ";source=repair_timeout_ack_observed"
-               << ";ack_base=" << sequence_number
-               << ";feedback_ms=" << trace.feedback_ms
-               << ";stable_feedback_ms=" << trace.stable_feedback_ms
-               << ";feedback_ratio=" << trace.feedback_ratio
-               << ";timeout_ms=" << trace.timeout_ms
-               << ";classified=already_timeout"
-               << ";feedback_class=severe_negative"
-               << ";repair_send_attempts=" << trace.repair_send_attempts
-               << ";timeout_reported_attempts=" << trace.timeout_reported_attempts;
-        FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_TIMEOUT_ACK_OBSERVED" : "TIMEOUT_ACK_OBSERVED_PROXY",
+            trace.new_sample ?
+            (writer->isAsync() ? "ADAPT_ASYNC_NEW_ACK_CONFIRMED" : "NEW_ACK_CONFIRMED_PROXY") :
+            (writer->isAsync() ? "ADAPT_ASYNC_ACK_CONFIRMED" : "ACK_CONFIRMED_PROXY"),
             writer->getGuid(),
             reader_guid,
             trace.sequence,
@@ -2649,20 +3225,148 @@ void AdaptiveRetransmissionController::on_change_removed(
     }
 
     const ChangeKey key {{writer->getGuid(), reader_guid}, sequence_number};
+    const auto now = steady_clock::now();
 #ifdef FASTDDS_RETRANSMISSION_TRACE
+    struct RemovalTrace
+    {
+        const char* event;
+        uint32_t estimated_bytes;
+        std::string detail;
+    };
+    std::vector<RemovalTrace> removal_traces;
     uint32_t estimated_bytes = 0;
     bool removed = false;
+#endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto reader = impl_->readers.find(key.path);
+        if (reader != impl_->readers.end())
+        {
+            reader->second.pending_new_dirty_sequences.erase(sequence_number);
+        }
+
+        auto episode = impl_->episodes.find(key);
+        if (episode != impl_->episodes.end())
+        {
+            const uint32_t episode_bytes = episode->second.estimated_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+            estimated_bytes = episode_bytes;
+#endif // FASTDDS_RETRANSMISSION_TRACE
+            if (reader != impl_->readers.end())
+            {
+                const bool can_classify_timeout =
+                        episode->second.has_repair_send &&
+                        reader->second.stable_feedback_calibrated &&
+                        reader->second.stable_feedback_ms > 0.0;
+                const double timeout_ms = can_classify_timeout ?
+                        repair_timeout_window_ms(reader->second) : 0.0;
+                const double episode_timeout_ms = can_classify_timeout ?
+                        no_ack_episode_window_ms(reader->second) : 0.0;
+                const steady_clock::time_point first_repair_send_time =
+                        episode->second.first_repair_send_time == steady_clock::time_point() ?
+                        episode->second.first_send_time : episode->second.first_repair_send_time;
+                const double pending_since_last_ms = std::chrono::duration<double, std::milli>(
+                    now - episode->second.last_send_time).count();
+                const double pending_since_first_ms = std::chrono::duration<double, std::milli>(
+                    now - first_repair_send_time).count();
+                if (can_classify_timeout &&
+                        (pending_since_last_ms >= timeout_ms || pending_since_first_ms >= episode_timeout_ms))
+                {
+                    record_severe_repair_evidence(
+                        reader->second,
+                        SevereRepairReason::NO_ACK_TIMEOUT,
+                        episode_bytes);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    std::ostringstream detail;
+                    detail << "mode=" << controller_mode_name(*writer)
+                           << ";source=change_removed"
+                           << ";outcome=no_ack_timeout"
+                           << ";pending_since_last_ms=" << pending_since_last_ms
+                           << ";pending_since_first_ms=" << pending_since_first_ms
+                           << ";no_ack_timeout_ms=" << timeout_ms
+                           << ";no_ack_episode_window_ms=" << episode_timeout_ms
+                           << ";stable_feedback_ms=" << reader->second.stable_feedback_ms
+                           << ";episode_send_count=" << episode->second.send_count
+                           << ";episode_generation=" << episode->second.generation;
+                    removal_traces.push_back(
+                        RemovalTrace
+                        {
+                            writer->isAsync() ?
+                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_TIMEOUT" :
+                            "REPAIR_EPISODE_REMOVE_TIMEOUT_PROXY",
+                            episode_bytes,
+                            detail.str()
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                else if (episode->second.dirty || episode->second.has_repair_send)
+                {
+                    ++reader->second.repair_attempt_overflow_samples;
+                    reader->second.repair_attempt_overflow_bytes += episode_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    std::ostringstream detail;
+                    detail << "mode=" << controller_mode_name(*writer)
+                           << ";source=change_removed"
+                           << ";outcome=inconclusive_removed"
+                           << ";pending_since_last_ms=" << pending_since_last_ms
+                           << ";pending_since_first_ms=" << pending_since_first_ms
+                           << ";no_ack_timeout_ms=" << timeout_ms
+                           << ";no_ack_episode_window_ms=" << episode_timeout_ms
+                           << ";stable_feedback_ms=" << reader->second.stable_feedback_ms
+                           << ";stable_feedback_calibrated=" <<
+                            reader->second.stable_feedback_calibrated
+                           << ";episode_send_count=" << episode->second.send_count
+                           << ";episode_generation=" << episode->second.generation;
+                    removal_traces.push_back(
+                        RemovalTrace
+                        {
+                            writer->isAsync() ?
+                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_INCONCLUSIVE" :
+                            "REPAIR_EPISODE_REMOVE_INCONCLUSIVE_PROXY",
+                            episode_bytes,
+                            detail.str()
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+                else
+                {
+                    ++reader->second.new_ack_inconclusive_samples;
+                    reader->second.new_ack_inconclusive_bytes += episode_bytes;
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+                    std::ostringstream detail;
+                    detail << "mode=" << controller_mode_name(*writer)
+                           << ";source=change_removed"
+                           << ";outcome=inconclusive_removed"
+                           << ";estimated_bytes=" << episode_bytes;
+                    removal_traces.push_back(
+                        RemovalTrace
+                        {
+                            writer->isAsync() ?
+                            "ADAPT_ASYNC_PENDING_NEW_REMOVED" :
+                            "PENDING_NEW_REMOVED_PROXY",
+                            episode_bytes,
+                            detail.str()
+                        });
+#endif // FASTDDS_RETRANSMISSION_TRACE
+                }
+            }
+            impl_->episodes.erase(episode);
+        }
+
         auto change = impl_->changes.find(key);
         if (change != impl_->changes.end())
         {
+#ifdef FASTDDS_RETRANSMISSION_TRACE
             estimated_bytes = change->second.estimated_bytes;
+#endif // FASTDDS_RETRANSMISSION_TRACE
             impl_->changes.erase(change);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
             removed = true;
+#endif // FASTDDS_RETRANSMISSION_TRACE
         }
     }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     if (writer->isAsync() && removed)
     {
         FASTDDS_TRACE_RETRANSMISSION(
@@ -2673,9 +3377,16 @@ void AdaptiveRetransmissionController::on_change_removed(
             estimated_bytes,
             std::string("mode=") + controller_mode_name(*writer));
     }
-#else
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->changes.erase(key);
+    for (const RemovalTrace& trace : removal_traces)
+    {
+        FASTDDS_TRACE_RETRANSMISSION(
+            trace.event,
+            writer->getGuid(),
+            reader_guid,
+            sequence_number,
+            trace.estimated_bytes,
+            trace.detail);
+    }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
@@ -2705,6 +3416,39 @@ void AdaptiveRetransmissionController::on_reader_removed(
             {
                 it = impl_->changes.erase(it);
                 ++removed_changes;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        for (auto it = impl_->episodes.begin(); it != impl_->episodes.end(); )
+        {
+            if (!(it->first.path < key) && !(key < it->first.path))
+            {
+                it = impl_->episodes.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        for (auto it = impl_->pending_origin_positive_feedback.begin();
+                it != impl_->pending_origin_positive_feedback.end(); )
+        {
+            std::vector<PendingOriginPositiveFeedback>& pending = it->second;
+            pending.erase(
+                std::remove_if(
+                    pending.begin(),
+                    pending.end(),
+                    [&key](const PendingOriginPositiveFeedback& feedback)
+                    {
+                        return !(feedback.reader < key) && !(key < feedback.reader);
+                    }),
+                pending.end());
+            if (pending.empty())
+            {
+                it = impl_->pending_origin_positive_feedback.erase(it);
             }
             else
             {
