@@ -33,7 +33,7 @@ Use the same Publisher and Subscriber arguments for all groups:
 ```text
 plain                 adaptive code compiled OFF
 adaptive-disabled     adaptive library loaded, Topic property absent
-adaptive-enabled      adaptive library loaded, Topic property present
+async-adaptive-value  async writers assigned to an ADAPTIVE_VALUE_UTILITY FlowController
 ```
 
 Primary measurements must use Fast DDS builds with `FASTDDS_RETRANSMISSION_TRACE=OFF`. Use a trace-enabled build only
@@ -64,9 +64,10 @@ peer process:
 /adaptive/sensor_snapshot  high-rate replaceable snapshot stream
 ```
 
-Use `adaptive_topics_off.xml` for the adaptive-disabled control group and `adaptive_topics_enabled.xml` for the
-topic-level adaptive-enabled group. This benchmark validates writer-local old-sample admission under different topic
-value properties. It does not by itself validate cross-writer FlowController priority scheduling.
+Use `adaptive_topics_off.xml` for the disabled control group, scheduler-specific async profiles for FIFO/priority
+controls, and `adaptive_topics_async_adaptive_value_admission.xml` for the async adaptive mechanism. The async adaptive
+mechanism is enabled by `<scheduler>ADAPTIVE_VALUE_UTILITY</scheduler>`; topic value properties only classify samples
+after a writer is placed in that FlowController.
 
 ## Same-Host Default Transport
 
@@ -91,21 +92,19 @@ env \
     --output "/tmp/adaptive_sub_${RUN_ID}.csv"
 ```
 
-Start the Publisher in Terminal B. Omit `FASTRTPS_DEFAULT_PROFILES_FILE` for `adaptive-disabled`; set it only for
-`adaptive-enabled`:
+Start the Publisher in Terminal B. Omit `FASTRTPS_DEFAULT_PROFILES_FILE` for the disabled control and for this
+single-topic smoke run; set it to an async FlowController profile only for scheduler tests:
 
 ```bash
 source /opt/ros/humble/setup.bash
 source "$HOME/adaptive_benchmark_ws/install/setup.bash"
 
 LIB="$HOME/fastdds_trace_ws/install/adaptive-v1/lib"
-XML="$(ros2 pkg prefix --share ros2_adaptive_benchmark)/config/adaptive_enabled.xml"
 RUN_ID="$(date +%s)"
 
 env \
   LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
-  FASTRTPS_DEFAULT_PROFILES_FILE="$XML" \
   ROS_DOMAIN_ID=81 \
   ROS_LOCALHOST_ONLY=1 \
   ros2 run ros2_adaptive_benchmark adaptive_benchmark_publisher \
@@ -127,7 +126,7 @@ ROS_LOCALHOST_ONLY=0
 ```
 
 Do not pass `--same-host` to the Subscriber. Cross-host monotonic clocks have unrelated epochs. Delivery, ordering,
-inter-arrival, completion time, goodput, CPU, and RSS remain valid. Use a separate round-trip test or a documented
+inter-arrival, completion time, goodput, and RSS remain valid. Use a separate round-trip test or a documented
 clock-synchronization error bound before reporting cross-host latency.
 
 For controlled network conditions, apply `tc netem` only to the physical interface carrying traffic. Record `tc -s`

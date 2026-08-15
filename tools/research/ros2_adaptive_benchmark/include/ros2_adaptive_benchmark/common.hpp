@@ -153,7 +153,6 @@ inline std::string json_escape(
 
 struct ProcessUsage
 {
-    double cpu_seconds = 0.0;
     long max_rss_kb = 0;
 };
 
@@ -164,8 +163,6 @@ inline ProcessUsage process_usage()
     rusage usage {};
     if (0 == getrusage(RUSAGE_SELF, &usage))
     {
-        result.cpu_seconds = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1000000.0 +
-                usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1000000.0;
         result.max_rss_kb = usage.ru_maxrss;
     }
 #endif

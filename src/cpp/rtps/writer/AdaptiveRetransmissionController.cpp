@@ -32,7 +32,6 @@ namespace {
 
 using steady_clock = std::chrono::steady_clock;
 
-constexpr const char* enabled_property = "fastdds.adaptive_retransmission.enabled";
 constexpr const char* async_observe_property = "fastdds.adaptive_async.observe_old_samples";
 
 // Provisional safety defaults. These are experiment inputs, not calibrated link classifications.
@@ -46,14 +45,6 @@ constexpr double max_repair_timeout_request_interval_ms = 200.0;
 constexpr double no_ack_episode_window_multiplier = 2.0;
 constexpr double default_feedback_strong_positive_ratio = 1.0;
 constexpr double default_feedback_slow_ratio = 1.5;
-constexpr uint32_t max_planned_changes_per_cycle = 32;
-constexpr uint64_t max_bytes_per_cycle = 64 * 1024;
-constexpr uint32_t default_hard_max_defer_ms = 50;
-constexpr uint32_t default_defer_cooldown_ms = 20;
-constexpr double slow_feedback_ms = 25.0;
-constexpr uint64_t min_dynamic_bytes_per_cycle = 16 * 1024;
-constexpr uint64_t max_dynamic_bytes_per_cycle = 256 * 1024;
-constexpr uint64_t additive_budget_step = 8 * 1024;
 constexpr uint64_t max_tracked_send_periods_per_writer = 2048;
 
 struct ReaderKey
@@ -243,116 +234,12 @@ struct ChangeState
     steady_clock::time_point first_request;
     steady_clock::time_point last_request;
     steady_clock::time_point last_interest;
-    steady_clock::time_point defer_cooldown_until;
-};
-
-enum class RecoveryState
-{
-    NORMAL,
-    PRESSURE,
-    RECOVERY
-};
-
-enum class CandidateValueClass
-{
-    DEFAULT,
-    IMPORTANT,
-    REPLACEABLE_SNAPSHOT
-};
-
-enum class ForceClass
-{
-    NONE,
-    SOFT,
-    NORMAL,
-    STRONG
-};
-
-enum class SyncNegativeFeedbackKind
-{
-    NONE,
-    MILD,
-    SEVERE
-};
-
-struct WriterNegativeEpisode
-{
-    bool severe_active = false;
-    bool severe_triggered = false;
-    uint32_t severe_windows = 0;
-    uint32_t severe_clear_windows = 0;
-    bool mild_active = false;
-    bool mild_triggered = false;
-    uint32_t mild_windows = 0;
-    uint32_t mild_clear_windows = 0;
-};
-
-struct BudgetDecreaseObservation
-{
-    bool active = false;
-    SyncNegativeFeedbackKind kind = SyncNegativeFeedbackKind::NONE;
-    uint64_t budget_before = 0u;
-    uint64_t budget_after = 0u;
-    uint32_t windows = 0u;
-    uint32_t min_windows = 3u;
-    uint32_t max_windows = 9u;
-    steady_clock::time_point started;
-    double min_duration_ms = 0.0;
-    double max_duration_ms = 0.0;
-    double before_negative_share = 0.0;
-    double before_severe_share = 0.0;
-    double before_timeout_share = 0.0;
-    uint64_t evidence_units = 0u;
-    uint64_t negative_units = 0u;
-    uint64_t severe_units = 0u;
-    uint64_t repair_active_units = 0u;
-    uint64_t timeout_units = 0u;
-};
-
-enum class BudgetObservationResult
-{
-    ACTIVE,
-    COMMIT_IMPROVED,
-    ROLLBACK_NO_IMPROVEMENT,
-    COMMIT_WORSENED
 };
 
 struct WriterState
 {
-    uint64_t byte_budget = max_bytes_per_cycle;
-    uint64_t previous_repair_send_samples = 0;
-    uint64_t previous_repair_timeout_samples = 0;
-    uint64_t previous_repair_no_ack_timeout_samples = 0;
-    uint64_t previous_repair_late_ack_severe_samples = 0;
-    uint64_t previous_repair_attempt_overflow_samples = 0;
-    uint64_t previous_repair_unattributed_send_samples = 0;
-    uint64_t previous_repair_send_bytes = 0;
-    uint64_t previous_repair_timeout_bytes = 0;
-    uint64_t previous_repair_no_ack_timeout_bytes = 0;
-    uint64_t previous_repair_late_ack_severe_bytes = 0;
-    uint64_t previous_repair_attempt_overflow_bytes = 0;
-    uint64_t previous_repair_unattributed_send_bytes = 0;
-    uint64_t previous_repair_ack_samples = 0;
-    uint64_t previous_repair_ack_bytes = 0;
     uint64_t repair_unattributed_send_samples = 0;
     uint64_t repair_unattributed_send_bytes = 0;
-    uint64_t previous_feedback_strong_positive_samples = 0;
-    uint64_t previous_feedback_normal_samples = 0;
-    uint64_t previous_feedback_mild_negative_samples = 0;
-    uint64_t previous_feedback_severe_negative_samples = 0;
-    uint64_t previous_feedback_strong_positive_bytes = 0;
-    uint64_t previous_feedback_normal_bytes = 0;
-    uint64_t previous_feedback_mild_negative_bytes = 0;
-    uint64_t previous_feedback_severe_negative_bytes = 0;
-    double stable_feedback_ms = 0.0;
-    uint32_t stable_feedback_calibration_samples = 0;
-    steady_clock::time_point stable_feedback_calibration_started;
-    bool stable_feedback_calibrated = false;
-    RecoveryState recovery_state = RecoveryState::NORMAL;
-    uint32_t pressure_cycles = 0;
-    uint32_t improving_cycles = 0;
-    WriterNegativeEpisode negative_episode;
-    BudgetDecreaseObservation budget_observation;
     double feedback_strong_positive_ratio = default_feedback_strong_positive_ratio;
     double feedback_slow_ratio = default_feedback_slow_ratio;
 };
@@ -369,20 +256,6 @@ enum class SevereRepairReason
 {
     NO_ACK_TIMEOUT,
     LATE_ACK
-};
-
-struct AdmissionCandidate
-{
-    ChangeKey key;
-    uint32_t estimated_bytes = 0;
-    double request_age_ms = 0.0;
-    uint32_t requests = 0;
-    bool earliest_requested = false;
-    bool has_newer_change = false;
-    bool important = false;
-    bool replaceable = false;
-    double value_horizon_ms = 0.0;
-    CandidateValueClass value_class = CandidateValueClass::DEFAULT;
 };
 
 double update_ewma(
@@ -487,14 +360,6 @@ double feedback_classification_window_ms(
     return (std::max)(
         min_repair_timeout_ms,
         reader.stable_feedback_ms * repair_timeout_baseline_multiplier);
-}
-
-double writer_repair_classification_window_ms(
-        double stable_feedback_ms)
-{
-    return (std::max)(
-        min_repair_timeout_ms,
-        stable_feedback_ms * repair_timeout_baseline_multiplier);
 }
 
 RepairFeedbackClass classify_repair_feedback(
@@ -675,237 +540,7 @@ void mark_pending_new_dirty(
     }
 }
 
-double ratio(
-        uint64_t numerator,
-        uint64_t denominator)
-{
-    return denominator > 0u ? static_cast<double>(numerator) / static_cast<double>(denominator) : 0.0;
-}
-
-bool strict_majority_count(
-        uint64_t numerator,
-        uint64_t denominator)
-{
-    return denominator > 0u && numerator > denominator - numerator;
-}
-
-bool half_or_more_count(
-        uint64_t numerator,
-        uint64_t denominator)
-{
-    return denominator > 0u && numerator >= denominator - numerator;
-}
-
-bool share_improved(
-        double before,
-        double after)
-{
-    return before > 0.0 && (after <= before * 0.8 || before - after >= 0.10);
-}
-
-bool share_worsened(
-        double before,
-        double after)
-{
-    if (before < 0.05)
-    {
-        return after - before >= 0.10;
-    }
-    return after > before && (after >= before * 1.1 || after - before >= 0.10);
-}
-
-void update_writer_negative_episode(
-        bool signal_sample,
-        uint32_t clear_threshold,
-        uint32_t& signal_windows,
-        uint32_t& clear_windows,
-        bool& episode_active,
-        bool& episode_triggered)
-{
-    if (signal_sample)
-    {
-        episode_active = true;
-        clear_windows = 0u;
-        signal_windows = std::min(clear_threshold, signal_windows + 1u);
-        return;
-    }
-
-    if (!episode_active)
-    {
-        signal_windows = 0u;
-        clear_windows = 0u;
-        episode_triggered = false;
-        return;
-    }
-
-    clear_windows = std::min(clear_threshold, clear_windows + 1u);
-    if (clear_windows >= clear_threshold)
-    {
-        episode_active = false;
-        episode_triggered = false;
-        signal_windows = 0u;
-        clear_windows = 0u;
-    }
-}
-
-void reset_writer_negative_episode(
-        WriterState& writer)
-{
-    writer.negative_episode = WriterNegativeEpisode();
-    writer.pressure_cycles = 0u;
-}
-
-double observation_elapsed_ms(
-        const BudgetDecreaseObservation& observation,
-        steady_clock::time_point now)
-{
-    if (steady_clock::time_point() == observation.started)
-    {
-        return 0.0;
-    }
-    return std::chrono::duration<double, std::milli>(now - observation.started).count();
-}
-
-double observation_after_negative_share(
-        const BudgetDecreaseObservation& observation)
-{
-    return ratio(observation.negative_units, observation.evidence_units);
-}
-
-double observation_after_severe_share(
-        const BudgetDecreaseObservation& observation)
-{
-    return ratio(observation.severe_units, observation.evidence_units);
-}
-
-double observation_after_timeout_share(
-        const BudgetDecreaseObservation& observation)
-{
-    return ratio(observation.timeout_units, observation.repair_active_units);
-}
-
-void start_budget_observation(
-        WriterState& writer,
-        SyncNegativeFeedbackKind kind,
-        uint64_t budget_before,
-        uint64_t budget_after,
-        steady_clock::time_point now,
-        double repair_window_ms,
-        uint64_t evidence_units,
-        uint64_t negative_units,
-        uint64_t severe_units,
-        uint64_t repair_active_units,
-        uint64_t timeout_units)
-{
-    writer.budget_observation = BudgetDecreaseObservation();
-    writer.budget_observation.active = true;
-    writer.budget_observation.kind = kind;
-    writer.budget_observation.budget_before = budget_before;
-    writer.budget_observation.budget_after = budget_after;
-    writer.budget_observation.started = now;
-    writer.budget_observation.min_duration_ms = std::max(min_repair_timeout_ms, repair_window_ms);
-    writer.budget_observation.max_duration_ms = writer.budget_observation.min_duration_ms * 3.0;
-    writer.budget_observation.before_negative_share = ratio(negative_units, evidence_units);
-    writer.budget_observation.before_severe_share = ratio(severe_units, evidence_units);
-    writer.budget_observation.before_timeout_share = ratio(timeout_units, repair_active_units);
-}
-
-void accumulate_budget_observation(
-        BudgetDecreaseObservation& observation,
-        uint64_t evidence_units,
-        uint64_t negative_units,
-        uint64_t severe_units,
-        uint64_t repair_active_units,
-        uint64_t timeout_units)
-{
-    ++observation.windows;
-    observation.evidence_units += evidence_units;
-    observation.negative_units += negative_units;
-    observation.severe_units += severe_units;
-    observation.repair_active_units += repair_active_units;
-    observation.timeout_units += timeout_units;
-}
-
-BudgetObservationResult evaluate_budget_observation(
-        const BudgetDecreaseObservation& observation,
-        steady_clock::time_point now)
-{
-    if (!observation.active)
-    {
-        return BudgetObservationResult::ACTIVE;
-    }
-
-    const double elapsed_ms = observation_elapsed_ms(observation, now);
-    const bool min_elapsed = observation.windows >= observation.min_windows &&
-            elapsed_ms >= observation.min_duration_ms;
-    const bool max_elapsed = observation.windows >= observation.max_windows ||
-            (observation.max_duration_ms > 0.0 && elapsed_ms >= observation.max_duration_ms);
-    const bool has_observation_evidence = observation.evidence_units > 0u ||
-            observation.timeout_units > 0u;
-    if (!min_elapsed && !max_elapsed)
-    {
-        return BudgetObservationResult::ACTIVE;
-    }
-
-    if (!has_observation_evidence)
-    {
-        return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
-    }
-
-    const double after_negative_share = observation_after_negative_share(observation);
-    const double after_severe_share = observation_after_severe_share(observation);
-    const double after_timeout_share = observation_after_timeout_share(observation);
-    const bool negative_improved = share_improved(observation.before_negative_share, after_negative_share);
-    const bool severe_improved = share_improved(observation.before_severe_share, after_severe_share);
-    const bool timeout_improved = share_improved(observation.before_timeout_share, after_timeout_share);
-    const bool negative_worsened = share_worsened(observation.before_negative_share, after_negative_share);
-    const bool severe_worsened = share_worsened(observation.before_severe_share, after_severe_share);
-    const bool timeout_worsened = share_worsened(observation.before_timeout_share, after_timeout_share);
-    const bool severe_or_timeout_worsened = severe_worsened || timeout_worsened;
-    const bool trigger_metric_improved = SyncNegativeFeedbackKind::SEVERE == observation.kind ?
-            (severe_improved || timeout_improved) : negative_improved;
-    if (trigger_metric_improved && !severe_or_timeout_worsened)
-    {
-        return BudgetObservationResult::COMMIT_IMPROVED;
-    }
-    if (severe_or_timeout_worsened || negative_worsened)
-    {
-        return BudgetObservationResult::COMMIT_WORSENED;
-    }
-    return BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT;
-}
-
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-const char* sync_negative_kind_name(
-        SyncNegativeFeedbackKind kind)
-{
-    switch (kind)
-    {
-        case SyncNegativeFeedbackKind::MILD:
-            return "mild";
-        case SyncNegativeFeedbackKind::SEVERE:
-            return "severe";
-        default:
-            return "none";
-    }
-}
-
-const char* budget_observation_result_name(
-        BudgetObservationResult result)
-{
-    switch (result)
-    {
-        case BudgetObservationResult::COMMIT_IMPROVED:
-            return "commit_improved";
-        case BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT:
-            return "rollback_no_improvement";
-        case BudgetObservationResult::COMMIT_WORSENED:
-            return "commit_worsened";
-        default:
-            return "active";
-    }
-}
-
 const char* repair_feedback_class_name(
         RepairFeedbackClass feedback_class)
 {
@@ -947,29 +582,6 @@ bool boolean_property_is_enabled(
     return "1" == normalized || "true" == normalized || "on" == normalized;
 }
 
-bool property_is_enabled(
-        StatefulWriter& writer)
-{
-    if (writer.getGuid().is_builtin())
-    {
-        return false;
-    }
-
-    return boolean_property_is_enabled(writer, enabled_property);
-}
-
-bool sync_admission_enabled(
-        StatefulWriter& writer)
-{
-    return property_is_enabled(writer) && !writer.isAsync();
-}
-
-bool admission_enabled(
-        StatefulWriter& writer)
-{
-    return sync_admission_enabled(writer);
-}
-
 bool async_observe_enabled(
         StatefulWriter& writer)
 {
@@ -984,6 +596,7 @@ bool async_feedback_accounting_enabled(
            (writer.uses_adaptive_value_flow_controller() || async_observe_enabled(writer));
 }
 
+#ifdef FASTDDS_RETRANSMISSION_TRACE
 const char* controller_mode_name(
         StatefulWriter& writer)
 {
@@ -995,186 +608,9 @@ const char* controller_mode_name(
     {
         return "ASYNC_OBSERVE";
     }
-    return "SYNC_ADMISSION";
-}
-
-const std::string* find_property(
-        StatefulWriter& writer,
-        const char* name)
-{
-    return PropertyPolicyHelper::find_property(writer.getAttributes().properties, name);
-}
-
-double positive_property_or(
-        StatefulWriter& writer,
-        const char* name,
-        double fallback)
-{
-    const std::string* value = find_property(writer, name);
-    if (nullptr != value)
-    {
-        try
-        {
-            const double parsed = std::stod(*value);
-            if (parsed > 0.0)
-            {
-                return parsed;
-            }
-        }
-        catch (...)
-        {
-        }
-    }
-    return fallback;
-}
-
-double nonnegative_property_or(
-        StatefulWriter& writer,
-        const char* name,
-        double fallback)
-{
-    const std::string* value = find_property(writer, name);
-    if (nullptr != value)
-    {
-        try
-        {
-            const double parsed = std::stod(*value);
-            if (parsed >= 0.0)
-            {
-                return parsed;
-            }
-        }
-        catch (...)
-        {
-        }
-    }
-    return fallback;
-}
-
-double hard_max_defer_or(
-        StatefulWriter& writer)
-{
-    return positive_property_or(
-        writer,
-        "fastdds.adaptive_retransmission.hard_max_defer_ms",
-        default_hard_max_defer_ms);
-}
-
-double defer_cooldown_or(
-        StatefulWriter& writer)
-{
-    return nonnegative_property_or(
-        writer,
-        "fastdds.adaptive_retransmission.defer_cooldown_ms",
-        default_defer_cooldown_ms);
-}
-
-steady_clock::duration milliseconds_duration(
-        double milliseconds)
-{
-    return std::chrono::duration_cast<steady_clock::duration>(
-        std::chrono::duration<double, std::milli>(milliseconds));
-}
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-const char* recovery_state_name(
-        RecoveryState state)
-{
-    switch (state)
-    {
-        case RecoveryState::PRESSURE:
-            return "PRESSURE";
-        case RecoveryState::RECOVERY:
-            return "RECOVERY";
-        default:
-            return "NORMAL";
-    }
-}
-
-const char* value_class_name(
-        CandidateValueClass value_class)
-{
-    switch (value_class)
-    {
-        case CandidateValueClass::IMPORTANT:
-            return "important";
-        case CandidateValueClass::REPLACEABLE_SNAPSHOT:
-            return "replaceable_snapshot";
-        default:
-            return "default";
-    }
-}
-
-const char* force_class_name(
-        ForceClass force_class)
-{
-    switch (force_class)
-    {
-        case ForceClass::STRONG:
-            return "strong";
-        case ForceClass::NORMAL:
-            return "normal";
-        case ForceClass::SOFT:
-            return "soft";
-        default:
-            return "none";
-    }
+    return "SYNC_DISABLED";
 }
 #endif // FASTDDS_RETRANSMISSION_TRACE
-
-ForceClass stronger_force(
-        ForceClass left,
-        ForceClass right)
-{
-    return static_cast<int>(left) >= static_cast<int>(right) ? left : right;
-}
-
-ForceClass classify_force(
-        const AdmissionCandidate& candidate,
-        double hard_max_defer)
-{
-    if (candidate.request_age_ms < hard_max_defer)
-    {
-        return ForceClass::NONE;
-    }
-    if (candidate.important)
-    {
-        return ForceClass::STRONG;
-    }
-    if (candidate.replaceable && candidate.has_newer_change)
-    {
-        return ForceClass::SOFT;
-    }
-    return ForceClass::NORMAL;
-}
-
-bool cooldown_eligible(
-        const AdmissionCandidate& candidate,
-        ForceClass force_class)
-{
-    return candidate.replaceable && candidate.has_newer_change &&
-           (ForceClass::NONE == force_class || ForceClass::SOFT == force_class);
-}
-
-void classify_value(
-        StatefulWriter& writer,
-        AdmissionCandidate& candidate)
-{
-    const std::string* value_class = find_property(writer,
-                    "fastdds.adaptive_retransmission.value_class");
-    candidate.important = nullptr != value_class && "important" == *value_class;
-    candidate.replaceable = nullptr != value_class && "replaceable_snapshot" == *value_class;
-    if (candidate.important)
-    {
-        candidate.value_class = CandidateValueClass::IMPORTANT;
-    }
-    else if (candidate.replaceable)
-    {
-        candidate.value_class = CandidateValueClass::REPLACEABLE_SNAPSHOT;
-    }
-    candidate.value_horizon_ms = positive_property_or(writer,
-                    "fastdds.adaptive_retransmission.value_horizon_ms", 0.0);
-}
 
 } // namespace
 
@@ -1185,7 +621,6 @@ struct AdaptiveRetransmissionController::Implementation
     std::map<ChangeKey, ChangeState> changes;
     std::map<ChangeKey, DeliveryEpisode> episodes;
     std::map<GUID_t, WriterState> writers;
-    std::map<GUID_t, std::vector<AdmissionCandidate>> cycle_candidates;
     std::map<SendPeriodKey, SendPeriodSeal> send_period_seals;
     std::map<SendPeriodKey, std::vector<PendingOriginPositiveFeedback>> pending_origin_positive_feedback;
 
@@ -1288,6 +723,54 @@ void record_origin_positive_feedback_locked(
         PendingOriginPositiveFeedback {reader_key, estimated_bytes});
 }
 
+void seal_send_period_locked(
+        std::map<ReaderKey, ReaderState>& readers,
+        std::map<SendPeriodKey, SendPeriodSeal>& send_period_seals,
+        std::map<SendPeriodKey, std::vector<PendingOriginPositiveFeedback>>& pending_origin_positive_feedback,
+        const GUID_t& writer_guid,
+        uint64_t period_id,
+        uint64_t selected_bytes,
+        uint64_t active_load_floor_bytes,
+        bool saturated,
+        uint64_t* released_positive_samples,
+        uint64_t* released_positive_bytes)
+{
+    if (0u == period_id)
+    {
+        return;
+    }
+
+    const SendPeriodKey period_key {writer_guid, period_id};
+    send_period_seals[period_key] = SendPeriodSeal {
+        selected_bytes,
+        active_load_floor_bytes,
+        saturated
+    };
+
+    auto pending = pending_origin_positive_feedback.find(period_key);
+    if (pending != pending_origin_positive_feedback.end())
+    {
+        if (saturated)
+        {
+            for (const PendingOriginPositiveFeedback& feedback : pending->second)
+            {
+                record_origin_saturated_positive_feedback(
+                    readers[feedback.reader],
+                    feedback.estimated_bytes);
+                if (nullptr != released_positive_samples)
+                {
+                    ++(*released_positive_samples);
+                }
+                if (nullptr != released_positive_bytes)
+                {
+                    *released_positive_bytes += feedback.estimated_bytes;
+                }
+            }
+        }
+        pending_origin_positive_feedback.erase(pending);
+    }
+}
+
 } // namespace
 
 AdaptiveRetransmissionController& AdaptiveRetransmissionController::instance()
@@ -1304,6 +787,12 @@ AdaptiveRetransmissionController::AdaptiveRetransmissionController()
 AdaptiveRetransmissionController::~AdaptiveRetransmissionController()
 {
     delete impl_;
+}
+
+bool AdaptiveRetransmissionController::feedback_accounting_enabled(
+        StatefulWriter* writer)
+{
+    return nullptr != writer && async_feedback_accounting_enabled(*writer);
 }
 
 void AdaptiveRetransmissionController::configure_feedback_thresholds(
@@ -1403,7 +892,7 @@ AdaptiveRetransmissionFeedbackSnapshot AdaptiveRetransmissionController::feedbac
                << ";episode_send_count=" << it->second.send_count
                << ";episode_generation=" << it->second.generation;
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED" : "REPAIR_TIMEOUT_CONFIRMED_PROXY",
+            "ADAPT_ASYNC_REPAIR_TIMEOUT_CONFIRMED",
             writer->getGuid(),
             it->first.path.reader,
             it->first.sequence,
@@ -1601,8 +1090,7 @@ void AdaptiveRetransmissionController::on_requested(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    const bool sync_admission = admission_enabled(*writer);
-    if (!sync_admission && !async_feedback_accounting)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -1656,7 +1144,7 @@ void AdaptiveRetransmissionController::on_requested(
     }
 
     FASTDDS_TRACE_RETRANSMISSION(
-        writer->isAsync() ? "ADAPT_ASYNC_REQUEST_OBSERVED" : "ADAPT_REQUEST_OBSERVED",
+        "ADAPT_ASYNC_REQUEST_OBSERVED",
         writer->getGuid(),
         reader_guid,
         change.sequenceNumber,
@@ -1676,8 +1164,7 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    const bool sync_admission = admission_enabled(*writer);
-    if (!async_feedback_accounting && !sync_admission)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -1710,7 +1197,6 @@ void AdaptiveRetransmissionController::on_old_sample_enqueued(
             observed.estimated_bytes = change.serializedPayload.length;
         }
         observed.last_interest = now;
-
 #ifdef FASTDDS_RETRANSMISSION_TRACE
         const double age_ms = std::chrono::duration<double, std::milli>(
             now - observed.first_request).count();
@@ -1750,8 +1236,7 @@ void AdaptiveRetransmissionController::on_initial_old_sample_enqueued(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    const bool sync_admission = admission_enabled(*writer);
-    if (!sync_admission && !async_feedback_accounting)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -1791,7 +1276,7 @@ void AdaptiveRetransmissionController::on_initial_old_sample_enqueued(
            << ";open_delivery_episodes=" << open_delivery_episodes
            << ";pending_new_dirty_sequences=" << pending_new_dirty_sequences;
     FASTDDS_TRACE_RETRANSMISSION(
-        writer->isAsync() ? "ADAPT_ASYNC_INITIAL_OLD_SAMPLE_ENQUEUED" : "INITIAL_OLD_SAMPLE_ENQUEUED_PROXY",
+        "ADAPT_ASYNC_INITIAL_OLD_SAMPLE_ENQUEUED",
         writer->getGuid(),
         reader_guid,
         change.sequenceNumber,
@@ -1813,8 +1298,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    const bool sync_admission = admission_enabled(*writer);
-    if (!async_feedback_accounting && !sync_admission)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -1848,6 +1332,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
         std::lock_guard<std::mutex> lock(impl_->mutex);
         const GUID_t writer_guid = writer->getGuid();
         WriterState& writer_state = impl_->writers[writer_guid];
+        uint64_t effective_send_period_id = send_period_id;
         std::vector<GUID_t> unique_served_readers = served_readers;
         std::sort(unique_served_readers.begin(), unique_served_readers.end());
         unique_served_readers.erase(
@@ -1874,7 +1359,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                     episode.generation++;
                 }
                 episode.last_send_time = now;
-                episode.last_send_period_id = send_period_id;
+                episode.last_send_period_id = effective_send_period_id;
                 episode.estimated_bytes = change.serializedPayload.length;
                 episode.has_new_send = true;
                 episode.dirty = episode.dirty ||
@@ -1890,7 +1375,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                        << ";source=actual_new_send"
                        << ";old_sample=" << old_sample
                        << ";episode_send_count=" << episode.send_count
-                       << ";send_period_id=" << send_period_id
+                       << ";send_period_id=" << effective_send_period_id
                        << ";episode_dirty=" << episode.dirty
                        << ";episode_generation=" << episode.generation
                        << ";estimated_bytes=" << change.serializedPayload.length
@@ -1939,7 +1424,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                     episode.generation++;
                 }
                 episode.last_send_time = now;
-                episode.last_send_period_id = send_period_id;
+                episode.last_send_period_id = effective_send_period_id;
                 episode.estimated_bytes = change.serializedPayload.length;
                 if (!episode.has_repair_send)
                 {
@@ -1959,7 +1444,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                        << ";source=actual_repair_send"
                        << ";old_sample=" << old_sample
                        << ";episode_send_count=" << episode.send_count
-                       << ";send_period_id=" << send_period_id
+                       << ";send_period_id=" << effective_send_period_id
                        << ";episode_generation=" << episode.generation
                        << ";episode_had_new_send=" << episode.has_new_send
                        << ";estimated_bytes=" << change.serializedPayload.length
@@ -2005,7 +1490,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                << ";reason=" << unattributed_old_reason
                << ";unattributed_reader_paths=" << unattributed_old_reader_paths;
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_REPAIR_SAMPLE_UNATTRIBUTED" : "REPAIR_SAMPLE_UNATTRIBUTED_PROXY",
+            "ADAPT_ASYNC_REPAIR_SAMPLE_UNATTRIBUTED",
             writer->getGuid(),
             GUID_t::unknown(),
             change.sequenceNumber,
@@ -2022,7 +1507,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
                << ";evidence=out_of_scope"
                << ";reason=no_served_reader_set";
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_NEW_SAMPLE_UNATTRIBUTED" : "NEW_SAMPLE_UNATTRIBUTED_PROXY",
+            "ADAPT_ASYNC_NEW_SAMPLE_UNATTRIBUTED",
             writer->getGuid(),
             GUID_t::unknown(),
             change.sequenceNumber,
@@ -2032,7 +1517,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
     for (const NewSendTrace& trace : new_send_traces)
     {
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_NEW_SAMPLE_SENT" : "NEW_SAMPLE_SENT_PROXY",
+            "ADAPT_ASYNC_NEW_SAMPLE_SENT",
             writer->getGuid(),
             trace.reader,
             trace.sequence,
@@ -2042,7 +1527,7 @@ void AdaptiveRetransmissionController::on_repair_sample_sent(
     for (const RepairSendTrace& trace : repair_send_traces)
     {
         FASTDDS_TRACE_RETRANSMISSION(
-            writer->isAsync() ? "ADAPT_ASYNC_REPAIR_SAMPLE_SENT" : "REPAIR_SAMPLE_SENT_PROXY",
+            "ADAPT_ASYNC_REPAIR_SAMPLE_SENT",
             writer->getGuid(),
             trace.reader,
             trace.sequence,
@@ -2080,31 +1565,22 @@ void AdaptiveRetransmissionController::on_async_send_period_sealed(
 
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        const SendPeriodKey period_key {writer->getGuid(), period_id};
-        impl_->send_period_seals[period_key] = SendPeriodSeal {
+        seal_send_period_locked(
+            impl_->readers,
+            impl_->send_period_seals,
+            impl_->pending_origin_positive_feedback,
+            writer->getGuid(),
+            period_id,
             selected_bytes,
             active_load_floor_bytes,
-            saturated
-        };
-
-        auto pending = impl_->pending_origin_positive_feedback.find(period_key);
-        if (pending != impl_->pending_origin_positive_feedback.end())
-        {
-            if (saturated)
-            {
-                for (const PendingOriginPositiveFeedback& feedback : pending->second)
-                {
-                    record_origin_saturated_positive_feedback(
-                        impl_->readers[feedback.reader],
-                        feedback.estimated_bytes);
+            saturated,
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-                    ++released_positive_samples;
-                    released_positive_bytes += feedback.estimated_bytes;
+            &released_positive_samples,
+            &released_positive_bytes);
+#else
+            nullptr,
+            nullptr);
 #endif // FASTDDS_RETRANSMISSION_TRACE
-                }
-            }
-            impl_->pending_origin_positive_feedback.erase(pending);
-        }
 
         prune_send_period_tracking_locked(
             impl_->send_period_seals,
@@ -2132,833 +1608,6 @@ void AdaptiveRetransmissionController::on_async_send_period_sealed(
 #endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
-void AdaptiveRetransmissionController::begin_admission_cycle(
-        StatefulWriter* writer)
-{
-    if (nullptr == writer || !admission_enabled(*writer))
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->cycle_candidates[writer->getGuid()].clear();
-}
-
-bool AdaptiveRetransmissionController::admission_planning_enabled(
-        StatefulWriter* writer)
-{
-    return nullptr != writer && admission_enabled(*writer);
-}
-
-void AdaptiveRetransmissionController::add_admission_candidate(
-        StatefulWriter* writer,
-        const GUID_t& reader_guid,
-        const CacheChange_t& change,
-        bool earliest_requested)
-{
-    if (nullptr == writer || !admission_enabled(*writer))
-    {
-        return;
-    }
-
-    const auto now = steady_clock::now();
-    const ReaderKey reader_key {writer->getGuid(), reader_guid};
-    const ChangeKey change_key {reader_key, change.sequenceNumber};
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    ChangeState& observed = impl_->changes[change_key];
-    if (0 == observed.requests)
-    {
-        observed.first_request = now;
-        observed.estimated_bytes = change.serializedPayload.length;
-    }
-
-    AdmissionCandidate candidate;
-    candidate.key = change_key;
-    candidate.estimated_bytes = 0 == observed.estimated_bytes ?
-            change.serializedPayload.length : observed.estimated_bytes;
-    candidate.request_age_ms = std::chrono::duration<double, std::milli>(
-        now - observed.first_request).count();
-    candidate.requests = observed.requests;
-    candidate.earliest_requested = earliest_requested;
-    candidate.has_newer_change = change.sequenceNumber + 1 < writer->next_sequence_number();
-    classify_value(*writer, candidate);
-    impl_->cycle_candidates[writer->getGuid()].push_back(candidate);
-}
-
-std::vector<AdaptiveRetransmissionPlanEntry> AdaptiveRetransmissionController::finalize_admission_cycle(
-        StatefulWriter* writer)
-{
-    std::vector<AdaptiveRetransmissionPlanEntry> plan;
-    if (nullptr == writer || !admission_enabled(*writer))
-    {
-        return plan;
-    }
-
-    feedback_snapshot(writer);
-
-    struct ChangeGroup
-    {
-        SequenceNumber_t sequence;
-        std::vector<size_t> candidates;
-        uint32_t estimated_bytes = 0;
-        double max_age_ms = 0.0;
-        uint32_t max_requests = 0;
-        bool blocking = false;
-        bool important = false;
-        bool urgent = false;
-        bool superseded = true;
-        ForceClass force_class = ForceClass::NONE;
-    };
-
-    uint32_t cooldown_skipped_changes = 0;
-    uint64_t cooldown_skipped_bytes = 0;
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-    struct PlanTrace
-    {
-        GUID_t reader;
-        SequenceNumber_t sequence;
-        uint32_t estimated_bytes;
-        std::string detail;
-    };
-    struct BudgetTrace
-    {
-        std::string detail;
-    };
-    std::vector<PlanTrace> plan_traces;
-    std::vector<BudgetTrace> budget_traces;
-    double min_cooldown_remaining_ms = 0.0;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        std::vector<AdmissionCandidate>& candidates = impl_->cycle_candidates[writer->getGuid()];
-        std::map<SequenceNumber_t, ChangeGroup> grouped;
-        const auto now = steady_clock::now();
-        const double hard_max_defer = hard_max_defer_or(*writer);
-        const double defer_cooldown_ms = defer_cooldown_or(*writer);
-
-        for (size_t index = 0; index < candidates.size(); ++index)
-        {
-            const AdmissionCandidate& candidate = candidates[index];
-            ChangeState& observed = impl_->changes[candidate.key];
-            const ForceClass candidate_force = classify_force(candidate, hard_max_defer);
-            const bool cooldown_active = ForceClass::NONE == candidate_force &&
-                    defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force) &&
-                    observed.defer_cooldown_until != steady_clock::time_point() &&
-                    now < observed.defer_cooldown_until;
-            if (cooldown_active)
-            {
-                plan.push_back(
-                    AdaptiveRetransmissionPlanEntry
-                    {
-                        candidate.key.path.reader,
-                        candidate.key.sequence,
-                        AdaptiveRetransmissionDecision::DEFER
-                    });
-                ++cooldown_skipped_changes;
-                cooldown_skipped_bytes += candidate.estimated_bytes;
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                const double remaining_ms = std::chrono::duration<double, std::milli>(
-                    observed.defer_cooldown_until - now).count();
-                if (0.0 == min_cooldown_remaining_ms || remaining_ms < min_cooldown_remaining_ms)
-                {
-                    min_cooldown_remaining_ms = remaining_ms;
-                }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                continue;
-            }
-
-            ChangeGroup& group = grouped[candidate.key.sequence];
-            group.sequence = candidate.key.sequence;
-            group.candidates.push_back(index);
-            group.estimated_bytes = std::max(group.estimated_bytes, candidate.estimated_bytes);
-            group.max_age_ms = std::max(group.max_age_ms, candidate.request_age_ms);
-            group.max_requests = std::max(group.max_requests, candidate.requests);
-            group.force_class = stronger_force(group.force_class, candidate_force);
-            group.blocking |= candidate.earliest_requested;
-            group.important |= candidate.important;
-            group.urgent |= candidate.important && candidate.value_horizon_ms > 0.0 &&
-                    candidate.request_age_ms >= 0.75 * candidate.value_horizon_ms;
-            group.superseded &= candidate.replaceable && candidate.has_newer_change;
-        }
-
-        std::vector<ChangeGroup*> ordered;
-        uint64_t candidate_bytes = 0;
-        for (auto& item : grouped)
-        {
-            ordered.push_back(&item.second);
-            candidate_bytes += item.second.estimated_bytes;
-        }
-        const uint64_t pressure_candidate_bytes = candidate_bytes + cooldown_skipped_bytes;
-
-        WriterState& writer_state = impl_->writers[writer->getGuid()];
-        uint64_t repair_send_samples = 0;
-        uint64_t repair_ack_samples = 0;
-        uint64_t repair_timeout_samples = 0;
-        uint64_t repair_no_ack_timeout_samples = 0;
-        uint64_t repair_late_ack_severe_samples = 0;
-        uint64_t repair_attempt_overflow_samples = 0;
-        uint64_t repair_unattributed_send_samples = 0;
-        uint64_t repair_send_bytes = 0;
-        uint64_t repair_ack_bytes = 0;
-        uint64_t repair_timeout_bytes = 0;
-        uint64_t repair_no_ack_timeout_bytes = 0;
-        uint64_t repair_late_ack_severe_bytes = 0;
-        uint64_t repair_attempt_overflow_bytes = 0;
-        uint64_t repair_unattributed_send_bytes = 0;
-        uint64_t strong_positive_samples = 0;
-        uint64_t normal_samples = 0;
-        uint64_t mild_negative_samples = 0;
-        uint64_t severe_negative_samples = 0;
-        uint64_t strong_positive_bytes = 0;
-        uint64_t normal_bytes = 0;
-        uint64_t mild_negative_bytes = 0;
-        uint64_t severe_negative_bytes = 0;
-        bool calibrated_feedback_available = false;
-        double calibrated_feedback_ms = 0.0;
-        repair_unattributed_send_samples = writer_state.repair_unattributed_send_samples;
-        repair_unattributed_send_bytes = writer_state.repair_unattributed_send_bytes;
-        for (const auto& item : impl_->readers)
-        {
-            if (item.first.writer == writer->getGuid())
-            {
-                repair_send_samples += item.second.repair_send_samples;
-                repair_ack_samples += item.second.repair_ack_samples;
-                repair_timeout_samples += item.second.repair_timeout_samples;
-                repair_no_ack_timeout_samples += item.second.repair_no_ack_timeout_samples;
-                repair_late_ack_severe_samples += item.second.repair_late_ack_severe_samples;
-                repair_attempt_overflow_samples += item.second.repair_attempt_overflow_samples;
-                repair_unattributed_send_samples += item.second.repair_unattributed_send_samples;
-                repair_send_bytes += item.second.repair_send_bytes;
-                repair_ack_bytes += item.second.repair_ack_bytes;
-                repair_timeout_bytes += item.second.repair_timeout_bytes;
-                repair_no_ack_timeout_bytes += item.second.repair_no_ack_timeout_bytes;
-                repair_late_ack_severe_bytes += item.second.repair_late_ack_severe_bytes;
-                repair_attempt_overflow_bytes += item.second.repair_attempt_overflow_bytes;
-                repair_unattributed_send_bytes += item.second.repair_unattributed_send_bytes;
-                strong_positive_samples += item.second.feedback_strong_positive_samples;
-                normal_samples += item.second.feedback_normal_samples;
-                mild_negative_samples += item.second.feedback_mild_negative_samples;
-                severe_negative_samples += item.second.feedback_severe_negative_samples;
-                strong_positive_bytes += item.second.feedback_strong_positive_bytes;
-                normal_bytes += item.second.feedback_normal_bytes;
-                mild_negative_bytes += item.second.feedback_mild_negative_bytes;
-                severe_negative_bytes += item.second.feedback_severe_negative_bytes;
-                if (item.second.stable_feedback_calibrated && item.second.stable_feedback_ms > 0.0)
-                {
-                    calibrated_feedback_available = true;
-                    calibrated_feedback_ms = std::max(
-                        calibrated_feedback_ms,
-                        item.second.stable_feedback_ms);
-                }
-            }
-        }
-
-        if (calibrated_feedback_available && calibrated_feedback_ms > 0.0)
-        {
-            if (!writer_state.stable_feedback_calibrated || 0.0 == writer_state.stable_feedback_ms)
-            {
-                writer_state.stable_feedback_calibrated = true;
-                writer_state.stable_feedback_ms = calibrated_feedback_ms;
-            }
-        }
-
-        const auto counter_delta = [](uint64_t current, uint64_t previous) -> uint64_t
-                {
-                    return current > previous ? current - previous : 0u;
-                };
-        const uint64_t repair_send_samples_delta = counter_delta(
-            repair_send_samples, writer_state.previous_repair_send_samples);
-        const uint64_t repair_ack_samples_delta = counter_delta(
-            repair_ack_samples, writer_state.previous_repair_ack_samples);
-        const uint64_t repair_timeout_samples_delta = counter_delta(
-            repair_timeout_samples, writer_state.previous_repair_timeout_samples);
-        const uint64_t repair_no_ack_timeout_samples_delta = counter_delta(
-            repair_no_ack_timeout_samples, writer_state.previous_repair_no_ack_timeout_samples);
-        const uint64_t repair_late_ack_severe_samples_delta = counter_delta(
-            repair_late_ack_severe_samples, writer_state.previous_repair_late_ack_severe_samples);
-        const uint64_t repair_attempt_overflow_samples_delta = counter_delta(
-            repair_attempt_overflow_samples, writer_state.previous_repair_attempt_overflow_samples);
-        const uint64_t repair_unattributed_send_samples_delta = counter_delta(
-            repair_unattributed_send_samples, writer_state.previous_repair_unattributed_send_samples);
-        const uint64_t repair_send_bytes_delta = counter_delta(
-            repair_send_bytes, writer_state.previous_repair_send_bytes);
-        const uint64_t repair_ack_bytes_delta = counter_delta(
-            repair_ack_bytes, writer_state.previous_repair_ack_bytes);
-        const uint64_t repair_timeout_bytes_delta = counter_delta(
-            repair_timeout_bytes, writer_state.previous_repair_timeout_bytes);
-        const uint64_t repair_no_ack_timeout_bytes_delta = counter_delta(
-            repair_no_ack_timeout_bytes, writer_state.previous_repair_no_ack_timeout_bytes);
-        const uint64_t repair_late_ack_severe_bytes_delta = counter_delta(
-            repair_late_ack_severe_bytes, writer_state.previous_repair_late_ack_severe_bytes);
-        const uint64_t repair_attempt_overflow_bytes_delta = counter_delta(
-            repair_attempt_overflow_bytes, writer_state.previous_repair_attempt_overflow_bytes);
-        const uint64_t repair_unattributed_send_bytes_delta = counter_delta(
-            repair_unattributed_send_bytes, writer_state.previous_repair_unattributed_send_bytes);
-#ifndef FASTDDS_RETRANSMISSION_TRACE
-        static_cast<void>(repair_send_samples_delta);
-        static_cast<void>(repair_timeout_samples_delta);
-        static_cast<void>(repair_no_ack_timeout_samples_delta);
-        static_cast<void>(repair_late_ack_severe_samples_delta);
-        static_cast<void>(repair_attempt_overflow_samples_delta);
-        static_cast<void>(repair_unattributed_send_samples_delta);
-        static_cast<void>(repair_send_bytes_delta);
-        static_cast<void>(repair_timeout_bytes_delta);
-        static_cast<void>(repair_no_ack_timeout_bytes_delta);
-        static_cast<void>(repair_late_ack_severe_bytes_delta);
-        static_cast<void>(repair_attempt_overflow_bytes_delta);
-        static_cast<void>(repair_unattributed_send_bytes_delta);
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        const uint64_t strong_positive_samples_delta = counter_delta(
-            strong_positive_samples, writer_state.previous_feedback_strong_positive_samples);
-        const uint64_t normal_samples_delta = counter_delta(
-            normal_samples, writer_state.previous_feedback_normal_samples);
-        const uint64_t mild_negative_samples_delta = counter_delta(
-            mild_negative_samples, writer_state.previous_feedback_mild_negative_samples);
-        const uint64_t severe_negative_samples_delta = counter_delta(
-            severe_negative_samples, writer_state.previous_feedback_severe_negative_samples);
-        const uint64_t strong_positive_bytes_delta = counter_delta(
-            strong_positive_bytes, writer_state.previous_feedback_strong_positive_bytes);
-        const uint64_t normal_bytes_delta = counter_delta(
-            normal_bytes, writer_state.previous_feedback_normal_bytes);
-        const uint64_t mild_negative_bytes_delta = counter_delta(
-            mild_negative_bytes, writer_state.previous_feedback_mild_negative_bytes);
-        const uint64_t severe_negative_bytes_delta = counter_delta(
-            severe_negative_bytes, writer_state.previous_feedback_severe_negative_bytes);
-
-        writer_state.previous_repair_send_samples = repair_send_samples;
-        writer_state.previous_repair_ack_samples = repair_ack_samples;
-        writer_state.previous_repair_timeout_samples = repair_timeout_samples;
-        writer_state.previous_repair_no_ack_timeout_samples = repair_no_ack_timeout_samples;
-        writer_state.previous_repair_late_ack_severe_samples = repair_late_ack_severe_samples;
-        writer_state.previous_repair_attempt_overflow_samples = repair_attempt_overflow_samples;
-        writer_state.previous_repair_unattributed_send_samples = repair_unattributed_send_samples;
-        writer_state.previous_repair_send_bytes = repair_send_bytes;
-        writer_state.previous_repair_ack_bytes = repair_ack_bytes;
-        writer_state.previous_repair_timeout_bytes = repair_timeout_bytes;
-        writer_state.previous_repair_no_ack_timeout_bytes = repair_no_ack_timeout_bytes;
-        writer_state.previous_repair_late_ack_severe_bytes = repair_late_ack_severe_bytes;
-        writer_state.previous_repair_attempt_overflow_bytes = repair_attempt_overflow_bytes;
-        writer_state.previous_repair_unattributed_send_bytes = repair_unattributed_send_bytes;
-        writer_state.previous_feedback_strong_positive_samples = strong_positive_samples;
-        writer_state.previous_feedback_normal_samples = normal_samples;
-        writer_state.previous_feedback_mild_negative_samples = mild_negative_samples;
-        writer_state.previous_feedback_severe_negative_samples = severe_negative_samples;
-        writer_state.previous_feedback_strong_positive_bytes = strong_positive_bytes;
-        writer_state.previous_feedback_normal_bytes = normal_bytes;
-        writer_state.previous_feedback_mild_negative_bytes = mild_negative_bytes;
-        writer_state.previous_feedback_severe_negative_bytes = severe_negative_bytes;
-
-        const uint64_t evidence_samples_delta = strong_positive_samples_delta + normal_samples_delta +
-                mild_negative_samples_delta + severe_negative_samples_delta;
-        const uint64_t evidence_bytes_delta = strong_positive_bytes_delta + normal_bytes_delta +
-                mild_negative_bytes_delta + severe_negative_bytes_delta;
-        const uint64_t negative_samples_delta = mild_negative_samples_delta + severe_negative_samples_delta;
-        const uint64_t negative_bytes_delta = mild_negative_bytes_delta + severe_negative_bytes_delta;
-        const uint64_t evidence_weight = evidence_bytes_delta > 0u ?
-                evidence_bytes_delta : evidence_samples_delta;
-        const uint64_t severe_weight = evidence_bytes_delta > 0u ?
-                severe_negative_bytes_delta : severe_negative_samples_delta;
-        const uint64_t negative_weight = evidence_bytes_delta > 0u ?
-                negative_bytes_delta : negative_samples_delta;
-        const uint64_t strong_positive_weight = evidence_bytes_delta > 0u ?
-                strong_positive_bytes_delta : strong_positive_samples_delta;
-        const bool classified_feedback_activity = evidence_weight > 0u;
-        const uint64_t repair_completed_bytes_delta =
-                repair_ack_bytes_delta + repair_no_ack_timeout_bytes_delta;
-        const uint64_t repair_completed_samples_delta =
-                repair_ack_samples_delta + repair_no_ack_timeout_samples_delta;
-        const uint64_t repair_completed_weight = repair_completed_bytes_delta > 0u ?
-                repair_completed_bytes_delta : repair_completed_samples_delta;
-        const uint64_t timeout_weight = repair_no_ack_timeout_bytes_delta > 0u ?
-                repair_no_ack_timeout_bytes_delta : repair_no_ack_timeout_samples_delta;
-        const bool severe_negative_feedback = strict_majority_count(severe_weight, evidence_weight);
-        const bool mild_negative_feedback =
-                !severe_negative_feedback && strict_majority_count(negative_weight, evidence_weight);
-        const bool strong_positive_feedback = 0u == negative_weight &&
-                half_or_more_count(strong_positive_weight, evidence_weight);
-        const bool normal_feedback = classified_feedback_activity &&
-                !severe_negative_feedback && !mild_negative_feedback && !strong_positive_feedback;
-        const uint64_t active_load_floor = std::max<uint64_t>(
-            additive_budget_step,
-            writer_state.byte_budget / 2u);
-        const bool active_repair_load = pressure_candidate_bytes >= active_load_floor;
-        const bool budget_limited = pressure_candidate_bytes > writer_state.byte_budget;
-        const bool positive_feedback_candidate = active_repair_load &&
-                (strong_positive_feedback || normal_feedback);
-        const bool recovery_probe_candidate = !classified_feedback_activity && budget_limited &&
-                writer_state.byte_budget < max_dynamic_bytes_per_cycle;
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        const uint64_t previous_byte_budget = writer_state.byte_budget;
-        const char* budget_reason = "hold";
-        const char* observation_result = "none";
-        bool tentative_decrease = false;
-        bool negative_decrease_suppressed_by_observation = false;
-        bool positive_suppressed_by_observation = false;
-        bool probe_suppressed_by_observation = false;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        bool reset_budget_observation_after_trace = false;
-
-        const uint32_t negative_clear_threshold = 2u;
-        update_writer_negative_episode(
-            severe_negative_feedback,
-            negative_clear_threshold,
-            writer_state.negative_episode.severe_windows,
-            writer_state.negative_episode.severe_clear_windows,
-            writer_state.negative_episode.severe_active,
-            writer_state.negative_episode.severe_triggered);
-        update_writer_negative_episode(
-            mild_negative_feedback,
-            negative_clear_threshold,
-            writer_state.negative_episode.mild_windows,
-            writer_state.negative_episode.mild_clear_windows,
-            writer_state.negative_episode.mild_active,
-            writer_state.negative_episode.mild_triggered);
-        writer_state.pressure_cycles = writer_state.negative_episode.mild_windows;
-        const bool negative_episode_active = writer_state.negative_episode.severe_active ||
-                writer_state.negative_episode.mild_active;
-        const bool positive_feedback = positive_feedback_candidate && !negative_episode_active;
-        const bool recovery_probe = recovery_probe_candidate && !negative_episode_active;
-
-        if (writer_state.budget_observation.active)
-        {
-            accumulate_budget_observation(
-                writer_state.budget_observation,
-                evidence_weight,
-                negative_weight,
-                severe_weight,
-                repair_completed_weight,
-                timeout_weight);
-            const BudgetObservationResult result = evaluate_budget_observation(
-                writer_state.budget_observation,
-                now);
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            observation_result = budget_observation_result_name(result);
-            negative_decrease_suppressed_by_observation = severe_negative_feedback || mild_negative_feedback;
-            positive_suppressed_by_observation = positive_feedback_candidate;
-            probe_suppressed_by_observation = recovery_probe_candidate;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            writer_state.improving_cycles = 0;
-            if (BudgetObservationResult::ACTIVE == result)
-            {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                budget_reason = "observation_active";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-            else
-            {
-                if (BudgetObservationResult::ROLLBACK_NO_IMPROVEMENT == result)
-                {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    budget_reason = "observation_rollback_no_improvement";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                    writer_state.byte_budget = std::min(
-                        max_dynamic_bytes_per_cycle,
-                        writer_state.budget_observation.budget_before);
-                    writer_state.recovery_state = pressure_candidate_bytes > 0u ?
-                            RecoveryState::RECOVERY : RecoveryState::NORMAL;
-                }
-                else
-                {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    budget_reason = BudgetObservationResult::COMMIT_WORSENED == result ?
-                            "observation_commit_worsened" : "observation_commit_improved";
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                    writer_state.byte_budget = std::min(
-                        max_dynamic_bytes_per_cycle,
-                        std::max(min_dynamic_bytes_per_cycle, writer_state.budget_observation.budget_after));
-                    writer_state.recovery_state = BudgetObservationResult::COMMIT_WORSENED == result ?
-                            RecoveryState::PRESSURE : RecoveryState::RECOVERY;
-                }
-                reset_budget_observation_after_trace = true;
-                reset_writer_negative_episode(writer_state);
-            }
-        }
-        else if (severe_negative_feedback && !writer_state.negative_episode.severe_triggered)
-        {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            budget_reason = "severe_negative_tentative";
-            tentative_decrease = true;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            writer_state.negative_episode.severe_triggered = true;
-            writer_state.pressure_cycles = 0;
-            writer_state.improving_cycles = 0;
-            writer_state.recovery_state = RecoveryState::PRESSURE;
-            const uint64_t budget_before = writer_state.byte_budget;
-            writer_state.byte_budget = std::max(
-                min_dynamic_bytes_per_cycle, writer_state.byte_budget / 2);
-            const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
-                    writer_repair_classification_window_ms(writer_state.stable_feedback_ms) :
-                    min_repair_timeout_ms;
-            start_budget_observation(
-                writer_state,
-                SyncNegativeFeedbackKind::SEVERE,
-                budget_before,
-                writer_state.byte_budget,
-                now,
-                observation_repair_window_ms,
-                evidence_weight,
-                negative_weight,
-                severe_weight,
-                repair_completed_weight,
-                timeout_weight);
-        }
-        else if (mild_negative_feedback)
-        {
-            writer_state.improving_cycles = 0;
-            if (writer_state.negative_episode.mild_windows >= 2u &&
-                    !writer_state.negative_episode.mild_triggered)
-            {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                budget_reason = "mild_negative_tentative";
-                tentative_decrease = true;
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                writer_state.negative_episode.mild_triggered = true;
-                writer_state.recovery_state = RecoveryState::PRESSURE;
-                const uint64_t budget_before = writer_state.byte_budget;
-                const uint64_t decreased_budget = writer_state.byte_budget > additive_budget_step ?
-                        writer_state.byte_budget - additive_budget_step : 0u;
-                writer_state.byte_budget = std::max(
-                    min_dynamic_bytes_per_cycle, decreased_budget);
-                const double observation_repair_window_ms = writer_state.stable_feedback_ms > 0.0 ?
-                        writer_repair_classification_window_ms(writer_state.stable_feedback_ms) :
-                        min_repair_timeout_ms;
-                start_budget_observation(
-                    writer_state,
-                    SyncNegativeFeedbackKind::MILD,
-                    budget_before,
-                    writer_state.byte_budget,
-                    now,
-                    observation_repair_window_ms,
-                    evidence_weight,
-                    negative_weight,
-                    severe_weight,
-                repair_completed_weight,
-                    timeout_weight);
-            }
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            else
-            {
-                budget_reason = "mild_negative_pending";
-            }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-        }
-        else
-        {
-            if (positive_feedback || recovery_probe)
-            {
-                ++writer_state.improving_cycles;
-                if (RecoveryState::PRESSURE == writer_state.recovery_state)
-                {
-                    writer_state.recovery_state = RecoveryState::RECOVERY;
-                }
-                if (writer_state.improving_cycles >= 3)
-                {
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                    budget_reason = recovery_probe ? "recovery_probe" :
-                            (strong_positive_feedback ? "strong_positive" : "normal");
-#endif // FASTDDS_RETRANSMISSION_TRACE
-                    const uint64_t positive_step = strong_positive_feedback ?
-                            std::max<uint64_t>(additive_budget_step, writer_state.byte_budget / 10u) :
-                            additive_budget_step;
-                    writer_state.byte_budget = std::min(
-                        max_dynamic_bytes_per_cycle, writer_state.byte_budget + positive_step);
-                    if (writer_state.byte_budget >= max_bytes_per_cycle)
-                    {
-                        writer_state.recovery_state = RecoveryState::NORMAL;
-                    }
-                }
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                else
-                {
-                    budget_reason = recovery_probe ? "recovery_probe_pending" : "positive_feedback_pending";
-                }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-            else
-            {
-                writer_state.improving_cycles = 0;
-            }
-        }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-        {
-            std::ostringstream detail;
-            detail << "mode=" << controller_mode_name(*writer)
-                   << ";reason=" << budget_reason
-                   << ";previous_byte_budget=" << previous_byte_budget
-                   << ";current_byte_budget=" << writer_state.byte_budget
-                   << ";network_state=" << recovery_state_name(writer_state.recovery_state)
-                   << ";candidate_bytes=" << candidate_bytes
-                   << ";pressure_candidate_bytes=" << pressure_candidate_bytes
-                   << ";cooldown_skipped_bytes=" << cooldown_skipped_bytes
-                   << ";active_load_floor=" << active_load_floor
-                   << ";active_repair_load=" << active_repair_load
-                   << ";budget_limited=" << budget_limited
-                   << ";classified_feedback_activity=" << classified_feedback_activity
-                   << ";positive_feedback=" << positive_feedback
-                   << ";recovery_probe=" << recovery_probe
-                   << ";severe_negative_feedback=" << severe_negative_feedback
-                   << ";mild_negative_feedback=" << mild_negative_feedback
-                   << ";strong_positive_feedback=" << strong_positive_feedback
-                   << ";normal_feedback=" << normal_feedback
-                   << ";evidence_samples_delta=" << evidence_samples_delta
-                   << ";evidence_bytes_delta=" << evidence_bytes_delta
-                   << ";strong_positive_samples_delta=" << strong_positive_samples_delta
-                   << ";normal_samples_delta=" << normal_samples_delta
-                   << ";mild_negative_samples_delta=" << mild_negative_samples_delta
-                   << ";severe_negative_samples_delta=" << severe_negative_samples_delta
-                   << ";strong_positive_bytes_delta=" << strong_positive_bytes_delta
-                   << ";normal_bytes_delta=" << normal_bytes_delta
-                   << ";mild_negative_bytes_delta=" << mild_negative_bytes_delta
-                   << ";severe_negative_bytes_delta=" << severe_negative_bytes_delta
-                   << ";repair_send_samples_delta=" << repair_send_samples_delta
-                   << ";repair_ack_samples_delta=" << repair_ack_samples_delta
-                   << ";repair_timeout_samples_delta=" << repair_timeout_samples_delta
-                   << ";repair_no_ack_timeout_samples_delta=" << repair_no_ack_timeout_samples_delta
-                   << ";repair_late_ack_severe_samples_delta=" << repair_late_ack_severe_samples_delta
-                   << ";repair_attempt_overflow_samples_delta=" << repair_attempt_overflow_samples_delta
-                   << ";repair_unattributed_send_samples_delta=" << repair_unattributed_send_samples_delta
-                   << ";repair_send_bytes_delta=" << repair_send_bytes_delta
-                   << ";repair_ack_bytes_delta=" << repair_ack_bytes_delta
-                   << ";repair_timeout_bytes_delta=" << repair_timeout_bytes_delta
-                   << ";repair_no_ack_timeout_bytes_delta=" << repair_no_ack_timeout_bytes_delta
-                   << ";repair_late_ack_severe_bytes_delta=" << repair_late_ack_severe_bytes_delta
-                   << ";repair_attempt_overflow_bytes_delta=" << repair_attempt_overflow_bytes_delta
-                   << ";repair_unattributed_send_bytes_delta=" << repair_unattributed_send_bytes_delta
-                   << ";repair_completed_weight=" << repair_completed_weight
-                   << ";timeout_weight=" << timeout_weight
-                   << ";observation_active=" << writer_state.budget_observation.active
-                   << ";observation_kind=" << sync_negative_kind_name(writer_state.budget_observation.kind)
-                   << ";observation_windows=" << writer_state.budget_observation.windows
-                   << ";observation_min_windows=" << writer_state.budget_observation.min_windows
-                   << ";observation_max_windows=" << writer_state.budget_observation.max_windows
-                   << ";observation_elapsed_ms=" << observation_elapsed_ms(
-                        writer_state.budget_observation, now)
-                   << ";observation_min_duration_ms=" << writer_state.budget_observation.min_duration_ms
-                   << ";observation_max_duration_ms=" << writer_state.budget_observation.max_duration_ms
-                   << ";observation_budget_before=" << writer_state.budget_observation.budget_before
-                   << ";observation_budget_after=" << writer_state.budget_observation.budget_after
-                   << ";observation_before_negative_share=" <<
-                        writer_state.budget_observation.before_negative_share
-                   << ";observation_before_severe_share=" <<
-                        writer_state.budget_observation.before_severe_share
-                   << ";observation_before_timeout_share=" <<
-                        writer_state.budget_observation.before_timeout_share
-                   << ";observation_after_negative_share=" <<
-                        observation_after_negative_share(writer_state.budget_observation)
-                   << ";observation_after_severe_share=" <<
-                        observation_after_severe_share(writer_state.budget_observation)
-                   << ";observation_after_timeout_share=" <<
-                        observation_after_timeout_share(writer_state.budget_observation)
-                   << ";observation_evidence_units=" << writer_state.budget_observation.evidence_units
-                   << ";observation_negative_units=" << writer_state.budget_observation.negative_units
-                   << ";observation_severe_units=" << writer_state.budget_observation.severe_units
-                   << ";observation_repair_active_units=" << writer_state.budget_observation.repair_active_units
-                   << ";observation_timeout_units=" << writer_state.budget_observation.timeout_units
-                   << ";observation_result=" << observation_result
-                   << ";tentative_decrease=" << tentative_decrease
-                   << ";negative_decrease_suppressed_by_observation=" <<
-                        negative_decrease_suppressed_by_observation
-                   << ";positive_suppressed_by_observation=" << positive_suppressed_by_observation
-                   << ";probe_suppressed_by_observation=" << probe_suppressed_by_observation
-                   << ";severe_episode_active=" << writer_state.negative_episode.severe_active
-                   << ";severe_episode_triggered=" << writer_state.negative_episode.severe_triggered
-                   << ";severe_episode_windows=" << writer_state.negative_episode.severe_windows
-                   << ";severe_episode_clear_windows=" << writer_state.negative_episode.severe_clear_windows
-                   << ";mild_episode_active=" << writer_state.negative_episode.mild_active
-                   << ";mild_episode_triggered=" << writer_state.negative_episode.mild_triggered
-                   << ";mild_episode_windows=" << writer_state.negative_episode.mild_windows
-                   << ";mild_episode_clear_windows=" << writer_state.negative_episode.mild_clear_windows
-                   << ";stable_feedback_ms=" << writer_state.stable_feedback_ms
-                   << ";stable_feedback_calibrated=" << writer_state.stable_feedback_calibrated
-                   << ";classification_window_ms=" << writer_repair_classification_window_ms(
-                        writer_state.stable_feedback_ms)
-                   << ";pressure_cycles=" << writer_state.pressure_cycles
-                   << ";improving_cycles=" << writer_state.improving_cycles;
-            budget_traces.push_back(BudgetTrace {detail.str()});
-        }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-
-        if (reset_budget_observation_after_trace)
-        {
-            writer_state.budget_observation = BudgetDecreaseObservation();
-        }
-
-        std::sort(ordered.begin(), ordered.end(),
-                [](const ChangeGroup* left, const ChangeGroup* right)
-                {
-                    const bool left_strong = ForceClass::STRONG == left->force_class;
-                    const bool right_strong = ForceClass::STRONG == right->force_class;
-                    if (left_strong != right_strong)
-                    {
-                        return left_strong;
-                    }
-                    if (left->blocking != right->blocking)
-                    {
-                        return left->blocking;
-                    }
-                    if (left->important != right->important)
-                    {
-                        return left->important;
-                    }
-                    if (left->urgent != right->urgent)
-                    {
-                        return left->urgent;
-                    }
-                    const bool left_normal_force = ForceClass::NORMAL == left->force_class;
-                    const bool right_normal_force = ForceClass::NORMAL == right->force_class;
-                    if (left_normal_force != right_normal_force)
-                    {
-                        return left_normal_force;
-                    }
-                    if (left->superseded != right->superseded)
-                    {
-                        return !left->superseded;
-                    }
-                    const bool left_soft_force = ForceClass::SOFT == left->force_class;
-                    const bool right_soft_force = ForceClass::SOFT == right->force_class;
-                    if (left_soft_force != right_soft_force)
-                    {
-                        return left_soft_force;
-                    }
-                    if (left->max_age_ms != right->max_age_ms)
-                    {
-                        return left->max_age_ms > right->max_age_ms;
-                    }
-                    if (left->max_requests != right->max_requests)
-                    {
-                        return left->max_requests > right->max_requests;
-                    }
-                    if (left->estimated_bytes != right->estimated_bytes)
-                    {
-                        return left->estimated_bytes < right->estimated_bytes;
-                    }
-                    return left->sequence < right->sequence;
-                });
-
-        uint64_t admitted_bytes = 0;
-        uint32_t admitted_changes = 0;
-        for (const ChangeGroup* group : ordered)
-        {
-            const bool within_change_limit = admitted_changes < max_planned_changes_per_cycle;
-            const bool within_byte_limit = 0 == admitted_changes ||
-                    admitted_bytes + group->estimated_bytes <= writer_state.byte_budget;
-            const bool force_due = ForceClass::NORMAL == group->force_class || ForceClass::STRONG == group->force_class;
-            const bool admitted = force_due || (within_change_limit && within_byte_limit);
-
-            for (size_t index : group->candidates)
-            {
-                const AdmissionCandidate& candidate = candidates[index];
-                const ForceClass candidate_force_class = classify_force(candidate, hard_max_defer);
-                const bool candidate_force_due = ForceClass::NORMAL == candidate_force_class ||
-                        ForceClass::STRONG == candidate_force_class;
-                const AdaptiveRetransmissionDecision decision = !admitted ?
-                        AdaptiveRetransmissionDecision::DEFER :
-                        (candidate_force_due ?
-                        AdaptiveRetransmissionDecision::FORCE_SEND :
-                        AdaptiveRetransmissionDecision::SEND_NOW);
-                plan.push_back(
-                    AdaptiveRetransmissionPlanEntry
-                    {
-                        candidate.key.path.reader,
-                        candidate.key.sequence,
-                        decision
-                    });
-                if (AdaptiveRetransmissionDecision::DEFER != decision)
-                {
-                    impl_->changes[candidate.key].last_interest = steady_clock::now();
-                    impl_->changes[candidate.key].defer_cooldown_until = steady_clock::time_point();
-                }
-                else if (defer_cooldown_ms > 0.0 && cooldown_eligible(candidate, candidate_force_class))
-                {
-                    impl_->changes[candidate.key].defer_cooldown_until = now + milliseconds_duration(defer_cooldown_ms);
-                }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-                std::ostringstream detail;
-                detail << "network_state=" << recovery_state_name(writer_state.recovery_state)
-                       << ";decision=" << (AdaptiveRetransmissionDecision::DEFER == decision ? "DEFER" :
-                        (AdaptiveRetransmissionDecision::FORCE_SEND == decision ? "FORCE_SEND" : "SEND_NOW"))
-                       << ";request_age_ms=" << candidate.request_age_ms
-                       << ";estimated_bytes=" << candidate.estimated_bytes
-                       << ";cycle_byte_budget=" << writer_state.byte_budget
-                       << ";cycle_candidate_bytes=" << candidate_bytes
-                       << ";pressure_candidate_bytes=" << pressure_candidate_bytes
-                       << ";cooldown_skipped_changes=" << cooldown_skipped_changes
-                       << ";earliest_requested=" << candidate.earliest_requested
-                       << ";has_newer_change=" << candidate.has_newer_change
-                       << ";important=" << candidate.important
-                       << ";replaceable=" << candidate.replaceable
-                       << ";value_class=" << value_class_name(candidate.value_class)
-                       << ";force_class=" << force_class_name(group->force_class)
-                       << ";candidate_force_class=" << force_class_name(candidate_force_class)
-                       << ";value_horizon_ms=" << candidate.value_horizon_ms
-                       << ";would_gap=" << (candidate.replaceable && candidate.has_newer_change &&
-                                candidate.value_horizon_ms > 0.0 &&
-                                candidate.request_age_ms >= candidate.value_horizon_ms)
-                       << ";hard_max_defer_ms=" << hard_max_defer
-                       << ";defer_cooldown_ms=" << defer_cooldown_ms;
-                plan_traces.push_back(
-                    PlanTrace
-                    {
-                        candidate.key.path.reader,
-                        candidate.key.sequence,
-                        candidate.estimated_bytes,
-                        detail.str()
-                    });
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            }
-
-            if (admitted && !force_due)
-            {
-                ++admitted_changes;
-                admitted_bytes += group->estimated_bytes;
-            }
-        }
-    }
-
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-    for (const BudgetTrace& trace : budget_traces)
-    {
-        FASTDDS_TRACE_RETRANSMISSION(
-            "ADAPT_V2_BUDGET_UPDATE",
-            writer->getGuid(),
-            GUID_t::unknown(),
-            SequenceNumber_t::unknown(),
-            0,
-            trace.detail);
-    }
-    for (const PlanTrace& trace : plan_traces)
-    {
-        FASTDDS_TRACE_RETRANSMISSION(
-            "ADAPT_V2_PLAN_DECISION",
-            writer->getGuid(),
-            trace.reader,
-            trace.sequence,
-            trace.estimated_bytes,
-            trace.detail);
-    }
-    if (cooldown_skipped_changes > 0)
-    {
-        std::ostringstream detail;
-        detail << "skipped_changes=" << cooldown_skipped_changes
-               << ";skipped_bytes=" << cooldown_skipped_bytes
-               << ";min_remaining_ms=" << min_cooldown_remaining_ms;
-        FASTDDS_TRACE_RETRANSMISSION(
-            "ADAPT_V2_COOLDOWN_SKIP",
-            writer->getGuid(),
-            GUID_t::unknown(),
-            SequenceNumber_t::unknown(),
-            0,
-            detail.str());
-    }
-#endif // FASTDDS_RETRANSMISSION_TRACE
-    return plan;
-}
-
 void AdaptiveRetransmissionController::on_acknowledged_before(
         StatefulWriter* writer,
         const GUID_t& reader_guid,
@@ -2970,8 +1619,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    const bool sync_admission = admission_enabled(*writer);
-    if (!sync_admission && !async_feedback_accounting)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -3000,7 +1648,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
         ReaderState& reader = impl_->readers[reader_key];
         WriterState& writer_state = impl_->writers[writer->getGuid()];
 
-        if ((async_feedback_accounting || sync_admission) && sequence_number > reader.last_ack_base)
+        if (sequence_number > reader.last_ack_base)
         {
             if (!reader.ack_progress_tracking_started)
             {
@@ -3119,7 +1767,7 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                             feedback_ms,
                             feedback_class,
                             feedback_bytes);
-                        if (writer->isAsync() && writer->uses_adaptive_value_flow_controller())
+                        if (writer->uses_adaptive_value_flow_controller())
                         {
                             record_origin_positive_feedback_locked(
                                 impl_->readers,
@@ -3197,8 +1845,8 @@ void AdaptiveRetransmissionController::on_acknowledged_before(
                << ";feedback_class=" << repair_feedback_class_name(trace.feedback_class);
         FASTDDS_TRACE_RETRANSMISSION(
             trace.new_sample ?
-            (writer->isAsync() ? "ADAPT_ASYNC_NEW_ACK_CONFIRMED" : "NEW_ACK_CONFIRMED_PROXY") :
-            (writer->isAsync() ? "ADAPT_ASYNC_ACK_CONFIRMED" : "ACK_CONFIRMED_PROXY"),
+            "ADAPT_ASYNC_NEW_ACK_CONFIRMED" :
+            "ADAPT_ASYNC_ACK_CONFIRMED",
             writer->getGuid(),
             reader_guid,
             trace.sequence,
@@ -3219,7 +1867,7 @@ void AdaptiveRetransmissionController::on_change_removed(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_feedback_accounting)
+    if (!async_feedback_accounting)
     {
         return;
     }
@@ -3291,9 +1939,7 @@ void AdaptiveRetransmissionController::on_change_removed(
                     removal_traces.push_back(
                         RemovalTrace
                         {
-                            writer->isAsync() ?
-                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_TIMEOUT" :
-                            "REPAIR_EPISODE_REMOVE_TIMEOUT_PROXY",
+                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_TIMEOUT",
                             episode_bytes,
                             detail.str()
                         });
@@ -3320,9 +1966,7 @@ void AdaptiveRetransmissionController::on_change_removed(
                     removal_traces.push_back(
                         RemovalTrace
                         {
-                            writer->isAsync() ?
-                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_INCONCLUSIVE" :
-                            "REPAIR_EPISODE_REMOVE_INCONCLUSIVE_PROXY",
+                            "ADAPT_ASYNC_REPAIR_EPISODE_REMOVE_INCONCLUSIVE",
                             episode_bytes,
                             detail.str()
                         });
@@ -3341,9 +1985,7 @@ void AdaptiveRetransmissionController::on_change_removed(
                     removal_traces.push_back(
                         RemovalTrace
                         {
-                            writer->isAsync() ?
-                            "ADAPT_ASYNC_PENDING_NEW_REMOVED" :
-                            "PENDING_NEW_REMOVED_PROXY",
+                            "ADAPT_ASYNC_PENDING_NEW_REMOVED",
                             episode_bytes,
                             detail.str()
                         });
@@ -3367,7 +2009,7 @@ void AdaptiveRetransmissionController::on_change_removed(
     }
 
 #ifdef FASTDDS_RETRANSMISSION_TRACE
-    if (writer->isAsync() && removed)
+    if (removed)
     {
         FASTDDS_TRACE_RETRANSMISSION(
             "ADAPT_ASYNC_CHANGE_REMOVED",
@@ -3400,13 +2042,15 @@ void AdaptiveRetransmissionController::on_reader_removed(
     }
 
     const bool async_feedback_accounting = async_feedback_accounting_enabled(*writer);
-    if (!admission_enabled(*writer) && !async_feedback_accounting)
+    if (!async_feedback_accounting)
     {
         return;
     }
 
     const ReaderKey key {writer->getGuid(), reader_guid};
+#ifdef FASTDDS_RETRANSMISSION_TRACE
     uint32_t removed_changes = 0;
+#endif // FASTDDS_RETRANSMISSION_TRACE
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->readers.erase(key);
@@ -3415,7 +2059,9 @@ void AdaptiveRetransmissionController::on_reader_removed(
             if (!(it->first.path < key) && !(key < it->first.path))
             {
                 it = impl_->changes.erase(it);
+#ifdef FASTDDS_RETRANSMISSION_TRACE
                 ++removed_changes;
+#endif // FASTDDS_RETRANSMISSION_TRACE
             }
             else
             {
@@ -3457,19 +2103,18 @@ void AdaptiveRetransmissionController::on_reader_removed(
         }
     }
 
-    if (writer->isAsync())
-    {
-        std::ostringstream detail;
-        detail << "mode=" << controller_mode_name(*writer)
-               << ";removed_changes=" << removed_changes;
-        FASTDDS_TRACE_RETRANSMISSION(
-            "ADAPT_ASYNC_READER_REMOVED",
-            writer->getGuid(),
-            reader_guid,
-            SequenceNumber_t::unknown(),
-            0,
-            detail.str());
-    }
+#ifdef FASTDDS_RETRANSMISSION_TRACE
+    std::ostringstream detail;
+    detail << "mode=" << controller_mode_name(*writer)
+           << ";removed_changes=" << removed_changes;
+    FASTDDS_TRACE_RETRANSMISSION(
+        "ADAPT_ASYNC_READER_REMOVED",
+        writer->getGuid(),
+        reader_guid,
+        SequenceNumber_t::unknown(),
+        0,
+        detail.str());
+#endif // FASTDDS_RETRANSMISSION_TRACE
 }
 
 } // namespace detail

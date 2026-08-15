@@ -23,10 +23,6 @@
             <propertiesPolicy>
                 <properties>
                     <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                    <property>
                         <name>fastdds.adaptive_retransmission.value_class</name>
                         <value>important</value>
                     </property>
@@ -47,10 +43,6 @@
             <propertiesPolicy>
                 <properties>
                     <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                    <property>
                         <name>fastdds.adaptive_retransmission.value_class</name>
                         <value>default</value>
                     </property>
@@ -70,10 +62,6 @@
             <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
             <propertiesPolicy>
                 <properties>
-                    <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
                     <property>
                         <name>fastdds.adaptive_retransmission.value_class</name>
                         <value>replaceable_snapshot</value>

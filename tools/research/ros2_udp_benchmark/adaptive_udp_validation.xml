@@ -40,14 +40,6 @@
                 </data_sharing>
             </qos>
             <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
-            <propertiesPolicy>
-                <properties>
-                    <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                </properties>
-            </propertiesPolicy>
         </publisher>
 
         <subscriber profile_name="adaptive_validation_reader" is_default_profile="true">

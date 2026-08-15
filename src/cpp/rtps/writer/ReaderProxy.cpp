@@ -195,10 +195,11 @@ bool ReaderProxy::update(
 void ReaderProxy::stop()
 {
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-    if (is_active_ && is_remote_and_reliable())
+    auto& adaptive_controller = detail::AdaptiveRetransmissionController::instance();
+    if (is_active_ && is_remote_and_reliable() &&
+            adaptive_controller.feedback_accounting_enabled(writer_))
     {
-        detail::AdaptiveRetransmissionController::instance().on_reader_removed(
-            writer_, guid());
+        adaptive_controller.on_reader_removed(writer_, guid());
     }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 
@@ -390,10 +391,11 @@ void ReaderProxy::acked_changes_set(
     }
 #endif // FASTDDS_RETRANSMISSION_TRACE
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-    if (is_active_ && is_remote_and_reliable())
+    auto& adaptive_controller = detail::AdaptiveRetransmissionController::instance();
+    if (is_active_ && is_remote_and_reliable() &&
+            adaptive_controller.feedback_accounting_enabled(writer_))
     {
-        detail::AdaptiveRetransmissionController::instance().on_acknowledged_before(
-            writer_, guid(), seq_num);
+        adaptive_controller.on_acknowledged_before(writer_, guid(), seq_num);
     }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 
@@ -506,9 +508,11 @@ bool ReaderProxy::requested_changes_set(
                                 chit->getChange()->serializedPayload.length,
                                 std::string());
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-                            if (is_remote_and_reliable())
+                            auto& adaptive_controller = detail::AdaptiveRetransmissionController::instance();
+                            if (is_remote_and_reliable() &&
+                                    adaptive_controller.feedback_accounting_enabled(writer_))
                             {
-                                detail::AdaptiveRetransmissionController::instance().on_requested(
+                                adaptive_controller.on_requested(
                                     writer_,
                                     guid(),
                                     *chit->getChange(),
@@ -649,44 +653,14 @@ bool ReaderProxy::perform_nack_supression()
         );
 }
 
-void ReaderProxy::for_each_requested_change(
-        const std::function<void(const ChangeForReader_t& change, bool earliest_requested)>& func) const
-{
-    bool earliest_requested = true;
-    for (const ChangeForReader_t& change : changes_for_reader_)
-    {
-        if (REQUESTED == change.getStatus())
-        {
-            func(change, earliest_requested);
-            earliest_requested = false;
-        }
-    }
-}
-
 uint32_t ReaderProxy::perform_acknack_response(
         const std::function<void(ChangeForReader_t& change)>& func)
 {
-    uint32_t deferred = 0;
-    return perform_acknack_response(nullptr, func, deferred);
-}
-
-uint32_t ReaderProxy::perform_acknack_response(
-        const std::function<bool(const ChangeForReader_t& change)>& should_admit,
-        const std::function<void(ChangeForReader_t& change)>& func,
-        uint32_t& deferred)
-{
     uint32_t changed = 0;
-    deferred = 0;
     for (ChangeForReader_t& change : changes_for_reader_)
     {
         if (REQUESTED == change.getStatus())
         {
-            if (should_admit && !should_admit(change))
-            {
-                ++deferred;
-                continue;
-            }
-
             ++changed;
             change.setStatus(UNSENT);
 #ifdef FASTDDS_RETRANSMISSION_TRACE
@@ -706,35 +680,6 @@ uint32_t ReaderProxy::perform_acknack_response(
     }
 
     return changed;
-}
-
-bool ReaderProxy::admit_requested_change(
-        const SequenceNumber_t& sequence,
-        const std::function<void(ChangeForReader_t& change)>& func)
-{
-    for (ChangeForReader_t& change : changes_for_reader_)
-    {
-        if (REQUESTED == change.getStatus() && change.getSequenceNumber() == sequence)
-        {
-            change.setStatus(UNSENT);
-#ifdef FASTDDS_RETRANSMISSION_TRACE
-            FASTDDS_TRACE_RETRANSMISSION(
-                "READER_PROXY_STATUS",
-                writer_->getGuid(),
-                guid(),
-                change.getSequenceNumber(),
-                nullptr != change.getChange() ? change.getChange()->serializedPayload.length : 0,
-                std::string("from=REQUESTED;to=UNSENT;reason=periodic_admission_tick"));
-#endif // FASTDDS_RETRANSMISSION_TRACE
-            if (func)
-            {
-                func(change);
-            }
-            return true;
-        }
-    }
-
-    return false;
 }
 
 uint32_t ReaderProxy::convert_status_on_all_changes(
@@ -769,10 +714,11 @@ void ReaderProxy::change_has_been_removed(
         const SequenceNumber_t& seq_num)
 {
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-    if (is_active_ && is_remote_and_reliable())
+    auto& adaptive_controller = detail::AdaptiveRetransmissionController::instance();
+    if (is_active_ && is_remote_and_reliable() &&
+            adaptive_controller.feedback_accounting_enabled(writer_))
     {
-        detail::AdaptiveRetransmissionController::instance().on_change_removed(
-            writer_, guid(), seq_num);
+        adaptive_controller.on_change_removed(writer_, guid(), seq_num);
     }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION
 
@@ -845,7 +791,9 @@ bool ReaderProxy::requested_fragment_set(
     }
 
 #ifdef FASTDDS_ADAPTIVE_RETRANSMISSION
-    if (is_remote_and_reliable())
+    auto& adaptive_controller = detail::AdaptiveRetransmissionController::instance();
+    if (is_remote_and_reliable() &&
+            adaptive_controller.feedback_accounting_enabled(writer_))
     {
         uint32_t requested_fragments = 0;
         uint64_t estimated_bytes = 0;
@@ -865,7 +813,7 @@ bool ReaderProxy::requested_fragment_set(
                     }
                 });
 
-        detail::AdaptiveRetransmissionController::instance().on_requested(
+        adaptive_controller.on_requested(
             writer_, guid(), *change, requested_fragments, static_cast<uint32_t>(estimated_bytes));
     }
 #endif // FASTDDS_ADAPTIVE_RETRANSMISSION

@@ -136,8 +136,6 @@ int main(
             });
         static_cast<void>(subscription);
 
-        const auto usage_start = benchmark::process_usage();
-        const int64_t benchmark_start_ns = benchmark::steady_now_ns();
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_s);
         while (unique_sequences.size() < expected && std::chrono::steady_clock::now() < deadline)
         {
@@ -145,7 +143,6 @@ int main(
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         rclcpp::spin_some(node);
-        const int64_t benchmark_end_ns = benchmark::steady_now_ns();
         const auto usage_end = benchmark::process_usage();
 
         std::ofstream output(output_path);
@@ -197,8 +194,6 @@ int main(
 
         const double receive_span_seconds = records.size() > 1 ?
                 (records.back().receive_ns - records.front().receive_ns) / 1000000000.0 : 0.0;
-        const double wall_seconds = (benchmark_end_ns - benchmark_start_ns) / 1000000000.0;
-        const double cpu_seconds = usage_end.cpu_seconds - usage_start.cpu_seconds;
         std::ostringstream missing_json;
         missing_json << '[';
         for (size_t index = 0; index < missing_first_20.size(); ++index)
@@ -213,7 +208,6 @@ int main(
 
         std::cout << std::fixed << std::setprecision(6)
                   << "{\"completion_ms\":" << receive_span_seconds * 1000.0
-                  << ",\"cpu_percent\":" << (wall_seconds > 0.0 ? cpu_seconds / wall_seconds * 100.0 : 0.0)
                   << ",\"duplicates\":" << duplicates
                   << ",\"expected\":" << expected
                   << ",\"goodput_mbps\":"

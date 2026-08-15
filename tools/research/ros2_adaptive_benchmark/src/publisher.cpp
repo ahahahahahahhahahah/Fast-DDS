@@ -19,7 +19,6 @@ struct Record
     uint64_t sequence;
     int64_t scheduled_ns;
     int64_t send_ns;
-    double publish_call_us;
     double late_us;
     size_t application_bytes;
 };
@@ -91,8 +90,6 @@ int main(
 
         std::vector<Record> records;
         records.reserve(messages);
-        std::vector<double> publish_call_us;
-        publish_call_us.reserve(messages);
         std::vector<double> late_us;
         late_us.reserve(messages);
 
@@ -100,8 +97,6 @@ int main(
         int64_t next_send_ns = benchmark::steady_now_ns();
         uint64_t late_sends = 0;
         size_t total_application_bytes = 0;
-        const auto usage_start = benchmark::process_usage();
-        const int64_t benchmark_start_ns = benchmark::steady_now_ns();
 
         for (uint64_t sequence = 0; sequence < messages; ++sequence)
         {
@@ -131,19 +126,14 @@ int main(
                 message.data.append(payload_bytes - message.data.size(), 'x');
             }
 
-            const int64_t publish_start_ns = benchmark::steady_now_ns();
             publisher->publish(message);
-            const int64_t publish_end_ns = benchmark::steady_now_ns();
-            const double current_publish_us = (publish_end_ns - publish_start_ns) / 1000.0;
 
             records.push_back({
                 sequence,
                 next_send_ns,
                 send_ns,
-                current_publish_us,
                 current_late_us,
                 message.data.size()});
-            publish_call_us.push_back(current_publish_us);
             late_us.push_back(current_late_us);
             total_application_bytes += message.data.size();
             next_send_ns += period_ns;
@@ -157,38 +147,31 @@ int main(
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
 
-        const int64_t benchmark_end_ns = benchmark::steady_now_ns();
         const auto usage_end = benchmark::process_usage();
         std::ofstream output(output_path);
         if (!output)
         {
             throw std::runtime_error("cannot open output: " + output_path);
         }
-        output << "sequence,scheduled_monotonic_ns,send_monotonic_ns,publish_call_us,late_us,application_bytes\n";
+        output << "sequence,scheduled_monotonic_ns,send_monotonic_ns,late_us,application_bytes\n";
         output << std::fixed << std::setprecision(3);
         for (const auto& record : records)
         {
             output << record.sequence << ',' << record.scheduled_ns << ',' << record.send_ns << ','
-                   << record.publish_call_us << ',' << record.late_us << ',' << record.application_bytes << '\n';
+                   << record.late_us << ',' << record.application_bytes << '\n';
         }
 
-        const double wall_seconds = (benchmark_end_ns - benchmark_start_ns) / 1000000000.0;
         const double send_span_seconds = messages > 1 ?
                 (records.back().send_ns - records.front().send_ns) / 1000000000.0 : 0.0;
-        const double cpu_seconds = usage_end.cpu_seconds - usage_start.cpu_seconds;
         std::cout << std::fixed << std::setprecision(6)
                   << "{\"application_mbps\":"
                   << (send_span_seconds > 0.0 ? total_application_bytes * 8.0 / send_span_seconds / 1000000.0 : 0.0)
-                  << ",\"cpu_percent\":" << (wall_seconds > 0.0 ? cpu_seconds / wall_seconds * 100.0 : 0.0)
                   << ",\"late_p95_us\":" << benchmark::percentile(late_us, 0.95)
                   << ",\"late_sends\":" << late_sends
                   << ",\"matched_subscriptions\":" << matched
                   << ",\"max_rss_kb\":" << usage_end.max_rss_kb
                   << ",\"output\":\"" << benchmark::json_escape(output_path) << "\""
                   << ",\"payload_bytes\":" << payload_bytes
-                  << ",\"publish_call_p50_us\":" << benchmark::percentile(publish_call_us, 0.50)
-                  << ",\"publish_call_p95_us\":" << benchmark::percentile(publish_call_us, 0.95)
-                  << ",\"publish_call_p99_us\":" << benchmark::percentile(publish_call_us, 0.99)
                   << ",\"rate_hz\":" << rate_hz
                   << ",\"sent\":" << messages << "}\n";
 

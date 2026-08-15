@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <!-- Compatibility placeholder: identical to adaptive_off.xml and kept only for older scripts. -->
     <profiles>
         <participant profile_name="adaptive_benchmark_participant" is_default_profile="true">
             <rtps>
@@ -20,14 +21,6 @@
 
         <publisher profile_name="/adaptive_benchmark">
             <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
-            <propertiesPolicy>
-                <properties>
-                    <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                </properties>
-            </propertiesPolicy>
         </publisher>
 
         <subscriber profile_name="/adaptive_benchmark">

@@ -209,46 +209,12 @@ public:
     bool perform_nack_supression();
 
     /**
-     * Visits all changes currently waiting for an ACKNACK response without changing their state.
-     *
-     * @param func Function executed for each REQUESTED change. The boolean argument is true for the
-     *             lowest requested sequence in this reader.
-     */
-    void for_each_requested_change(
-            const std::function<void(const ChangeForReader_t& change, bool earliest_requested)>& func) const;
-
-    /**
      * Turns all REQUESTED changes into UNSENT.
      *
      * @param func Function executed for each change which changes its status.
      * @return the number of changes that changed its status.
      */
     uint32_t perform_acknack_response(
-            const std::function<void(ChangeForReader_t& change)>& func);
-
-    /**
-     * Turns admitted REQUESTED changes into UNSENT and leaves deferred changes as REQUESTED.
-     *
-     * @param should_admit Predicate called for each REQUESTED change.
-     * @param func Function executed for each admitted change.
-     * @param deferred Number of changes left in REQUESTED state.
-     * @return the number of changes that changed to UNSENT.
-     */
-    uint32_t perform_acknack_response(
-            const std::function<bool(const ChangeForReader_t& change)>& should_admit,
-            const std::function<void(ChangeForReader_t& change)>& func,
-            uint32_t& deferred);
-
-    /**
-     * Turns one admitted REQUESTED change into UNSENT and leaves all other
-     * REQUESTED changes untouched.
-     *
-     * @param sequence Sequence number selected by the admission tick.
-     * @param func Function executed if the selected change changes status.
-     * @return true when the selected change was still REQUESTED and changed to UNSENT.
-     */
-    bool admit_requested_change(
-            const SequenceNumber_t& sequence,
             const std::function<void(ChangeForReader_t& change)>& func);
 
     /**

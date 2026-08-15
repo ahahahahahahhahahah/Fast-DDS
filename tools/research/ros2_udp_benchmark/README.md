@@ -8,9 +8,10 @@ reliable ROS 2 nodes, embeds a sequence number and `CLOCK_MONOTONIC` timestamp i
 inter-arrival, ordering, and goodput statistics. Add `--same-host` to the subscriber only when both processes run on
 one host; only then does it report one-way latency from the shared monotonic clock.
 
-## Adaptive admission controller
+## Legacy adaptive profiles
 
-Build Fast DDS with both the controller and trace enabled for functional validation:
+Build Fast DDS with the controller and trace enabled only if you need controller evidence; these profiles themselves
+no longer toggle controller behavior:
 
 ```bash
 cmake -S "$ROOT" \
@@ -28,26 +29,26 @@ cmake --build "$HOME/fastdds_trace_ws/build/adaptive-v1" -j2
 cmake --install "$HOME/fastdds_trace_ws/build/adaptive-v1"
 ```
 
-`adaptive_enabled.xml` only adds `fastdds.adaptive_retransmission.enabled=true` to the
-`/adaptive_benchmark` DataWriter. It does not change transports, publication mode, memory policy, or ROS QoS. Set
-`FASTRTPS_DEFAULT_PROFILES_FILE` on the publisher process only. Do not set `RMW_FASTRTPS_USE_QOS_FROM_XML`.
+`adaptive_enabled.xml` is now a compatibility placeholder only. It does not enable any adaptive admission behavior in
+the current code. `adaptive_udp_validation.xml` is the same UDP fault-injection setup with extra transport controls for
+network evidence; it also does not toggle controller behavior. Set `FASTRTPS_DEFAULT_PROFILES_FILE` on the publisher
+process only. Do not set `RMW_FASTRTPS_USE_QOS_FROM_XML`.
 
-When a real remote Reliable Reader requests missing data, the publisher trace should contain:
+When a real remote Reliable Reader requests missing data, the current sync-path trace is:
 
 ```text
 REQUESTED
-ADAPT_REQUEST_OBSERVED
-ADAPT_ADMISSION_DECISION
 RETRANSMIT_ENQUEUE
+QUEUE_ADD_RESULT
 ```
 
-The admission decision may be `SEND_NOW`, `DEFER`, or `FORCE_SEND`. Deferred changes remain `REQUESTED` and the
-existing nack-response timer schedules another admission cycle. No sample is removed and no GAP is sent.
+`ADAPT_REQUEST_OBSERVED` and `ADAPT_ADMISSION_DECISION` are legacy trace names from the removed sync admission
+planner. Do not expect them in this branch. If you need async adaptive controller evidence, use
+`../ros2_adaptive_benchmark/` instead.
 
-Synchronous writers opt in with `fastdds.adaptive_retransmission.enabled=true`. Asynchronous writers only enable
-adaptive admission when the same property is set and their FlowController uses the `ADAPTIVE_VALUE` scheduler.
-`fastdds.adaptive_async.observe_old_samples=true` only enables async old-sample tracking and trace events; by itself it
-does not change retransmission admission.
+The current Fast DDS branch no longer uses `fastdds.adaptive_retransmission.enabled` as a sync admission switch.
+Asynchronous feedback accounting is driven by the async writer path and the `ADAPTIVE_VALUE` scheduler; the UDP smoke
+benchmark is not the place to validate that path.
 
 The controller is Transport-independent: it applies to Reliable readers in `matched_remote_readers_`, whether their
 RTPS traffic uses UDP, SHM Transport, or another registered Transport. Intraprocess readers and Data Sharing readers
@@ -60,9 +61,9 @@ appear.
 transports and Data Sharing, then registers only UDPv4 so `tc netem` can create repeatable packet loss. This profile is
 not part of the adaptive mechanism and is not required for normal Fast DDS operation or cross-host tests.
 
-`adaptive_udp_validation.xml` adds the `/adaptive_benchmark` enable property to the same controlled UDP setup. Use it
-only for active-controller fault injection. `adaptive_enabled.xml` remains the Transport-independent normal profile.
-Unset `ROS_LOCALHOST_ONLY` for this profile: Humble's RMW implementation otherwise appends an SHM Transport after XML
+`adaptive_udp_validation.xml` keeps the controlled UDP setup for transport fault injection. It does not change
+controller behavior. `adaptive_enabled.xml` is kept only as a compatibility alias for older scripts. Unset
+`ROS_LOCALHOST_ONLY` for this profile: Humble's RMW implementation otherwise appends an SHM Transport after XML
 loading, allowing user data to bypass loopback netem.
 
 Use unique output files for every run. On two hosts, do not pass `--same-host`: monotonic clock epochs are unrelated,

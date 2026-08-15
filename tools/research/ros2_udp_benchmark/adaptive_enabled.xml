@@ -1,15 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <profiles>
-        <publisher profile_name="/adaptive_benchmark">
-            <propertiesPolicy>
-                <properties>
-                    <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                </properties>
-            </propertiesPolicy>
-        </publisher>
+        <!-- Compatibility placeholder: kept for older scripts. This file no longer enables adaptive behavior. -->
     </profiles>
 </dds>

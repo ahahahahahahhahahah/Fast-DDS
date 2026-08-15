@@ -21,13 +21,6 @@ class StatefulWriter;
 
 namespace detail {
 
-enum class AdaptiveRetransmissionDecision
-{
-    SEND_NOW,
-    DEFER,
-    FORCE_SEND
-};
-
 struct AdaptiveRetransmissionReaderFeedbackSnapshot
 {
     GUID_t reader_guid;
@@ -160,25 +153,6 @@ struct AdaptiveRetransmissionFeedbackSnapshot
     std::vector<AdaptiveRetransmissionReaderFeedbackSnapshot> reader_paths;
 };
 
-struct AdaptiveRetransmissionPlanEntry
-{
-    AdaptiveRetransmissionPlanEntry() = default;
-
-    AdaptiveRetransmissionPlanEntry(
-            const GUID_t& reader,
-            const SequenceNumber_t& seq,
-            AdaptiveRetransmissionDecision planned_decision)
-        : reader_guid(reader)
-        , sequence(seq)
-        , decision(planned_decision)
-    {
-    }
-
-    GUID_t reader_guid;
-    SequenceNumber_t sequence;
-    AdaptiveRetransmissionDecision decision = AdaptiveRetransmissionDecision::DEFER;
-};
-
 class AdaptiveRetransmissionController
 {
 public:
@@ -224,19 +198,7 @@ public:
             uint64_t active_load_floor_bytes,
             bool saturated);
 
-    void begin_admission_cycle(
-            StatefulWriter* writer);
-
-    bool admission_planning_enabled(
-            StatefulWriter* writer);
-
-    void add_admission_candidate(
-            StatefulWriter* writer,
-            const GUID_t& reader_guid,
-            const CacheChange_t& change,
-            bool earliest_requested);
-
-    std::vector<AdaptiveRetransmissionPlanEntry> finalize_admission_cycle(
+    bool feedback_accounting_enabled(
             StatefulWriter* writer);
 
     void configure_feedback_thresholds(

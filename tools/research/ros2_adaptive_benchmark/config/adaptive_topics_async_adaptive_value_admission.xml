@@ -46,10 +46,6 @@
             <propertiesPolicy>
                 <properties>
                     <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                    <property>
                         <name>fastdds.adaptive_async.observe_old_samples</name>
                         <value>true</value>
                     </property>
@@ -80,10 +76,6 @@
             <propertiesPolicy>
                 <properties>
                     <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
-                    <property>
                         <name>fastdds.adaptive_async.observe_old_samples</name>
                         <value>true</value>
                     </property>
@@ -113,10 +105,6 @@
             </qos>
             <propertiesPolicy>
                 <properties>
-                    <property>
-                        <name>fastdds.adaptive_retransmission.enabled</name>
-                        <value>true</value>
-                    </property>
                     <property>
                         <name>fastdds.adaptive_async.observe_old_samples</name>
                         <value>true</value>
